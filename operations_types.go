@@ -198,6 +198,45 @@ type TypeResponse struct {
 	TabsChanged  bool   `json:"tabs_changed"`
 }
 
+// SelectOptionRequest 是 browserSelectOption 的输入。value 和 label 二选一。
+type SelectOptionRequest struct {
+	SessionID string `json:"session_id"`
+	PageID    string `json:"page_id"`
+	Ref       string `json:"ref"`
+	Revision  uint64 `json:"revision"`
+	Value     string `json:"value,omitempty"`
+	Label     string `json:"label,omitempty"`
+}
+
+// SelectOptionResponse 是 browserSelectOption 的输出。
+type SelectOptionResponse struct {
+	SessionID    string `json:"session_id"`
+	PageID       string `json:"page_id"`
+	Ref          string `json:"ref"`
+	Value        string `json:"value"`
+	ActivePageID string `json:"active_page_id,omitempty"`
+	TabsRevision uint64 `json:"tabs_revision"`
+	TabsChanged  bool   `json:"tabs_changed"`
+}
+
+// UploadFileRequest 是 browserUploadFile 的输入。
+type UploadFileRequest struct {
+	SessionID string `json:"session_id"`
+	PageID    string `json:"page_id"`
+	Ref       string `json:"ref"`
+	Revision  uint64 `json:"revision"`
+	Path      string `json:"path"`
+}
+
+// UploadFileResponse 只返回文件名，不回显宿主路径或内容。
+type UploadFileResponse struct {
+	SessionID string `json:"session_id"`
+	PageID    string `json:"page_id"`
+	Ref       string `json:"ref"`
+	FileName  string `json:"file_name"`
+	Bytes     int64  `json:"bytes"`
+}
+
 // PressRequest 是 browserPress 的输入。
 type PressRequest struct {
 	SessionID string `json:"session_id"`
@@ -213,6 +252,26 @@ type PressResponse struct {
 	ActivePageID string `json:"active_page_id,omitempty"`
 	TabsRevision uint64 `json:"tabs_revision"`
 	TabsChanged  bool   `json:"tabs_changed"`
+}
+
+// ScrollRequest 是 browserScroll 的输入，距离及坐标均为视口 CSS 像素。
+type ScrollRequest struct {
+	SessionID string   `json:"session_id"`
+	PageID    string   `json:"page_id"`
+	DeltaX    float64  `json:"delta_x,omitempty"`
+	DeltaY    float64  `json:"delta_y,omitempty"`
+	X         *float64 `json:"x,omitempty"`
+	Y         *float64 `json:"y,omitempty"`
+}
+
+// ScrollResponse 表示滚轮事件已由浏览器接收。
+type ScrollResponse struct {
+	SessionID string  `json:"session_id"`
+	PageID    string  `json:"page_id"`
+	DeltaX    float64 `json:"delta_x"`
+	DeltaY    float64 `json:"delta_y"`
+	X         float64 `json:"x"`
+	Y         float64 `json:"y"`
 }
 
 // WaitRequest 是 browserWait 的输入。

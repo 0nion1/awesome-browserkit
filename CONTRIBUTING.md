@@ -17,7 +17,8 @@ React 组件修改后，先构建 `react`，再构建 demo。
 
 - `make test`：Go 与 React 测试。
 - `make race`：Go 竞态检查。
-- `make smoke`：临时 Chrome 中的 SDK 和 CLI 测试，不连接日常浏览器。
+- `make smoke`：临时 Chrome 中的 SDK、CLI 和完整函数调用靶场测试，不连接日常浏览器。靶场说明见 `internal/toollab/README.md`。
+- `make lab`：在 `http://127.0.0.1:8879/` 启动同一靶场，便于手动调用浏览器工具。
 - `make pack`：生成 React 安装包。
 
 修改工具名称、签名或说明后，检查 `testdata/functions.golden` 的差异。

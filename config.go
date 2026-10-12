@@ -56,8 +56,10 @@ type Config struct {
 	// MaxTabsPerSession 限制单个浏览器 session 的网页 Tab 数量；零值为 16。
 	MaxTabsPerSession int
 	ScreenshotDir     string
-	MaxScriptBytes    int
-	MaxResultBytes    int
+	// UploadDir 限制 browserUploadFile 可读取的本地文件目录；留空时不暴露该函数。
+	UploadDir      string
+	MaxScriptBytes int
+	MaxResultBytes int
 	// IdleTimeout 是浏览器 session 无操作后的自动回收时间；零值为 30 分钟。
 	IdleTimeout time.Duration
 	// DNSResolver 用于浏览器请求发出前解析目标主机。省略时使用系统解析器。
@@ -167,6 +169,17 @@ func (config Config) normalized() (Config, error) {
 	config.Session.requestPolicy = newBrowserNetworkPolicy(config.AllowPrivateNetwork, config.AllowedOrigins, config.DNSResolver)
 	if config.ScreenshotDir == "" {
 		config.ScreenshotDir = filepath.Join(os.TempDir(), "browserkit-browser")
+	}
+	if config.UploadDir != "" {
+		resolved, err := filepath.EvalSymlinks(config.UploadDir)
+		if err != nil {
+			return Config{}, fmt.Errorf("Browser UploadDir 无效: %w", err)
+		}
+		info, err := os.Stat(resolved)
+		if err != nil || !info.IsDir() {
+			return Config{}, errors.New("Browser UploadDir 必须是目录")
+		}
+		config.UploadDir = resolved
 	}
 	return config, nil
 }

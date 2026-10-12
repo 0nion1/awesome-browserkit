@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tool lab dashboard</title>
+  <link rel="stylesheet" href="/lab.css">
+  <script src="/lab.js" defer></script>
+</head>
+<body>
+  <header><h1>Tool lab dashboard</h1><p>Browser function interaction target</p></header>
+  <main>
+    <section aria-label="Form and actions">
+      <form id="customer-form">
+        <label>Customer name <input id="customer" name="customer" aria-label="Customer name" autocomplete="off"></label>
+        <button type="submit">Save customer</button>
+      </form>
+      <p id="form-result" role="status">No customer saved</p>
+      <label for="reference-code">Reference code</label>
+      <input id="reference-code" autocomplete="off">
+      <label><input id="express" type="checkbox"> Express delivery</label>
+      <label for="priority">Priority</label>
+      <select id="priority">
+        <option value="normal">Normal</option>
+        <option value="urgent">Urgent</option>
+      </select>
+      <p id="control-result">Reference: empty; Express: no; Priority: normal</p>
+      <div class="menu">
+        <button id="hover-target" type="button">Hover menu</button>
+        <button id="hover-action" type="button">Hover action</button>
+      </div>
+      <p id="hover-result">Menu idle</p>
+      <button id="load-items" type="button">Load items</button>
+      <span id="loading" hidden>Loading items</span>
+      <ul id="items"></ul>
+      <p id="load-result">No items loaded</p>
+      <button id="replace-target" type="button">Replace target</button>
+      <button id="ephemeral" type="button">Old target</button>
+      <p id="replace-result">Original target</p>
+      <a href="/popup.html" target="_blank">Open popup</a>
+      <a href="/detail.html">Open detail</a>
+    </section>
+    <section aria-label="Scrollable list">
+      <h2>Nested scroll region</h2>
+      <div id="nested-scroll" class="nested-scroll">
+        <p>Nested row 1</p><p>Nested row 2</p><p>Nested row 3</p><p>Nested row 4</p>
+        <p>Nested row 5</p><p>Nested row 6</p><p>Nested row 7</p><p>Nested row 8</p>
+        <p>Nested row 9</p><p>Nested row 10</p><p>Nested row 11</p><p>Nested row 12</p>
+        <button id="nested-target" type="button">Nested target</button>
+      </div>
+      <p id="nested-result">Nested target idle</p>
+    </section>
+    <section aria-label="Embedded controls">
+      <h2>Embedded controls</h2>
+      <div id="shadow-host"></div>
+      <iframe id="same-origin-frame" title="Embedded checkout" src="/frame.html"></iframe>
+      <iframe id="cross-origin-frame" title="External checkout" src="about:blank"></iframe>
+      <label for="attachment">Attachment</label>
+      <input id="attachment" type="file" accept="text/plain">
+      <p id="upload-result">No attachment</p>
+    </section>
+    <section class="long-page" aria-label="Long page">
+      <h2>Long page</h2>
+      <p>Scroll through this section to reach the distant action.</p>
+      <button id="far-target" type="button">Far target</button>
+      <p id="far-result">Far target idle</p>
+    </section>
+  </main>
+  <img src="/pixel.svg" alt="Lab asset" width="4" height="4">
+</body>
+</html>

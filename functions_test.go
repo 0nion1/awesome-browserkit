@@ -65,7 +65,7 @@ func TestFunctionsFollowCapabilitiesAndDoNotShareCatalog(t *testing.T) {
 	for _, config := range []Config{{}, {AllowEvaluate: true}, {AllowDevtools: true}, {AllowEvaluate: true, AllowDevtools: true}} {
 		manager, _ := fakeManager(t, config)
 		functions := manager.Functions()
-		expected := 14
+		expected := 16
 		if config.AllowEvaluate {
 			expected++
 		}
@@ -89,6 +89,18 @@ func TestFunctionsFollowCapabilitiesAndDoNotShareCatalog(t *testing.T) {
 	var absent *Manager
 	if len(absent.Functions()) != 0 {
 		t.Fatal("nil Manager 应返回空清单")
+	}
+}
+
+func TestUploadFunctionRequiresConfiguredDirectory(t *testing.T) {
+	manager, _ := fakeManager(t, Config{UploadDir: t.TempDir()})
+	defer manager.Close(context.Background())
+	if len(manager.Functions()) != 17 {
+		t.Fatalf("配置上传目录后的函数数量=%d", len(manager.Functions()))
+	}
+	function := functionByName(t, manager, "browserUploadFile")
+	if reflect.TypeOf(function.Handler).In(1) != reflect.TypeFor[UploadFileRequest]() {
+		t.Fatalf("上传函数签名无效: %T", function.Handler)
 	}
 }
 

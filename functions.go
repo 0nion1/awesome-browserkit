@@ -19,7 +19,7 @@ type Function struct {
 }
 
 // Functions 返回绑定当前 Manager 的浏览器函数清单。
-// 默认提供 14 个函数；AllowEvaluate 增加脚本执行，AllowDevtools 增加三个诊断函数。
+// 默认提供 16 个函数；AllowEvaluate 增加脚本执行，AllowDevtools 增加三个诊断函数，UploadDir 增加文件上传。
 // 每次返回独立切片，宿主可以筛选；同一 Manager 的操作与 HTTP/React 共用 session 和 Tab。
 // 请求解码、输入/输出 schema 校验、审批、进度和模型协议由宿主工具框架处理。
 func (manager *Manager) Functions() []Function {
@@ -36,7 +36,9 @@ func (manager *Manager) Functions() []Function {
 		{Name: "browserClick", Description: "点击指定 page_id 页面快照中的元素引用。ref 只能用于生成它的 page_id。", Handler: manager.Click},
 		{Name: "browserHover", Description: "将指针移动到指定 page_id 的快照元素。ref 只能用于生成它的页面。", Handler: manager.Hover},
 		{Name: "browserType", Description: "向指定 page_id 页面元素输入文本。ref 只能用于生成它的 page_id。默认覆盖原值，append=true 时追加。响应不会回显输入内容。", Handler: manager.Type},
+		{Name: "browserSelectOption", Description: "按 browserSnapshot 返回的 value 或可见 label，选择指定 page_id 中原生单选下拉框的选项；需要同一快照的 ref 和 revision。", Handler: manager.SelectOption},
 		{Name: "browserPress", Description: "向指定 page_id 页面发送白名单按键。", Handler: manager.Press},
+		{Name: "browserScroll", Description: "在指定 page_id 发送滚轮事件，delta_x/delta_y 为 CSS 像素；省略 x/y 时以视口中心为起点，也可指定坐标滚动嵌套区域。", Handler: manager.Scroll},
 		{Name: "browserWait", Description: "等待指定 page_id 页面的状态。selector_visible/selector_hidden 可直接使用 browserSnapshot 返回的 ref 或 CSS selector；也支持 url_contains、title_contains、text_contains 和 load_complete。", Handler: manager.Wait},
 		{Name: "browserScreenshot", Description: "把指定 page_id 页面截图保存为宿主可读取的 PNG 文件。", Handler: manager.Screenshot},
 		{Name: "browserAssets", Description: "读取指定 page_id 当前页面已经观测到的资源列表；返回脚本、样式、图片、字体和 XHR/Fetch 等资源的名称、实际地址、发起类型、状态、大小与耗时；可用 host 过滤域名。不会主动爬取未访问页面。", Handler: manager.ListAssets},
@@ -44,6 +46,9 @@ func (manager *Manager) Functions() []Function {
 	}
 	if manager.config.AllowEvaluate {
 		functions = append(functions, Function{Name: "browserEvaluate", Description: "在指定页面的 console 域执行一段 JavaScript，并返回有限 JSON 值。", Handler: manager.Evaluate})
+	}
+	if manager.config.UploadDir != "" {
+		functions = append(functions, Function{Name: "browserUploadFile", Description: "将宿主 UploadDir 目录内一个普通文件设置到指定 page_id 的原生 file input；需要快照 ref、revision 和绝对路径，响应只返回文件名及字节数。", Handler: manager.UploadFile})
 	}
 	if manager.config.AllowDevtools {
 		functions = append(functions,

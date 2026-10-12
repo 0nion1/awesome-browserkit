@@ -1,0 +1,14 @@
+body { font: 16px system-ui, sans-serif; margin: 0; color: #17252f; }
+header { background: #dcebe7; padding: 16px 24px; }
+main { max-width: 760px; margin: 0 auto; padding: 24px; }
+section { border: 1px solid #bfd0d1; border-radius: 8px; margin-bottom: 28px; padding: 20px; }
+button, input { font: inherit; margin: 4px; padding: 8px; }
+.menu { position: relative; display: inline-flex; align-items: center; }
+#hover-action { visibility: hidden; }
+.menu:hover #hover-action { visibility: visible; }
+.nested-scroll { height: 180px; overflow-y: auto; border: 1px solid #8b9ca5; padding: 8px; }
+.nested-scroll p { min-height: 48px; margin: 0; }
+.long-page { padding-bottom: 24px; }
+.long-page #far-target { margin-top: 1150px; }
+#same-origin-frame { width: 100%; height: 190px; border: 1px solid #8b9ca5; }
+#cross-origin-frame { width: 100%; height: 100px; border: 1px solid #8b9ca5; }

@@ -25,8 +25,14 @@ browserHover(HoverRequest) -> HoverResponse
 browserType(TypeRequest) -> TypeResponse
 向指定 page_id 页面元素输入文本。ref 只能用于生成它的 page_id。默认覆盖原值，append=true 时追加。响应不会回显输入内容。
 
+browserSelectOption(SelectOptionRequest) -> SelectOptionResponse
+按 browserSnapshot 返回的 value 或可见 label，选择指定 page_id 中原生单选下拉框的选项；需要同一快照的 ref 和 revision。
+
 browserPress(PressRequest) -> PressResponse
 向指定 page_id 页面发送白名单按键。
+
+browserScroll(ScrollRequest) -> ScrollResponse
+在指定 page_id 发送滚轮事件，delta_x/delta_y 为 CSS 像素；省略 x/y 时以视口中心为起点，也可指定坐标滚动嵌套区域。
 
 browserWait(WaitRequest) -> WaitResponse
 等待指定 page_id 页面的状态。selector_visible/selector_hidden 可直接使用 browserSnapshot 返回的 ref 或 CSS selector；也支持 url_contains、title_contains、text_contains 和 load_complete。

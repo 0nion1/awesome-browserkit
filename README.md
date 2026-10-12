@@ -323,6 +323,23 @@ go run ./examples/demo --addr 127.0.0.1:8878 --chrome /path/to/chrome
 
 See [Contributing](CONTRIBUTING.md) for development and test commands.
 
+### Browser function tool lab
+
+Run `make lab` to serve the [tool lab pages](internal/toollab/README.md) at
+`http://127.0.0.1:8879/`. The pages include forms, hover menus, asynchronous
+data, nested and long page scrolling, DOM replacement, assets, and popup tabs.
+Snapshot results include native form labels, checkbox roles, and select options.
+`browserSelectOption` chooses a native select option by value or label;
+`browserScroll` sends a wheel event at the viewport center or supplied CSS coordinates.
+Snapshots also find controls in same-origin iframes and open shadow roots.
+Cross-origin iframe elements appear with role `frame` and `frame_url`; their
+contents remain outside the current page ref namespace.
+Set `Config.UploadDir` to expose `browserUploadFile` for regular files up to 10 MiB
+inside that directory; the tool returns the file name and size.
+Use `browserkit --allow-private-network --url http://127.0.0.1:8879/` to try
+function calls manually. `make smoke` runs the same lab in a temporary browser
+and verifies every enabled browser function through JSON tool calls.
+
 ## License
 
 [Apache-2.0](LICENSE).

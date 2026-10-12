@@ -3,6 +3,7 @@ package browserkit
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"image"
 	"image/png"
@@ -185,6 +186,46 @@ func (manager *Manager) Type(ctx context.Context, request TypeRequest) (TypeResp
 	return response, nil
 }
 
+// SelectOption 按快照中的值或标签选择单选原生下拉框选项。
+func (manager *Manager) SelectOption(ctx context.Context, request SelectOptionRequest) (SelectOptionResponse, error) {
+	if err := contextErr(ctx); err != nil {
+		return SelectOptionResponse{}, err
+	}
+	if err := requirePage(request.SessionID, request.PageID, "browserSelectOption"); err != nil {
+		return SelectOptionResponse{}, err
+	}
+	if request.Ref == "" || request.Revision == 0 || (request.Value == "" && request.Label == "") || (request.Value != "" && request.Label != "") {
+		return SelectOptionResponse{}, errors.New("browserSelectOption 需要 ref、revision，以及 value 或 label 其中之一")
+	}
+	current, currentPage, err := manager.get(ctx, request.SessionID, request.PageID)
+	if err != nil {
+		return SelectOptionResponse{}, err
+	}
+	selectPage, ok := currentPage.page.(SelectOptionPage)
+	if !ok {
+		return SelectOptionResponse{}, browserError("select_unsupported", "当前浏览器页面不支持选择下拉选项", "使用支持 BrowserKit SelectOptionPage 的 Browser Factory", true)
+	}
+	unlockInteraction, err := lockSessionInteraction(ctx, current)
+	if err != nil {
+		return SelectOptionResponse{}, err
+	}
+	defer unlockInteraction()
+	current.mu.Lock()
+	beforeTabsRevision := tabsRevisionLocked(current)
+	refErr := validatePageRef(currentPage, request.Ref, request.Revision)
+	current.mu.Unlock()
+	if refErr != nil {
+		return SelectOptionResponse{}, refErr
+	}
+	value, err := selectPage.SelectOption(ctx, ElementRef{Ref: request.Ref, Revision: request.Revision}, request.Value, request.Label)
+	if err != nil {
+		return SelectOptionResponse{}, err
+	}
+	unlockInteraction()
+	activePageID, tabsRevision, tabsChanged := manager.tabChange(ctx, current, beforeTabsRevision)
+	return SelectOptionResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, Value: value, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}, nil
+}
+
 // Press 执行浏览器页面操作，使用普通 context 和明确目标。
 func (manager *Manager) Press(ctx context.Context, request PressRequest) (PressResponse, error) {
 	if err := contextErr(ctx); err != nil {
@@ -216,6 +257,59 @@ func (manager *Manager) Press(ctx context.Context, request PressRequest) (PressR
 	activePageID, tabsRevision, tabsChanged := manager.tabChange(ctx, current, beforeTabsRevision)
 	response := PressResponse{SessionID: current.id, PageID: currentPage.id, Key: request.Key, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
 	return response, nil
+}
+
+// Scroll 向页面视口或指定坐标下的滚动容器发送真实滚轮事件。
+func (manager *Manager) Scroll(ctx context.Context, request ScrollRequest) (ScrollResponse, error) {
+	if err := contextErr(ctx); err != nil {
+		return ScrollResponse{}, err
+	}
+	if err := requirePage(request.SessionID, request.PageID, "browserScroll"); err != nil {
+		return ScrollResponse{}, err
+	}
+	if math.IsNaN(request.DeltaX) || math.IsNaN(request.DeltaY) || math.IsInf(request.DeltaX, 0) || math.IsInf(request.DeltaY, 0) ||
+		(request.DeltaX == 0 && request.DeltaY == 0) || math.Abs(request.DeltaX) > 10_000 || math.Abs(request.DeltaY) > 10_000 {
+		return ScrollResponse{}, errors.New("browserScroll 需要非零且不超过 10000 CSS 像素的滚动距离")
+	}
+	current, currentPage, err := manager.get(ctx, request.SessionID, request.PageID)
+	if err != nil {
+		return ScrollResponse{}, err
+	}
+	inputPage, ok := currentPage.page.(InputPage)
+	if !ok {
+		return ScrollResponse{}, browserError("scroll_unsupported", "当前浏览器页面不支持滚轮输入", "使用支持 BrowserKit InputPage 的 Browser Factory", true)
+	}
+	viewportResult, err := currentPage.page.Evaluate(ctx, "({width: window.innerWidth, height: window.innerHeight})", EvaluateOptions{})
+	if err != nil {
+		return ScrollResponse{}, err
+	}
+	var viewport Viewport
+	if err := json.Unmarshal(viewportResult.Value, &viewport); err != nil {
+		return ScrollResponse{}, err
+	}
+	if err := viewport.Validate(); err != nil {
+		return ScrollResponse{}, err
+	}
+	x, y := float64(viewport.Width)/2, float64(viewport.Height)/2
+	if request.X != nil {
+		x = *request.X
+	}
+	if request.Y != nil {
+		y = *request.Y
+	}
+	if math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) || x < 0 || y < 0 || x >= float64(viewport.Width) || y >= float64(viewport.Height) {
+		return ScrollResponse{}, errors.New("browserScroll 的 x/y 超出页面视口")
+	}
+	unlockInteraction, err := lockSessionInteraction(ctx, current)
+	if err != nil {
+		return ScrollResponse{}, err
+	}
+	defer unlockInteraction()
+	if err := inputPage.DispatchInput(ctx, InputEvent{Kind: "mouse", Action: "wheel", X: x, Y: y, DeltaX: request.DeltaX, DeltaY: request.DeltaY}); err != nil {
+		return ScrollResponse{}, err
+	}
+	manager.emit(ctx, Event{Kind: "interaction_finished", SessionID: current.id, PageID: currentPage.id})
+	return ScrollResponse{SessionID: current.id, PageID: currentPage.id, DeltaX: request.DeltaX, DeltaY: request.DeltaY, X: x, Y: y}, nil
 }
 
 // tabChange 在交互返回前刷新一次真实 Tab 列表，并返回模型需要立即

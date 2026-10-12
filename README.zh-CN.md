@@ -318,6 +318,16 @@ go run ./examples/demo --addr 127.0.0.1:8878 --chrome /path/to/chrome
 
 测试与开发命令见 [贡献指南](CONTRIBUTING.md)。
 
+### 浏览器函数靶场
+
+运行 `make lab`，在 `http://127.0.0.1:8879/` 启动[工具靶场](internal/toollab/README.md)。
+页面包含表单、悬停菜单、异步数据、嵌套和长页滚动、DOM 替换、资源加载及弹出 Tab。
+快照包含原生表单标签、复选框角色和下拉选项。`browserSelectOption` 可按 value 或 label 选择原生单选下拉项；`browserScroll` 在视口中心或指定 CSS 坐标发送滚轮事件。
+快照还会发现同源 iframe 和 open Shadow DOM 内的控件。配置 `Config.UploadDir` 后才会暴露 `browserUploadFile`，仅接受该目录内不超过 10 MiB 的普通文件，响应只包含文件名和大小。
+跨源 iframe 会以 `frame` 角色及 `frame_url` 出现在快照中，其内部控件目前不属于主页面 ref 命名空间。
+可以用 `browserkit --allow-private-network --url http://127.0.0.1:8879/` 手动调用函数。
+`make smoke` 会在临时浏览器中使用同一靶场，通过 JSON 工具调用验证全部已启用的浏览器函数。
+
 ## 许可证
 
 [Apache-2.0](LICENSE)。

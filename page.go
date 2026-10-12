@@ -3,11 +3,9 @@ package browserkit
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
-	"strings"
 	"sync"
 	"time"
 
@@ -16,228 +14,9 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
-// Viewport 描述页面视口尺寸。
-type Viewport struct {
-	Width  int `json:"width"`
-	Height int `json:"height"`
-}
-
-const maxViewportDimension = 16_384
-const maxViewportPixels = 64 * 1024 * 1024
 const maxSnapshotChars = 1 << 20
 const maxSnapshotElements = 1_000
-const screencastAckTimeout = 250 * time.Millisecond
-const screencastStopTimeout = 500 * time.Millisecond
 const targetCloseTimeout = 2 * time.Second
-
-// Validate 校验页面视口，避免异常尺寸造成浏览器截图和渲染资源失控。
-func (viewport Viewport) Validate() error {
-	if viewport.Width <= 0 || viewport.Height <= 0 {
-		return errors.New("浏览器 viewport 无效")
-	}
-	if viewport.Width > maxViewportDimension || viewport.Height > maxViewportDimension ||
-		int64(viewport.Width)*int64(viewport.Height) > maxViewportPixels {
-		return errors.New("浏览器 viewport 超出允许范围")
-	}
-	return nil
-}
-
-// PageOptions 描述新页面选项。
-type PageOptions struct {
-	Viewport Viewport
-	// InjectScript 会在后续每个 document 创建早期于主 world 执行。
-	InjectScript string
-}
-
-// PageInfo 描述页面当前的公开状态。
-type PageInfo struct {
-	URL   string `json:"url"`
-	Title string `json:"title"`
-}
-
-// Asset 描述当前页面已经观测到的一项网络资源。
-type Asset struct {
-	Name           string  `json:"name"`
-	URL            string  `json:"url"`
-	InitiatorType  string  `json:"initiator_type,omitempty"`
-	ResponseStatus int     `json:"response_status,omitempty"`
-	TransferBytes  int64   `json:"transfer_bytes,omitempty"`
-	EncodedBytes   int64   `json:"encoded_bytes,omitempty"`
-	DecodedBytes   int64   `json:"decoded_bytes,omitempty"`
-	DurationMS     float64 `json:"duration_ms,omitempty"`
-}
-
-// ListAssetsOptions 描述资源列表的过滤和数量限制。
-type ListAssetsOptions struct {
-	// Host 非空时只返回该主机的资源。
-	Host string
-	// Limit 限制返回资源数量，必须位于 1 到 500。
-	Limit int
-}
-
-// ListAssetsResult 是页面资源的有界读取结果。
-type ListAssetsResult struct {
-	// Assets 按页面性能记录顺序返回最近的资源。
-	Assets []Asset
-	// Truncated 表示更早的资源因 Limit 未返回。
-	Truncated bool
-}
-
-// AssetsPage 提供当前页面已观测资源的只读列表。
-type AssetsPage interface {
-	ListAssets(context.Context, ListAssetsOptions) (ListAssetsResult, error)
-}
-
-// ElementRef 是快照生成的、绑定 Page（即一个 Tab）及 document revision 的元素引用。
-// 同一 document 内的局部 DOM 更新不会改变 revision；节点被替换或移除时，
-// 点击执行阶段会根据仍存在的 data-browserkit-ref 判断该节点是否 stale。
-type ElementRef struct {
-	Ref      string `json:"ref"`
-	Revision uint64 `json:"revision"`
-}
-
-// Element 描述一个可交互元素，不包含字段值。
-type Element struct {
-	Ref  string `json:"ref"`
-	Role string `json:"role"`
-	Name string `json:"name,omitempty"`
-	Type string `json:"type,omitempty"`
-}
-
-// SnapshotOptions 限制快照大小。
-type SnapshotOptions struct {
-	MaxChars    int
-	MaxElements int
-	// Offset 跳过前面的可交互候选元素，用于分页读取。
-	Offset int
-}
-
-// Snapshot 是页面文本和可交互元素的结构化摘要。
-type Snapshot struct {
-	Info      PageInfo  `json:"info"`
-	Revision  uint64    `json:"revision"`
-	Text      string    `json:"text"`
-	Elements  []Element `json:"elements"`
-	Truncated bool      `json:"truncated"`
-	// ActiveRefs 是当前 DOM 中仍存在的内部 ref，供宿主回收已删除节点引用。
-	ActiveRefs []string `json:"-"`
-}
-
-// ScreenshotOptions 描述截图选项。
-type ScreenshotOptions struct {
-	FullPage bool
-}
-
-// ScreencastOptions 描述 CDP 连续画面的编码参数。
-type ScreencastOptions struct {
-	Quality       int
-	MaxWidth      int
-	MaxHeight     int
-	EveryNthFrame int
-}
-
-// Screenshot 是截图二进制结果。
-type Screenshot struct {
-	Data   []byte
-	Width  int
-	Height int
-	Format string
-}
-
-// ScreencastPage 提供可选的 CDP 连续画面能力。
-// 普通 Page 实现可以不支持；宿主应回退到定时截图。
-type ScreencastPage interface {
-	StartScreencast(context.Context, ScreencastOptions) (<-chan Screenshot, func(), error)
-}
-
-// InputEvent 是宿主通过 CDP 发送给真实浏览器页面的输入。
-// 坐标和滚动距离均使用远程页面 viewport 的 CSS 像素。
-// shortcut 类型只接受 select_all、copy、paste，Modifiers 可为 Ctrl(2)、Meta(4)
-// 或由运行平台决定的零值。
-type InputEvent struct {
-	Kind           string            `json:"kind"`
-	Action         string            `json:"action,omitempty"`
-	X              float64           `json:"x,omitempty"`
-	Y              float64           `json:"y,omitempty"`
-	DeltaX         float64           `json:"delta_x,omitempty"`
-	DeltaY         float64           `json:"delta_y,omitempty"`
-	Button         string            `json:"button,omitempty"`
-	Buttons        int               `json:"buttons,omitempty"`
-	ClickCount     int               `json:"click_count,omitempty"`
-	PointerType    string            `json:"pointer_type,omitempty"`
-	Touches        []InputTouchPoint `json:"touches,omitempty"`
-	Modifiers      int               `json:"modifiers,omitempty"`
-	Key            string            `json:"key,omitempty"`
-	Code           string            `json:"code,omitempty"`
-	KeyCode        int               `json:"key_code,omitempty"`
-	Location       int               `json:"location,omitempty"`
-	AutoRepeat     bool              `json:"auto_repeat,omitempty"`
-	Text           string            `json:"text,omitempty"`
-	SelectionStart int               `json:"selection_start,omitempty"`
-	SelectionEnd   int               `json:"selection_end,omitempty"`
-}
-
-// InputTouchPoint 描述一个活动触点，坐标使用远程 viewport 的 CSS 像素。
-type InputTouchPoint struct {
-	ID      int     `json:"id"`
-	X       float64 `json:"x"`
-	Y       float64 `json:"y"`
-	RadiusX float64 `json:"radius_x,omitempty"`
-	RadiusY float64 `json:"radius_y,omitempty"`
-	Force   float64 `json:"force,omitempty"`
-}
-
-// InputPage 提供基于 CDP Input 域的真实浏览器输入能力。
-type InputPage interface {
-	DispatchInput(context.Context, InputEvent) error
-}
-
-// HoverPage 提供基于真实指针坐标的元素悬停能力。
-type HoverPage interface {
-	Hover(context.Context, ElementRef) error
-}
-
-// EvaluateOptions 描述一次 console 域 JavaScript 执行。
-type EvaluateOptions struct {
-	AwaitPromise bool
-	Timeout      time.Duration
-}
-
-// EvaluateResult 是只包含可 JSON 序列化值的 JavaScript 返回值。
-type EvaluateResult struct {
-	Value json.RawMessage `json:"value,omitempty"`
-	Type  string          `json:"type"`
-}
-
-// Page 是浏览器页面的最小稳定操作接口。
-type Page interface {
-	Info(context.Context) (PageInfo, error)
-	Navigate(context.Context, string) (PageInfo, error)
-	Snapshot(context.Context, SnapshotOptions) (Snapshot, error)
-	Click(context.Context, ElementRef) error
-	Type(context.Context, ElementRef, string, bool) error
-	Press(context.Context, string) error
-	Wait(context.Context, WaitOptions) error
-	// WaitIdle 等待页面下一次 requestIdleCallback，超时由调用方控制。
-	WaitIdle(context.Context, time.Duration) error
-	Screenshot(context.Context, ScreenshotOptions) (Screenshot, error)
-	Evaluate(context.Context, string, EvaluateOptions) (EvaluateResult, error)
-	AddScriptToEvaluateOnNewDocument(context.Context, string) error
-	Close(context.Context) error
-}
-
-// TargetPage 是能提供底层 target 身份的 Page。身份只供 Browser Manager
-// 绑定已有 Tab 使用，不应进入模型或 Web 协议。
-type TargetPage interface {
-	Page
-	TargetID() string
-}
-
-// WaitOptions 描述浏览器页面的有限等待条件。
-type WaitOptions struct {
-	Condition string
-	Selector  string
-}
 
 type rodPage struct {
 	page             *rod.Page
@@ -457,7 +236,7 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 	args := map[string]int{"max_chars": options.MaxChars, "max_elements": options.MaxElements, "offset": options.Offset}
 	result, err := page.page.Context(operationCtx).Eval(`(options) => {
 		const clean = value => (value || '').replace(/[\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim();
-		const selectors = 'button,a,input,textarea,select,summary,[contenteditable="true"],[role="button"],[role="link"],[role="textbox"],[role="menuitem"],[role="option"],[role="tab"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="combobox"],[aria-haspopup],[aria-expanded],[onclick],[tabindex]:not([tabindex="-1"])';
+		const selectors = 'button,a,input,textarea,select,summary,iframe,[contenteditable="true"],[role="button"],[role="link"],[role="textbox"],[role="menuitem"],[role="option"],[role="tab"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="combobox"],[aria-haspopup],[aria-expanded],[onclick],[tabindex]:not([tabindex="-1"])';
 		const visible = el => {
 			const style = getComputedStyle(el);
 			const rect = el.getBoundingClientRect();
@@ -468,6 +247,17 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 		const offset = Math.max(0, options.offset || 0);
 		const maxElements = Math.max(1, options.max_elements || 100);
 		const scanLimit = offset + maxElements;
+		const roots = [];
+		const visit = root => {
+			roots.push(root);
+			for (const el of root.querySelectorAll('*')) {
+				if (el.shadowRoot) visit(el.shadowRoot);
+				if (el.tagName === 'IFRAME') {
+					try { if (el.contentDocument?.documentElement) visit(el.contentDocument); } catch {}
+				}
+			}
+		};
+		visit(document);
 		const candidates = [];
 		const candidateSet = new Set();
 		const addCandidate = el => {
@@ -475,19 +265,25 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 			candidateSet.add(el);
 			candidates.push(el);
 		};
-		for (const el of document.querySelectorAll(selectors)) {
-			if (disabled(el) || !visible(el)) continue;
-			addCandidate(el);
+		for (const root of roots) {
+			for (const el of root.querySelectorAll(selectors)) {
+				if (disabled(el) || !visible(el)) continue;
+				addCandidate(el);
+				if (candidates.length >= scanLimit) break;
+			}
 			if (candidates.length >= scanLimit) break;
 		}
-		if (candidates.length < scanLimit) for (const el of document.querySelectorAll('*')) {
-			if (disabled(el) || !visible(el) || getComputedStyle(el).cursor !== 'pointer') continue;
-			const name = text(el);
-			if (name.length === 0 || name.length > 160) continue;
-			const parent = el.parentElement;
-			if (parent && getComputedStyle(parent).cursor === 'pointer') continue;
-			if (el.closest('button,a,[role="button"],[role="link"],[role="menuitem"],[role="option"],[role="tab"]')) continue;
-			addCandidate(el);
+		if (candidates.length < scanLimit) for (const root of roots) {
+			for (const el of root.querySelectorAll('*')) {
+				if (disabled(el) || !visible(el) || getComputedStyle(el).cursor !== 'pointer') continue;
+				const name = text(el);
+				if (name.length === 0 || name.length > 160) continue;
+				const parent = el.parentElement;
+				if (parent && getComputedStyle(parent).cursor === 'pointer') continue;
+				if (el.closest('button,a,[role="button"],[role="link"],[role="menuitem"],[role="option"],[role="tab"]')) continue;
+				addCandidate(el);
+				if (candidates.length >= scanLimit) break;
+			}
 			if (candidates.length >= scanLimit) break;
 		}
 		const windowed = candidates.slice(offset, offset + maxElements);
@@ -498,12 +294,18 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 			el.setAttribute('data-browserkit-ref', ref);
 			state.refs.add(ref);
 			const type = (el.getAttribute('type') || '').toLowerCase();
-			const role = el.getAttribute('role') || (el.tagName === 'A' ? 'link' : el.tagName.toLowerCase() === 'button' ? 'button' : el.tagName.toLowerCase() === 'input' ? 'textbox' : el.tagName.toLowerCase() === 'select' ? 'combobox' : 'button');
-			const labelledBy = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map(id => document.getElementById(id)?.innerText || document.getElementById(id)?.textContent || '').join(' ');
-			const label = el.getAttribute('aria-label') || labelledBy || el.getAttribute('placeholder') || el.getAttribute('title') || text(el) || el.getAttribute('name') || '';
-			return {ref, role, name: clean(label).slice(0, 160), type: type === 'password' ? 'password' : type};
+			const inputRole = type === 'file' ? 'button' : type === 'checkbox' ? 'checkbox' : type === 'radio' ? 'radio' :
+				(type === 'button' || type === 'submit' || type === 'reset' || type === 'image') ? 'button' :
+				type === 'range' ? 'slider' : type === 'number' ? 'spinbutton' : type === 'search' ? 'searchbox' : 'textbox';
+			const role = el.getAttribute('role') || (el.tagName === 'IFRAME' ? 'frame' : el.tagName === 'A' ? 'link' : el.tagName === 'BUTTON' ? 'button' : el.tagName === 'INPUT' ? inputRole : el.tagName === 'SELECT' ? 'combobox' : el.tagName === 'TEXTAREA' ? 'textbox' : 'button');
+			const labelledBy = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map(id => el.getRootNode().getElementById?.(id)?.textContent || el.ownerDocument.getElementById(id)?.textContent || '').join(' ');
+			const nativeLabel = [...(el.labels || [])].map(label => label.innerText || label.textContent || '').join(' ');
+			const label = el.getAttribute('aria-label') || labelledBy || nativeLabel || el.getAttribute('placeholder') || el.getAttribute('title') || text(el) || el.getAttribute('name') || '';
+			const options = el.tagName === 'SELECT' ? [...el.options].slice(0, 100).map(option => ({value: option.value, label: clean(option.label).slice(0, 160), selected: option.selected})) : undefined;
+			return {ref, role, name: clean(label).slice(0, 160), type: type === 'password' ? 'password' : type, frame_url: el.tagName === 'IFRAME' ? el.src : undefined, options, options_truncated: el.tagName === 'SELECT' && el.options.length > 100};
 		});
-		const bodyText = clean(document.body ? document.body.innerText : '');
+		state.refs = new Set(roots.flatMap(root => [...root.querySelectorAll('[data-browserkit-ref]')].map(el => el.getAttribute('data-browserkit-ref')).filter(ref => ref?.startsWith(state.refPrefix + '_'))));
+		const bodyText = clean(roots.map(root => root.body?.innerText || [...(root.children || [])].map(el => el.innerText || '').join(' ')).join(' '));
 		return {url: location.href, title: document.title, text: bodyText.slice(0, Math.max(0, options.max_chars || 12000)), elements, refs: [...state.refs]};
 	}`, args)
 	if err != nil {
@@ -607,7 +409,20 @@ func (page *rodPage) elementLocked(ctx context.Context, ref ElementRef) (*rod.El
 	page.stateMu.Unlock()
 	// 这是对快照 ref 的一次性校验，不能使用 rod 默认会持续重试的 Element。
 	// 节点被替换或删除时必须立即返回 stale_reference，否则 browserClick 会表现为卡死。
-	el, err := page.page.Context(ctx).Sleeper(rod.NotFoundSleeper).Element(`[data-browserkit-ref="` + ref.Ref + `"]`)
+	el, err := page.page.Context(ctx).Sleeper(rod.NotFoundSleeper).ElementByJS(rod.Eval(`function(ref) {
+		const find = root => {
+			const direct = root.querySelector('[data-browserkit-ref="' + ref + '"]');
+			if (direct) return direct;
+			for (const node of root.querySelectorAll('*')) {
+				if (node.shadowRoot) { const found = find(node.shadowRoot); if (found) return found; }
+				if (node.tagName === 'IFRAME') {
+					try { if (node.contentDocument) { const found = find(node.contentDocument); if (found) return found; } } catch {}
+				}
+			}
+			return null;
+		};
+		return find(document);
+	}`, ref.Ref))
 	if err != nil {
 		return nil, newError("stale_reference", "页面结构已变化，元素引用已经过期", "重新调用 browserSnapshot 获取当前 ref", true)
 	}
@@ -678,10 +493,18 @@ type elementPointResult struct {
 func (page *rodPage) elementPoint(ctx context.Context, element *rod.Element) (elementPointResult, error) {
 	result, err := element.Evaluate(rod.Eval(`function() {
 		const rect = this.getBoundingClientRect();
-		const style = getComputedStyle(this);
-		const x = rect.left + rect.width / 2;
-		const y = rect.top + rect.height / 2;
-		const hit = document.elementFromPoint(x, y);
+		const style = this.ownerDocument.defaultView.getComputedStyle(this);
+		let x = rect.left + rect.width / 2;
+		let y = rect.top + rect.height / 2;
+		const root = this.getRootNode();
+		const hit = (root.elementFromPoint?.(x, y) || this.ownerDocument.elementFromPoint(x, y));
+		let view = this.ownerDocument.defaultView;
+		while (view !== view.top && view.frameElement) {
+			const frame = view.frameElement.getBoundingClientRect();
+			x += frame.left;
+			y += frame.top;
+			view = view.parent;
+		}
 		return {
 			x, y,
 			visible: !this.hidden && !this.closest('[hidden],[aria-hidden="true"]') &&
@@ -706,38 +529,52 @@ func (page *rodPage) elementPoint(ctx context.Context, element *rod.Element) (el
 }
 
 // scrollElementNaturally 将目标滚动拆成最多两段，每段之间留出短暂的
-// renderer 时间。它只操作页面滚动容器，不向调用方暴露中间滚动事件。
+// renderer 时间。依次滚动所有裁剪目标的容器和页面，避免嵌套容器本身
+// 位于视口外时只滚动内部容器，最后仍无法点击目标。
 func scrollElementNaturally(ctx context.Context, element *rod.Element) error {
+	if _, err := element.Evaluate(rod.Eval(`function() {
+		if (this.ownerDocument.defaultView !== top || this.getRootNode() !== this.ownerDocument)
+			this.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+	}`).ByUser()); err != nil {
+		return err
+	}
 	for step := 0; step < 2; step++ {
 		fraction := 0.6
 		if step == 1 {
 			fraction = 1
 		}
 		result, err := element.Evaluate(rod.Eval(`function() {
-			const rect = this.getBoundingClientRect();
-			const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
-			const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
-			const margin = Math.min(48, Math.max(12, Math.min(viewportHeight, viewportWidth) * 0.05));
-			const visible = rect.top >= margin && rect.bottom <= viewportHeight - margin &&
-				rect.left >= margin && rect.right <= viewportWidth - margin;
-			if (visible) return false;
-			let container = document.scrollingElement;
+			const doc = this.ownerDocument;
+			const view = doc.defaultView;
+			const viewportHeight = view.innerHeight || doc.documentElement.clientHeight;
+			const viewportWidth = view.innerWidth || doc.documentElement.clientWidth;
+			const containers = [];
 			let node = this.parentElement;
-			while (node && node !== document.body) {
+			while (node && node !== doc.scrollingElement) {
 				const style = getComputedStyle(node);
 				if ((style.overflowY === 'auto' || style.overflowY === 'scroll' || style.overflowY === 'overlay') && node.scrollHeight > node.clientHeight ||
 					(style.overflowX === 'auto' || style.overflowX === 'scroll' || style.overflowX === 'overlay') && node.scrollWidth > node.clientWidth) {
-					container = node;
-					break;
+					containers.push(node);
 				}
 				node = node.parentElement;
 			}
-			const containerRect = container === document.scrollingElement ?
-				{top: 0, left: 0, height: viewportHeight, width: viewportWidth} : container.getBoundingClientRect();
-			const deltaY = (rect.top + rect.height / 2) - (containerRect.top + containerRect.height / 2);
-			const deltaX = (rect.left + rect.width / 2) - (containerRect.left + containerRect.width / 2);
-			container.scrollBy({top: deltaY * ` + fmt.Sprintf("%g", fraction) + `, left: deltaX * ` + fmt.Sprintf("%g", fraction) + `, behavior: 'auto'});
-			return true;
+			containers.push(doc.scrollingElement || doc.documentElement);
+			let moved = false;
+			for (const container of containers) {
+				const rect = this.getBoundingClientRect();
+				const containerRect = container === doc.scrollingElement ?
+					{top: 0, left: 0, height: viewportHeight, width: viewportWidth} : container.getBoundingClientRect();
+				const margin = Math.min(48, Math.max(12, Math.min(containerRect.height, containerRect.width) * 0.05));
+				const centerX = rect.left + rect.width / 2;
+				const centerY = rect.top + rect.height / 2;
+				if (centerX >= containerRect.left + margin && centerX <= containerRect.left + containerRect.width - margin &&
+					centerY >= containerRect.top + margin && centerY <= containerRect.top + containerRect.height - margin) continue;
+				const deltaY = centerY - (containerRect.top + containerRect.height / 2);
+				const deltaX = centerX - (containerRect.left + containerRect.width / 2);
+				container.scrollBy({top: deltaY * ` + fmt.Sprintf("%g", fraction) + `, left: deltaX * ` + fmt.Sprintf("%g", fraction) + `, behavior: 'auto'});
+				moved = true;
+			}
+			return moved;
 		}`).ByUser())
 		if err != nil {
 			return err
@@ -866,6 +703,75 @@ func (page *rodPage) Type(ctx context.Context, ref ElementRef, text string, clea
 	return nil
 }
 
+func (page *rodPage) SelectOption(ctx context.Context, ref ElementRef, value, label string) (string, error) {
+	operationCtx, operationCancel, err := page.ctx(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer operationCancel()
+	if err := lockInteraction(operationCtx, &page.interactionMu); err != nil {
+		return "", err
+	}
+	defer page.interactionMu.Unlock()
+	el, err := page.elementLocked(operationCtx, ref)
+	if err != nil {
+		return "", err
+	}
+	if err := scrollElementNaturally(operationCtx, el); err != nil {
+		return "", err
+	}
+	if _, err := page.elementPoint(operationCtx, el); err != nil {
+		return "", err
+	}
+	result, err := el.Evaluate(rod.Eval(`function(criteria) {
+		if (this.tagName !== 'SELECT' || this.multiple) return {error: 'unsupported_select'};
+		const option = [...this.options].find(option => criteria.value ? option.value === criteria.value : option.label.trim() === criteria.label);
+		if (!option || option.disabled || option.closest('optgroup[disabled]')) return {error: 'option_not_found'};
+		this.value = option.value;
+		this.dispatchEvent(new Event('input', {bubbles: true}));
+		this.dispatchEvent(new Event('change', {bubbles: true}));
+		return {value: this.value};
+	}`, map[string]string{"value": value, "label": label}).ByUser())
+	if err != nil {
+		return "", err
+	}
+	var selection struct {
+		Value string `json:"value"`
+		Error string `json:"error"`
+	}
+	if err := result.Value.Unmarshal(&selection); err != nil {
+		return "", err
+	}
+	if selection.Error != "" {
+		return "", newError(selection.Error, "无法选择该下拉选项", "重新调用 browserSnapshot 获取可用选项", true)
+	}
+	return selection.Value, nil
+}
+
+func (page *rodPage) UploadFile(ctx context.Context, ref ElementRef, path string) error {
+	operationCtx, cancel, err := page.ctx(ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	if err := lockInteraction(operationCtx, &page.interactionMu); err != nil {
+		return err
+	}
+	defer page.interactionMu.Unlock()
+	el, err := page.elementLocked(operationCtx, ref)
+	if err != nil {
+		return err
+	}
+	check, err := el.Evaluate(rod.Eval(`function() { return this.tagName === 'INPUT' && this.type === 'file' && !this.disabled }`).ByUser())
+	if err != nil {
+		return err
+	}
+	if !check.Value.Bool() {
+		return newError("invalid_upload_target", "目标不是可用的文件输入框", "重新调用 browserSnapshot 获取 file input 的 ref", true)
+	}
+	return el.SetFiles([]string{path})
+}
+
 func (page *rodPage) Press(ctx context.Context, key string) error {
 	if err := contextErr(ctx); err != nil {
 		return err
@@ -922,6 +828,18 @@ func (page *rodPage) Wait(ctx context.Context, options WaitOptions) error {
 			return err
 		}
 		result, err := page.page.Context(operationCtx).Eval(`(condition, value) => {
+			const roots = [];
+			const visit = root => {
+				roots.push(root);
+				for (const el of root.querySelectorAll('*')) {
+					if (el.shadowRoot) visit(el.shadowRoot);
+					if (el.tagName === 'IFRAME') {
+						try { if (el.contentDocument?.documentElement) visit(el.contentDocument); } catch {}
+					}
+				}
+			};
+			visit(document);
+			const matches = selector => roots.map(root => root.querySelector(selector)).filter(Boolean);
 			const visible = element => {
 				if (!element) return false;
 				const style = getComputedStyle(element);
@@ -931,11 +849,11 @@ func (page *rodPage) Wait(ctx context.Context, options WaitOptions) error {
 					style.opacity !== '0' && rect.width > 0 && rect.height > 0;
 			};
 			switch (condition) {
-			case 'selector_visible': return visible(document.querySelector(value));
-			case 'selector_hidden': return !visible(document.querySelector(value));
+			case 'selector_visible': return matches(value).some(visible);
+			case 'selector_hidden': return !matches(value).some(visible);
 			case 'url_contains': return location.href.includes(value);
 			case 'title_contains': return document.title.includes(value);
-			case 'text_contains': return (document.body?.innerText || '').includes(value);
+			case 'text_contains': return roots.some(root => (root.body?.innerText || [...(root.children || [])].map(el => el.innerText || '').join(' ')).includes(value));
 			case 'load_complete': return document.readyState === 'complete';
 			default: return false;
 			}
@@ -1004,484 +922,6 @@ func (page *rodPage) syncState(ctx context.Context) error {
 	page.documentID = state.DocumentID
 	page.stateKnown = true
 	return nil
-}
-
-func (page *rodPage) Screenshot(ctx context.Context, options ScreenshotOptions) (Screenshot, error) {
-	if err := contextErr(ctx); err != nil {
-		return Screenshot{}, err
-	}
-	operationCtx, operationCancel, err := page.ctx(ctx)
-	if err != nil {
-		return Screenshot{}, err
-	}
-	defer operationCancel()
-	// Chrome 新版的 headless target 在刚创建或导航后可能还不是 active page；
-	// 先显式激活 target，避免 Page.captureScreenshot 返回 attach 错误。
-	if err := page.activate(operationCtx); err != nil {
-		return Screenshot{}, err
-	}
-	data, err := page.page.Context(operationCtx).Screenshot(options.FullPage, &proto.PageCaptureScreenshot{Format: proto.PageCaptureScreenshotFormatPng})
-	if err != nil {
-		return Screenshot{}, err
-	}
-	return Screenshot{Data: data, Format: "png"}, nil
-}
-
-func (page *rodPage) StartScreencast(ctx context.Context, options ScreencastOptions) (<-chan Screenshot, func(), error) {
-	if err := contextErr(ctx); err != nil {
-		return nil, nil, err
-	}
-	// 连续画面的订阅本身是由调用方 stop/ctx 结束的长生命周期操作，不能
-	// 套用单次 30 秒默认时限；启动、激活、停止和每一帧 ack 仍分别通过
-	// page.ctx 获得有界 context。
-	streamCtx, cancel := context.WithCancel(ctx)
-	frames := make(chan Screenshot, 1)
-	var stopOnce sync.Once
-	stop := func() {
-		stopOnce.Do(func() {
-			// 先解除本地事件订阅，再有界提交远端 stop。同一 Page 可能因
-			// viewport 变化或 WebSocket 重连立即启动下一条 screencast；stop
-			// 不能放到后台，否则旧 stop 可能晚于新 start 到达 Chrome，并把
-			// 新流静默停掉。这里最多占用 live goroutine 500ms，不持有页面交互锁。
-			cancel()
-			stopCtx, stopCancel, err := page.controlCtx(context.Background(), screencastStopTimeout)
-			if err != nil {
-				return
-			}
-			defer stopCancel()
-			_ = (proto.PageStopScreencast{}).Call(page.page.Context(stopCtx))
-		})
-	}
-	quality := options.Quality
-	if quality <= 0 || quality > 100 {
-		quality = 100
-	}
-	// Rod 当前未提供 screencast 启停和帧确认的高层 API。
-	start := proto.PageStartScreencast{Format: proto.PageStartScreencastFormatJpeg, Quality: &quality}
-	if options.MaxWidth > 0 {
-		start.MaxWidth = &options.MaxWidth
-	}
-	if options.MaxHeight > 0 {
-		start.MaxHeight = &options.MaxHeight
-	}
-	if options.EveryNthFrame > 0 {
-		start.EveryNthFrame = &options.EveryNthFrame
-	}
-	streamPage := page.page.Context(streamCtx)
-	var callbackMu sync.Mutex
-	wait := streamPage.EachEvent(func(event *proto.PageScreencastFrame) {
-		callbackMu.Lock()
-		defer callbackMu.Unlock()
-		frame := Screenshot{Data: event.Data, Format: "jpeg"}
-		// 只保留最新一帧，避免 CDP 生产速度超过消费速度时积压旧画面。
-		select {
-		case <-frames:
-		default:
-		}
-		select {
-		case frames <- frame:
-		default:
-		}
-		ackCtx, ackCancel, err := page.controlCtx(streamCtx, screencastAckTimeout)
-		if err == nil {
-			_ = (proto.PageScreencastFrameAck{SessionID: event.SessionID}).Call(page.page.Context(ackCtx))
-			ackCancel()
-		}
-	})
-	setupCtx, setupCancel, err := page.ctx(streamCtx)
-	if err != nil {
-		cancel()
-		return nil, nil, err
-	}
-	if err := page.activate(setupCtx); err != nil {
-		setupCancel()
-		cancel()
-		return nil, nil, err
-	}
-	if err := start.Call(page.page.Context(setupCtx)); err != nil {
-		setupCancel()
-		cancel()
-		return nil, nil, err
-	}
-	setupCancel()
-	go func() {
-		wait()
-		callbackMu.Lock()
-		close(frames)
-		callbackMu.Unlock()
-	}()
-	return frames, stop, nil
-}
-
-// DispatchInput 使用 CDP Input 域向页面发送真实浏览器输入，不执行页面 JavaScript。
-func (page *rodPage) DispatchInput(ctx context.Context, event InputEvent) error {
-	if err := contextErr(ctx); err != nil {
-		return err
-	}
-	operationCtx, operationCancel, err := page.ctx(ctx)
-	if err != nil {
-		return err
-	}
-	defer operationCancel()
-	if err := lockInteraction(operationCtx, &page.interactionMu); err != nil {
-		return err
-	}
-	defer page.interactionMu.Unlock()
-	client := page.page.Context(operationCtx)
-	switch event.Kind {
-	case "mouse":
-		typeValue, err := mouseEventType(event.Action)
-		if err != nil {
-			return err
-		}
-		button, err := mouseButton(event.Button)
-		if err != nil {
-			return err
-		}
-		pointerType := proto.InputDispatchMouseEventPointerTypeMouse
-		if event.PointerType == "pen" {
-			pointerType = proto.InputDispatchMouseEventPointerTypePen
-		} else if event.PointerType != "" && event.PointerType != "mouse" {
-			return fmt.Errorf("不支持的鼠标 pointer_type: %q", event.PointerType)
-		}
-		if err := validateInputPoint(event.X, event.Y); err != nil {
-			return err
-		}
-		buttons := event.Buttons
-		if event.Action == "down" && buttons == 0 {
-			buttons = mouseButtonMask(button)
-		}
-		err = (proto.InputDispatchMouseEvent{
-			Type: typeValue, X: event.X, Y: event.Y, DeltaX: event.DeltaX, DeltaY: event.DeltaY,
-			Button: button, Buttons: &buttons, ClickCount: event.ClickCount, Modifiers: event.Modifiers,
-			PointerType: pointerType,
-		}).Call(client)
-		if err == nil {
-			page.pointerMu.Lock()
-			page.pointerX, page.pointerY, page.pointerKnown = event.X, event.Y, true
-			page.pointerMu.Unlock()
-		}
-		return err
-	case "touch":
-		typeValue, err := touchEventType(event.Action)
-		if err != nil {
-			return err
-		}
-		points := make([]*proto.InputTouchPoint, 0, len(event.Touches))
-		for _, touch := range event.Touches {
-			if err := validateInputPoint(touch.X, touch.Y); err != nil {
-				return err
-			}
-			id := float64(touch.ID)
-			point := &proto.InputTouchPoint{X: touch.X, Y: touch.Y, ID: &id}
-			if touch.RadiusX > 0 {
-				point.RadiusX = &touch.RadiusX
-			}
-			if touch.RadiusY > 0 {
-				point.RadiusY = &touch.RadiusY
-			}
-			if touch.Force > 0 {
-				point.Force = &touch.Force
-			}
-			points = append(points, point)
-		}
-		if (event.Action == "start" || event.Action == "move") && len(points) == 0 {
-			return errors.New("touch start/move 必须包含活动触点")
-		}
-		if (event.Action == "end" || event.Action == "cancel") && len(points) != 0 {
-			return errors.New("touch end/cancel 不能包含活动触点")
-		}
-		return (proto.InputDispatchTouchEvent{Type: typeValue, TouchPoints: points, Modifiers: event.Modifiers}).Call(client)
-	case "key":
-		typeValue := proto.InputDispatchKeyEventTypeKeyUp
-		if event.Action == "down" {
-			typeValue = proto.InputDispatchKeyEventTypeKeyDown
-			if event.Text == "" {
-				typeValue = proto.InputDispatchKeyEventTypeRawKeyDown
-			}
-		} else if event.Action != "up" {
-			return fmt.Errorf("不支持的键盘 action: %q", event.Action)
-		}
-		location := event.Location
-		// KeyEvent 携带 code、location、native key code 等 Rod Keyboard API
-		// 无法完整表达的字段，必须保留 CDP Input.dispatchKeyEvent。
-		return (proto.InputDispatchKeyEvent{
-			Type: typeValue, Modifiers: event.Modifiers, Text: event.Text, UnmodifiedText: event.Text,
-			Code: event.Code, Key: event.Key, WindowsVirtualKeyCode: event.KeyCode,
-			NativeVirtualKeyCode: event.KeyCode, AutoRepeat: event.AutoRepeat,
-			IsKeypad: event.Location == 3, IsSystemKey: event.Modifiers&1 != 0, Location: &location,
-		}).Call(client)
-	case "shortcut":
-		return dispatchShortcut(client, event.Action, event.Modifiers)
-	case "composition":
-		if event.SelectionStart < 0 || event.SelectionEnd < event.SelectionStart {
-			return errors.New("输入法选区无效")
-		}
-		// Rod 没有输入法 composition 包装，只能调用 CDP Input.imeSetComposition。
-		return (proto.InputImeSetComposition{
-			Text: event.Text, SelectionStart: event.SelectionStart, SelectionEnd: event.SelectionEnd,
-		}).Call(client)
-	case "text":
-		if event.Text == "" {
-			return nil
-		}
-		return (proto.InputInsertText{Text: event.Text}).Call(client)
-	default:
-		return fmt.Errorf("不支持的浏览器输入 kind: %q", event.Kind)
-	}
-}
-
-func dispatchShortcut(client proto.Client, action string, modifiers int) error {
-	key, err := shortcutInputKey(action)
-	if err != nil {
-		return err
-	}
-	modifierKey := input.ControlLeft
-	switch modifiers {
-	case 0:
-		if input.IsMac {
-			modifierKey = input.MetaLeft
-		}
-	case input.ModifierControl:
-	case input.ModifierMeta:
-		modifierKey = input.MetaLeft
-	default:
-		return errors.New("快捷键只允许 Ctrl 或 Meta 修饰键")
-	}
-	modifier := modifierKey.Modifier()
-	modifierUp := modifierKey.Encode(proto.InputDispatchKeyEventTypeKeyUp, 0)
-	if err := modifierKey.Encode(proto.InputDispatchKeyEventTypeKeyDown, modifier).Call(client); err != nil {
-		return err
-	}
-	keyDown := key.Encode(proto.InputDispatchKeyEventTypeKeyDown, modifier)
-	keyDown.Text = ""
-	keyDown.Commands = []string{shortcutInputCommand(action)}
-	if err := keyDown.Call(client); err != nil {
-		_ = modifierUp.Call(client)
-		return err
-	}
-	if err := key.Encode(proto.InputDispatchKeyEventTypeKeyUp, modifier).Call(client); err != nil {
-		_ = modifierUp.Call(client)
-		return err
-	}
-	return modifierUp.Call(client)
-}
-
-func shortcutInputCommand(action string) string {
-	switch action {
-	case "select_all":
-		return "selectAll"
-	case "copy":
-		return "copy"
-	case "paste":
-		return "paste"
-	default:
-		return ""
-	}
-}
-
-func mouseButtonMask(button proto.InputMouseButton) int {
-	switch button {
-	case proto.InputMouseButtonLeft:
-		return 1
-	case proto.InputMouseButtonRight:
-		return 2
-	case proto.InputMouseButtonMiddle:
-		return 4
-	case proto.InputMouseButtonBack:
-		return 8
-	case proto.InputMouseButtonForward:
-		return 16
-	default:
-		return 0
-	}
-}
-
-func shortcutInputKey(action string) (input.Key, error) {
-	switch action {
-	case "select_all":
-		return input.Key('a'), nil
-	case "copy":
-		return input.Key('c'), nil
-	case "paste":
-		return input.Key('v'), nil
-	default:
-		return 0, fmt.Errorf("不支持的浏览器快捷键: %q", action)
-	}
-}
-
-func mouseEventType(action string) (proto.InputDispatchMouseEventType, error) {
-	switch action {
-	case "down":
-		return proto.InputDispatchMouseEventTypeMousePressed, nil
-	case "up":
-		return proto.InputDispatchMouseEventTypeMouseReleased, nil
-	case "move":
-		return proto.InputDispatchMouseEventTypeMouseMoved, nil
-	case "wheel":
-		return proto.InputDispatchMouseEventTypeMouseWheel, nil
-	default:
-		return "", fmt.Errorf("不支持的鼠标 action: %q", action)
-	}
-}
-
-func touchEventType(action string) (proto.InputDispatchTouchEventType, error) {
-	switch action {
-	case "start":
-		return proto.InputDispatchTouchEventTypeTouchStart, nil
-	case "end":
-		return proto.InputDispatchTouchEventTypeTouchEnd, nil
-	case "move":
-		return proto.InputDispatchTouchEventTypeTouchMove, nil
-	case "cancel":
-		return proto.InputDispatchTouchEventTypeTouchCancel, nil
-	default:
-		return "", fmt.Errorf("不支持的 touch action: %q", action)
-	}
-}
-
-func mouseButton(value string) (proto.InputMouseButton, error) {
-	if value == "" {
-		return proto.InputMouseButtonNone, nil
-	}
-	switch button := proto.InputMouseButton(value); button {
-	case proto.InputMouseButtonNone, proto.InputMouseButtonLeft, proto.InputMouseButtonMiddle,
-		proto.InputMouseButtonRight, proto.InputMouseButtonBack, proto.InputMouseButtonForward:
-		return button, nil
-	default:
-		return "", fmt.Errorf("不支持的鼠标 button: %q", value)
-	}
-}
-
-func validateInputPoint(x, y float64) error {
-	if math.IsNaN(x) || math.IsInf(x, 0) || math.IsNaN(y) || math.IsInf(y, 0) || x < 0 || y < 0 {
-		return errors.New("浏览器输入坐标无效")
-	}
-	return nil
-}
-
-func (page *rodPage) Evaluate(ctx context.Context, code string, options EvaluateOptions) (EvaluateResult, error) {
-	if err := contextErr(ctx); err != nil {
-		return EvaluateResult{}, err
-	}
-	if strings.TrimSpace(code) == "" {
-		return EvaluateResult{}, errors.New("JavaScript 代码不能为空")
-	}
-	operationCtx, operationCancel, err := page.ctx(ctx)
-	if err != nil {
-		return EvaluateResult{}, err
-	}
-	defer operationCancel()
-	evalCtx := operationCtx
-	if options.Timeout > 0 {
-		var cancel context.CancelFunc
-		evalCtx, cancel = context.WithTimeout(operationCtx, options.Timeout)
-		defer cancel()
-	}
-	// Rod Evaluate 只接受函数形式并固定若干 Runtime 参数，无法保持本接口
-	// 的任意表达式、AwaitPromise、CSP 和 command-line API 语义，因此这里
-	// 使用 Runtime.evaluate；调用仍绑定 evalCtx 的独立超时。
-	result, err := (proto.RuntimeEvaluate{
-		Expression:                  code,
-		IncludeCommandLineAPI:       true,
-		ReturnByValue:               true,
-		AwaitPromise:                options.AwaitPromise,
-		UserGesture:                 true,
-		AllowUnsafeEvalBlockedByCSP: true,
-	}).Call(page.page.Context(evalCtx))
-	if err != nil {
-		return EvaluateResult{}, err
-	}
-	if result.ExceptionDetails != nil {
-		return EvaluateResult{}, fmt.Errorf("JavaScript 执行失败: %s", result.ExceptionDetails.Text)
-	}
-	if result.Result == nil {
-		return EvaluateResult{}, errors.New("JavaScript 没有返回值")
-	}
-	if result.Result.UnserializableValue != "" {
-		return EvaluateResult{}, newError("unserializable_result", "JavaScript 返回值不可序列化", "只返回 JSON、字符串、数字、布尔值或 null", true)
-	}
-	value, err := json.Marshal(result.Result.Value)
-	if err != nil || !json.Valid(value) {
-		return EvaluateResult{}, newError("unserializable_result", "JavaScript 返回值不是有效 JSON", "不要返回 DOM 节点、函数或循环引用对象", true)
-	}
-	return EvaluateResult{Value: value, Type: string(result.Result.Type)}, nil
-}
-
-func (page *rodPage) ListAssets(ctx context.Context, options ListAssetsOptions) (ListAssetsResult, error) {
-	if err := contextErr(ctx); err != nil {
-		return ListAssetsResult{}, err
-	}
-	if options.Limit <= 0 || options.Limit > 500 {
-		return ListAssetsResult{}, errors.New("资源列表 limit 必须位于 1 到 500")
-	}
-	operationCtx, operationCancel, err := page.ctx(ctx)
-	if err != nil {
-		return ListAssetsResult{}, err
-	}
-	defer operationCancel()
-	encodedHost, _ := json.Marshal(strings.TrimSpace(options.Host))
-	expression := `(function(host, limit) {
-		const wanted = String(host || '').toLowerCase();
-		const entries = performance.getEntriesByType('resource');
-		const result = [];
-		for (const item of entries) {
-			if (!item || !item.name) continue;
-			let url;
-			try { url = new URL(item.name, location.href); } catch { continue; }
-			if (wanted && url.hostname.toLowerCase() !== wanted) continue;
-			const path = url.pathname.split('/').filter(Boolean);
-			result.push({
-				name: path[path.length - 1] || url.hostname,
-				url: url.href,
-				initiator_type: item.initiatorType || '',
-				response_status: Number(item.responseStatus) || 0,
-				transfer_bytes: Number(item.transferSize) || 0,
-				encoded_bytes: Number(item.encodedBodySize) || 0,
-				decoded_bytes: Number(item.decodedBodySize) || 0,
-				duration_ms: Number(item.duration) || 0
-			});
-		}
-		return result.slice(-Math.max(1, Math.min(501, Number(limit) || 100)));
-	})(` + string(encodedHost) + `,` + fmt.Sprint(options.Limit+1) + `)`
-	result, err := (proto.RuntimeEvaluate{Expression: expression, ReturnByValue: true}).Call(page.page.Context(operationCtx))
-	if err != nil {
-		return ListAssetsResult{}, err
-	}
-	if result.ExceptionDetails != nil || result.Result == nil {
-		return ListAssetsResult{}, errors.New("读取页面资源列表失败")
-	}
-	value, err := json.Marshal(result.Result.Value)
-	if err != nil {
-		return ListAssetsResult{}, err
-	}
-	var assets []Asset
-	if err := json.Unmarshal(value, &assets); err != nil {
-		return ListAssetsResult{}, fmt.Errorf("解码页面资源列表: %w", err)
-	}
-	resultValue := ListAssetsResult{Assets: assets, Truncated: len(assets) > options.Limit}
-	if resultValue.Truncated {
-		resultValue.Assets = assets[len(assets)-options.Limit:]
-	}
-	return resultValue, nil
-}
-
-func (page *rodPage) AddScriptToEvaluateOnNewDocument(ctx context.Context, script string) error {
-	if err := contextErr(ctx); err != nil {
-		return err
-	}
-	if strings.TrimSpace(script) == "" {
-		return errors.New("注入 JavaScript 不能为空")
-	}
-	operationCtx, operationCancel, err := page.ctx(ctx)
-	if err != nil {
-		return err
-	}
-	defer operationCancel()
-	// EvalOnNewDocument 是 Rod 对 Page.addScriptToEvaluateOnNewDocument 的
-	// 包装；这里只需安装脚本，不需要向调用方暴露 remove 回调。
-	_, err = page.page.Context(operationCtx).EvalOnNewDocument(script)
-	return err
 }
 
 func (page *rodPage) Close(ctx context.Context) error {

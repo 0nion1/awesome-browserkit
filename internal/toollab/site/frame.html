@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Embedded checkout</title></head>
+<body>
+  <h2>Embedded checkout</h2>
+  <label for="frame-code">Frame code</label><input id="frame-code">
+  <button id="frame-action">Frame action</button>
+  <p id="frame-result">Frame idle</p>
+  <div id="frame-shadow-host"></div>
+  <label for="frame-attachment">Frame attachment</label><input id="frame-attachment" type="file" accept="text/plain">
+  <p id="frame-upload-result">No frame attachment</p>
+  <script>
+    document.querySelector('#frame-action').addEventListener('click', () => {
+      document.querySelector('#frame-result').textContent = `Frame clicked: ${document.querySelector('#frame-code').value}`
+    })
+    const shadow = document.querySelector('#frame-shadow-host').attachShadow({mode: 'open'})
+    shadow.innerHTML = '<button id="frame-shadow-action">Frame shadow action</button><p id="frame-shadow-result">Frame shadow idle</p>'
+    shadow.querySelector('#frame-shadow-action').addEventListener('click', () => {
+      shadow.querySelector('#frame-shadow-result').textContent = 'Frame shadow clicked'
+    })
+    document.querySelector('#frame-attachment').addEventListener('change', event => {
+      document.querySelector('#frame-upload-result').textContent = `Frame uploaded: ${event.target.files?.[0]?.name || 'none'}`
+    })
+  </script>
+</body>
+</html>

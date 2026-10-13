@@ -32,13 +32,13 @@ func (manager *Manager) Functions() []Function {
 		{Name: "browserActivateTab", Description: "激活指定浏览器 Tab，让后续直播画面和输入切换到该 Tab。", Handler: manager.activateTabFunction},
 		{Name: "browserCloseTab", Description: "关闭浏览器 session 中指定的网页 Tab。", Handler: manager.closeTabFunction},
 		{Name: "browserNavigate", Description: "在已有浏览器 page 中导航到 HTTP/HTTPS 地址，返回前等待页面空闲。", Handler: manager.Navigate},
-		{Name: "browserSnapshot", Description: "获取页面文本摘要和绑定 revision 的可交互元素引用；先同步 Tab 状态。省略 page_id 时使用最新 active page，并返回 active_page_id、tabs_revision、tabs_changed 和 Tab 摘要；支持 max_elements 限量和 offset 分页，下一页使用 next_offset。", Handler: manager.Snapshot},
-		{Name: "browserClick", Description: "点击指定 page_id 页面快照中的元素引用。ref 只能用于生成它的 page_id。", Handler: manager.Click},
-		{Name: "browserHover", Description: "将指针移动到指定 page_id 的快照元素。ref 只能用于生成它的页面。", Handler: manager.Hover},
-		{Name: "browserType", Description: "向指定 page_id 页面元素输入文本。ref 只能用于生成它的 page_id。默认覆盖原值，append=true 时追加。响应不会回显输入内容。", Handler: manager.Type},
-		{Name: "browserSelectOption", Description: "按 browserSnapshot 返回的 value 或可见 label，选择指定 page_id 中原生单选下拉框的选项；需要同一快照的 ref 和 revision。", Handler: manager.SelectOption},
-		{Name: "browserPress", Description: "向指定 page_id 页面发送白名单按键。", Handler: manager.Press},
-		{Name: "browserScroll", Description: "在指定 page_id 发送滚轮事件，delta_x/delta_y 为 CSS 像素；省略 x/y 时以视口中心为起点，也可指定坐标滚动嵌套区域。", Handler: manager.Scroll},
+		{Name: "browserSnapshot", Description: "获取页面文本摘要和绑定 revision 的可交互元素引用；先同步 Tab 状态。省略 page_id 时使用最新 active page，并返回 active_page_id、tabs_revision、tabs_changed 和 Tab 摘要；支持 max_elements 限量和 offset 分页，下一页使用 next_offset。交互后页面内容或控件状态可能变化，即使 revision 未变也可能需要重新获取快照；元素列表中缺少某个控件时，它也可能尚未启用。", Handler: manager.Snapshot},
+		{Name: "browserClick", Description: "点击指定 page_id 页面快照中的元素引用。ref 只能用于生成它的 page_id。点击后页面内容或控件状态可能变化，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.Click},
+		{Name: "browserHover", Description: "将指针移动到指定 page_id 的快照元素。ref 只能用于生成它的页面。悬停可能展开菜单或显示新控件，操作这些控件前可能需要重新调用 browserSnapshot。", Handler: manager.Hover},
+		{Name: "browserType", Description: "向指定 page_id 页面元素输入文本。ref 只能用于生成它的 page_id。默认覆盖原值，append=true 时追加。响应不会回显输入内容。输入可能启用按钮或显示新控件；完成一组输入后，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.Type},
+		{Name: "browserSelectOption", Description: "按 browserSnapshot 返回的 value 或可见 label，选择指定 page_id 中原生单选下拉框的选项；需要同一快照的 ref 和 revision。选择后页面内容或控件状态可能变化，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.SelectOption},
+		{Name: "browserPress", Description: "向指定 page_id 页面发送白名单按键。按键后页面内容或控件状态可能变化，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.Press},
+		{Name: "browserScroll", Description: "在指定 page_id 发送滚轮事件，delta_x/delta_y 为 CSS 像素；省略 x/y 时以视口中心为起点，也可指定坐标滚动嵌套区域。滚动可能触发懒加载或显示新控件，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.Scroll},
 		{Name: "browserWait", Description: "等待指定 page_id 页面的状态。selector_visible/selector_hidden 可直接使用 browserSnapshot 返回的 ref 或 CSS selector；也支持 url_contains、title_contains、text_contains 和 load_complete。", Handler: manager.Wait},
 		{Name: "browserScreenshot", Description: "把指定 page_id 页面截图保存为宿主可读取的 PNG 文件。", Handler: manager.Screenshot},
 		{Name: "browserAssets", Description: "读取指定 page_id 当前页面已经观测到的资源列表；返回脚本、样式、图片、字体和 XHR/Fetch 等资源的名称、实际地址、发起类型、状态、大小与耗时；可用 host 过滤域名。不会主动爬取未访问页面。", Handler: manager.ListAssets},
@@ -48,7 +48,7 @@ func (manager *Manager) Functions() []Function {
 		functions = append(functions, Function{Name: "browserEvaluate", Description: "在指定页面的 console 域执行一段 JavaScript，并返回有限 JSON 值。", Handler: manager.Evaluate})
 	}
 	if manager.config.UploadDir != "" {
-		functions = append(functions, Function{Name: "browserUploadFile", Description: "将宿主 UploadDir 目录内一个普通文件设置到指定 page_id 的原生 file input；需要快照 ref、revision 和绝对路径，响应只返回文件名及字节数。", Handler: manager.UploadFile})
+		functions = append(functions, Function{Name: "browserUploadFile", Description: "将宿主 UploadDir 目录内一个普通文件设置到指定 page_id 的原生 file input；需要快照 ref、revision 和绝对路径，响应只返回文件名及字节数。设置文件后页面内容或控件状态可能变化，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.UploadFile})
 	}
 	if manager.config.AllowDevtools {
 		functions = append(functions,

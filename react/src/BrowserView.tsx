@@ -11,6 +11,7 @@ type BrowserViewport = { width: number; height: number }
 type ViewportTarget = BrowserViewport & { sessionID: string; pageID: string; generation: number; attempt: number; force: boolean }
 const viewportResizeDebounceMS = 200
 const viewportResizeRetryMS = 500
+const agentBusyOverlayCloseDelayMS = 300
 
 const sameViewport = (left: BrowserViewport | undefined, right: BrowserViewport) =>
   left?.width === right.width && left.height === right.height
@@ -81,6 +82,8 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
   const [activePageID, setActivePageID] = useState<string | undefined>(undefined)
   const [hasFrame, setHasFrame] = useState(false)
   const [waitingForFrame, setWaitingForFrame] = useState(false)
+  const [busyOverlayVisible, setBusyOverlayVisible] = useState(busy)
+  const interactionBusy = busy || busyOverlayVisible
   const [syncing, setSyncing] = useState(false)
   const [closing, setClosing] = useState(false)
   const closingRef = useRef(false)
@@ -161,7 +164,7 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
   const flushViewportRef = useRef<() => void>(() => undefined)
   const correctViewportRef = useRef<(pageID: string) => void>(() => undefined)
   const browserControllerRef = useRef(false)
-  const readOnlyRef = useRef(readOnly); readOnlyRef.current = readOnly || busy || closing
+  const readOnlyRef = useRef(readOnly); readOnlyRef.current = readOnly || interactionBusy || closing
   const browserControlRevisionRef = useRef(0)
   sideViewportSizeRef.current = sideViewportSize
   browserControllerRef.current = !readOnlyRef.current && browserControl?.controller === true
@@ -221,6 +224,16 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
   useEffect(() => {
     if (busy) loseBrowserControl()
   }, [busy])
+
+  useEffect(() => {
+    if (busy) {
+      setBusyOverlayVisible(true)
+      return
+    }
+    if (!busyOverlayVisible) return
+    const timer = window.setTimeout(() => setBusyOverlayVisible(false), agentBusyOverlayCloseDelayMS)
+    return () => window.clearTimeout(timer)
+  }, [busy, busyOverlayVisible])
 
   const applyBrowserControl = (state: BrowserControlState) => {
     if (state.type !== 'browser_control') return
@@ -436,9 +449,9 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
   }, [liveViewEnabled, panelHost])
 
   useEffect(() => {
-    if (readOnly || busy || closing || !browserControl?.controller || !liveViewEnabled || !sessionID || !activePageID || !sideViewportSize) return
+    if (readOnly || interactionBusy || closing || !browserControl?.controller || !liveViewEnabled || !sessionID || !activePageID || !sideViewportSize) return
     scheduleViewport(activePageID, sideViewportSize, false, true)
-  }, [activePageID, browserControl?.controller, liveViewEnabled, sessionID, sideViewportSize, readOnly, busy, closing])
+  }, [activePageID, browserControl?.controller, liveViewEnabled, sessionID, sideViewportSize, readOnly, interactionBusy, closing])
 
   useEffect(() => {
     // 浮窗、侧栏和最小化状态会重建 canvas；旧 backing store 不能复用。
@@ -858,7 +871,7 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
     setActivePageID(state.active_page_id || pageID)
     setPageURL(state.url)
     if (state.viewport?.width && state.viewport.height) setViewport(state.viewport)
-    setWaitingForFrame(true)
+    // 导航返回前可能已经绘制最终帧；状态同步不能重新开启等待。
     void source.cachedFrame(sessionID).then((cached) => drawFrame(cached, state.active_page_id || pageID, false)).catch(() => undefined)
   }
 
@@ -873,6 +886,7 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
       await syncAfterNavigation(pageID)
       setNotice(undefined)
     } catch (error) {
+      setWaitingForFrame(false)
       setNotice(error instanceof Error ? `前往页面失败：${error.message}` : '前往页面失败')
     }
   }
@@ -886,6 +900,7 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
       await syncAfterNavigation(pageID)
       setNotice(undefined)
     } catch (error) {
+      setWaitingForFrame(false)
       setNotice(error instanceof Error ? `刷新页面失败：${error.message}` : '刷新页面失败')
     }
   }
@@ -958,7 +973,7 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
   }
 
   const activeTab = tabs.find((tab) => tab.page_id === activePageID)
-  const controller = !readOnly && !busy && !closing && browserControl?.controller === true
+  const controller = !readOnly && !interactionBusy && !closing && browserControl?.controller === true
   const inspectionLocked = inspecting && Boolean(inspected || area)
   const showAddress = visible('toolbar') && visible('addressBar')
   const showReload = visible('toolbar') && visible('reload')
@@ -969,9 +984,9 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
   const showToolbar = showAddress || showReload || showClose || showDevtools || showInspect
   const takeoverSeconds = Math.ceil(controlRetryAfterMS / 1000)
 
-  const content = <section ref={setPanelHost} data-part="root" className={`browserkit ${className} browser-live-window browser-live-window-side-panel ${devtoolsEnabled ? 'browser-live-window-devtools-enabled' : ''} ${devtoolsPanelOpen ? 'browser-live-window-devtools-open' : ''} ${devtoolsOptions?.resizable === false ? 'browser-live-window-devtools-fixed' : ''}   ${syncing ? 'browser-live-window-syncing' : ''} `} style={style} aria-busy={busy || closing || undefined} aria-label={liveViewEnabled ? syncing ? '浏览器页面直播（同步中）' : '浏览器页面直播' : '浏览器开发诊断'} onKeyDownCapture={(event) => { if (inspecting) return; if (devtoolsEnabled && devtoolsOptions?.shortcut !== false && event.key === "F12") { event.preventDefault(); event.stopPropagation(); devtoolsPanelOpen ? closeDevtoolsPanel() : openDevtoolsPanel() } }}>
-    {busy && <div className="browser-live-busy-overlay" role="status">Agent 正在操作浏览器…</div>}
-    {visible('tabs') && <div data-part="tabs" className={`browser-live-tab-list ${classNames?.tabs || ''}`} role="tablist" aria-label="浏览器 Tab 列表" inert={busy || closing || inspectionLocked || undefined}>
+  const content = <section ref={setPanelHost} data-part="root" className={`browserkit ${className} browser-live-window browser-live-window-side-panel ${devtoolsEnabled ? 'browser-live-window-devtools-enabled' : ''} ${devtoolsPanelOpen ? 'browser-live-window-devtools-open' : ''} ${devtoolsOptions?.resizable === false ? 'browser-live-window-devtools-fixed' : ''}   ${syncing ? 'browser-live-window-syncing' : ''} `} style={style} aria-busy={interactionBusy || closing || undefined} aria-label={liveViewEnabled ? syncing ? '浏览器页面直播（同步中）' : '浏览器页面直播' : '浏览器开发诊断'} onKeyDownCapture={(event) => { if (inspecting) return; if (devtoolsEnabled && devtoolsOptions?.shortcut !== false && event.key === "F12") { event.preventDefault(); event.stopPropagation(); devtoolsPanelOpen ? closeDevtoolsPanel() : openDevtoolsPanel() } }}>
+    {interactionBusy && <div className="browser-live-busy-overlay" role="status">Agent 正在操作浏览器…</div>}
+    {visible('tabs') && <div data-part="tabs" className={`browser-live-tab-list ${classNames?.tabs || ''}`} role="tablist" aria-label="浏览器 Tab 列表" inert={interactionBusy || closing || inspectionLocked || undefined}>
       {tabs.length === 0 && <span className="browser-live-tab-empty">没有可用页面</span>}
       {tabs.map((tab) => <div key={tab.page_id} data-part="tab" className={`browser-live-tab-row ${classNames?.tab || ''} ${tab.page_id === activePageID ? 'browser-live-tab-row-active' : ''} ${tab.status === 'loading' ? 'browser-live-tab-row-loading' : ''}`}>
         <button type="button" role="tab" disabled={!liveViewEnabled || !controller} aria-selected={tab.page_id === activePageID} aria-busy={tab.status === 'loading' || undefined} onClick={() => void selectTab(tab.page_id)} title={tab.url || tab.title || tab.page_id}>
@@ -983,7 +998,7 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
       {!readOnly && liveViewEnabled && visible('newTab') && <button type="button" className="browser-new-tab" aria-label="新建浏览器 Tab" disabled={!controller} onClick={() => void source.newTab(sessionID, viewerID).catch((error: Error) => setNotice(error.message))}><Plus size={14} /></button>}
     </div>}
     {showToolbar && <header data-part="toolbar" className={`browser-live-window-header ${classNames?.toolbar || ''}`}>
-      <div className="browser-live-address-row" inert={busy || closing || undefined} onPointerDown={(event) => { event.stopPropagation() }}>
+      <div className="browser-live-address-row" inert={interactionBusy || closing || undefined} onPointerDown={(event) => { event.stopPropagation() }}>
         {showAddress && <i aria-hidden="true" />}
         {showAddress && <input
           aria-label="浏览器页面地址"
@@ -1002,10 +1017,10 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
       <div>
         {showClose && <button type="button" aria-label="关闭浏览器" disabled={!browserControl?.controller || closing || inspectionLocked} onClick={() => void close()}><X size={14} /></button>}
         {showDevtools && <button type="button" aria-label="切换开发诊断 F12" aria-pressed={devtoolsPanelOpen} onClick={() => devtoolsPanelOpen ? closeDevtoolsPanel() : openDevtoolsPanel()}><Code2 size={15} /></button>}
-        {showInspect && <button type="button" aria-label="选择页面元素" aria-pressed={inspecting} disabled={!controller || !hasFrame || busy} onClick={() => { if (inspecting) stopInspecting(); else { clearKeyboardState(); inputRef.current?.blur(); inspectingRef.current = true; setInspecting(true) } }}><MousePointer2 size={15} /></button>}
+        {showInspect && <button type="button" aria-label="选择页面元素" aria-pressed={inspecting} disabled={!controller || !hasFrame || interactionBusy} onClick={() => { if (inspecting) stopInspecting(); else { clearKeyboardState(); inputRef.current?.blur(); inspectingRef.current = true; setInspecting(true) } }}><MousePointer2 size={15} /></button>}
       </div>
     </header>}
-    {<div className={`browser-live-panel-body browser-live-panel-${mobilePanel}`} inert={busy || closing || undefined} style={devtoolsHeight ? { '--browser-devtools-height': devtoolsHeight } as CSSProperties : undefined}>
+    {<div className={`browser-live-panel-body browser-live-panel-${mobilePanel}`} inert={interactionBusy || closing || undefined} style={devtoolsHeight ? { '--browser-devtools-height': devtoolsHeight } as CSSProperties : undefined}>
       {devtoolsEnabled && devtoolsPanelOpen && <div className="browser-live-mobile-switch" role="tablist" aria-label="浏览器面板视图">
         <button type="button" role="tab" aria-selected={mobilePanel === 'page'} onClick={() => setMobilePanel('page')}>页面</button>
         <button type="button" role="tab" aria-selected={mobilePanel === 'devtools'} onClick={() => setMobilePanel('devtools')}>开发诊断</button>
@@ -1078,7 +1093,7 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
         onKeyUp={(event) => event.stopPropagation()}
         onClick={toggleMobileInput}
       ><Keyboard size={13} /><span>{mobileInputActive ? '完成' : '输入'}</span></button>}
-      {(visible('controlStatus') || visible('takeover') && !readOnly) && liveViewEnabled && hasFrame && !controller && !busy && !closing && <div className="browser-live-window-control-overlay" role="status" aria-label="浏览器观察模式">
+      {(visible('controlStatus') || visible('takeover') && !readOnly) && liveViewEnabled && hasFrame && !controller && !interactionBusy && !closing && <div className="browser-live-window-control-overlay" role="status" aria-label="浏览器观察模式">
         <div className="browser-live-window-control-copy">
           {visible('controlStatus') && <span>{readOnly ? '只读浏览器视图' : browserControl ? '当前浏览器正在由其他窗口控制' : '正在确认浏览器操作权…'}</span>}
           {visible('takeover') && browserControl && !readOnly && <button

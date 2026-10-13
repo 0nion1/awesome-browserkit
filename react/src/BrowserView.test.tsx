@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { activateBrowserTab, browserDevtoolsStreamURL, browserStateStreamURL, browserStreamURL, closeBrowser, closeBrowserTab, fetchBrowserAssets, fetchBrowserDevtoolsState, fetchBrowserState, fetchCachedBrowserFrame, setBrowserTabViewport, takeBrowserControl, type BrowserTabView, type BrowserViewState } from './client'
+import { activateBrowserTab, navigateBrowserTab, browserDevtoolsStreamURL, browserStateStreamURL, browserStreamURL, closeBrowser, closeBrowserTab, fetchBrowserAssets, fetchBrowserDevtoolsState, fetchBrowserState, fetchCachedBrowserFrame, setBrowserTabViewport, takeBrowserControl, type BrowserTabView, type BrowserViewState } from './client'
 import { BrowserView, type BrowserViewProps } from './BrowserView'
 import { httpBrowserSource } from './source'
 function BrowserLiveWindow({sessionID, devtoolsEnabled, liveViewEnabled, agentOperating}: {sessionID?:string;devtoolsEnabled?:boolean;liveViewEnabled?:boolean;agentOperating?:boolean;[key:string]:unknown}) { return <BrowserView endpoint={sessionID || '/browser'} devtools={devtoolsEnabled} liveView={liveViewEnabled} busy={agentOperating} /> }
@@ -1178,6 +1178,58 @@ describe('BrowserLiveWindow', () => {
     expect(mockedCloseBrowser).toHaveBeenCalledWith('/browser', expect.any(String))
     expect(close).toBeDisabled()
     await act(async () => { finish?.() })
+  })
+
+  it('keeps the Agent overlay and input lock for 300ms after busy ends', async () => {
+    mockedFetchBrowserState.mockResolvedValue(singleTabState())
+    const props = { endpoint: '/browser', viewerID: 'viewer-agent-overlay' }
+    const { rerender } = render(<BrowserView {...props} busy />)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    await receiveFrame()
+    rerender(<BrowserView {...props} busy={false} />)
+    expect(screen.getByText('Agent 正在操作浏览器…')).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: '浏览器页面地址' })).toBeDisabled()
+    await act(async () => { vi.advanceTimersByTime(299) })
+    expect(screen.getByText('Agent 正在操作浏览器…')).toBeInTheDocument()
+    await act(async () => { vi.advanceTimersByTime(1) })
+    expect(screen.queryByText('Agent 正在操作浏览器…')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: '浏览器页面地址' })).toBeEnabled()
+
+    rerender(<BrowserView {...props} busy />)
+    rerender(<BrowserView {...props} busy={false} />)
+    await act(async () => { vi.advanceTimersByTime(150) })
+    rerender(<BrowserView {...props} busy />)
+    await act(async () => { vi.advanceTimersByTime(300) })
+    expect(screen.getByText('Agent 正在操作浏览器…')).toBeInTheDocument()
+  })
+
+  it('导航返回前已绘制最终帧时不重新显示加载遮罩', async () => {
+    const target = 'https://example.com/?query=kept#fragment'
+    mockedFetchBrowserState.mockResolvedValueOnce(singleTabState({ url: 'about:blank' })).mockResolvedValue(singleTabState({ url: target }))
+    let finishNavigation!: () => void
+    vi.mocked(navigateBrowserTab).mockImplementationOnce(() => new Promise<void>((resolve) => { finishNavigation = resolve }))
+    render(<BrowserView endpoint="/browser" viewerID="viewer-navigation" />)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    await receiveFrame()
+    const input = screen.getByRole('textbox', { name: '浏览器页面地址' })
+    fireEvent.change(input, { target: { value: target } })
+    fireEvent.click(screen.getByRole('button', { name: '前往页面' }))
+    await receiveFrame()
+    await act(async () => { finishNavigation(); await Promise.resolve(); await Promise.resolve() })
+    expect(input).toHaveValue(target)
+    expect(screen.queryByText('页面加载中…')).not.toBeInTheDocument()
+  })
+
+  it('导航失败时保留画面并结束加载等待', async () => {
+    mockedFetchBrowserState.mockResolvedValue(singleTabState())
+    vi.mocked(navigateBrowserTab).mockRejectedValueOnce(new Error('navigation failed'))
+    render(<BrowserView endpoint="/browser" viewerID="viewer-navigation-error" />)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    await receiveFrame()
+    fireEvent.change(screen.getByRole('textbox', { name: '浏览器页面地址' }), { target: { value: 'https://example.com/unavailable' } })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '前往页面' })); await Promise.resolve(); await Promise.resolve() })
+    expect(screen.getByText('前往页面失败：navigation failed')).toBeInTheDocument()
+    expect(screen.queryByText('页面加载中…')).not.toBeInTheDocument()
   })
 
 })

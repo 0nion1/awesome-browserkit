@@ -65,15 +65,6 @@ func mainRun() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	sessionConfig := browserkit.SessionConfig{ExecPath: *chrome, RemoteAddress: *remote}
-	if mode == "new" && !*list {
-		dir, err := os.MkdirTemp("", "browserkit-profile-")
-		if err != nil {
-			return err
-		}
-		defer os.RemoveAll(dir)
-		sessionConfig.UserDataDir = dir
-		sessionConfig.CleanupUserDataDir = true
-	}
 	manager, err := browserkit.NewManager(browserkit.Config{
 		AllowEvaluate:       *allowEvaluate,
 		AllowPrivateNetwork: *private,

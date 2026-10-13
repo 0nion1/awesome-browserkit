@@ -123,7 +123,7 @@ func (session *rodSession) controlCtx(parent context.Context, timeout time.Durat
 }
 
 // NewSession 创建本地或远程浏览器会话。下载默认被禁用。
-func NewSession(ctx context.Context, config SessionConfig) (Session, error) {
+func NewSession(ctx context.Context, config SessionConfig) (result Session, err error) {
 	if ctx == nil {
 		return nil, errors.New("browserkit context 不能为空")
 	}
@@ -144,7 +144,7 @@ func NewSession(ctx context.Context, config SessionConfig) (Session, error) {
 	var transport *boundedWebSocket
 	var launch *launcher.Launcher
 	var ownsLauncher bool
-	var err error
+	var profile localBrowserProfile
 	sessionContext, cancel := context.WithCancel(context.Background())
 	startupCtx, startupCancel := context.WithTimeout(ctx, config.OperationTimeout)
 	defer startupCancel()
@@ -163,11 +163,23 @@ func NewSession(ctx context.Context, config SessionConfig) (Session, error) {
 				return nil, newError("browser_unavailable", "没有找到本地 Chrome", "配置 ExecPath 或启动远程 CDP 浏览器", true)
 			}
 		}
+		profile, err = newLocalBrowserProfile(config)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		profile.useInstalledBrowserIdentity(startupCtx, address)
+		defer func() {
+			if err != nil {
+				profile.cleanupFailedLaunch(launch)
+			}
+		}()
 		// Browser 永久运行在 headless 模式；直播来自 CDP 截图，不打开宿主 GUI。
 		// Launcher 只负责启动阶段；使用 startupCtx 限制等待 Chrome
 		// remote-debugging URL，启动完成后由 sessionContext 管理会话生命周期。
 		launch = launcher.New().Bin(address).Context(startupCtx).Leakless(config.Leakless).
 			Headless(true).Proxy(config.Proxy)
+		profile.configureLauncher(launch)
 		if config.ForceSandbox {
 			launch.Delete("no-sandbox")
 		} else {
@@ -175,12 +187,6 @@ func NewSession(ctx context.Context, config SessionConfig) (Session, error) {
 		}
 		launch.Set("disable-downloads").Set("disable-background-networking").Set("disable-extensions")
 		launch.Set("no-first-run").Set("no-default-browser-check").Set("disable-popup-blocking")
-		if config.UserAgent != "" {
-			launch.Set("user-agent", config.UserAgent)
-		}
-		if config.UserDataDir != "" {
-			launch.Set("user-data-dir", config.UserDataDir)
-		}
 		if len(config.InsecureDomains) > 0 {
 			launch.Set("unsafely-treat-insecure-origin-as-secure", strings.Join(config.InsecureDomains, ","))
 		}
@@ -255,7 +261,7 @@ func NewSession(ctx context.Context, config SessionConfig) (Session, error) {
 		}
 	}
 	return &rodSession{browser: browser, launcher: launch, ownsLauncher: ownsLauncher,
-		cleanup: config.CleanupUserDataDir && config.UserDataDir != "", operationTimeout: config.OperationTimeout,
+		cleanup: profile.cleanup, operationTimeout: config.OperationTimeout,
 		cancel: cancel, transport: transport, pages: make(map[proto.TargetTargetID]*rodPage), stopNetworkPolicy: stopNetworkPolicy}, nil
 }
 

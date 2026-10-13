@@ -146,7 +146,8 @@ browserkit --url 'https://example.com'
 ```
 
 默认 `new` 模式使用临时 profile，以无头模式运行。
-Cookie 和本地存储与日常浏览器隔离；退出时关闭浏览器并删除临时 profile。
+所有本地启动的会话（包括库调用和 HTTP 服务）各有独立临时 profile。Cookie 和本地存储与日常浏览器隔离；关闭会话时删除 profile。显式设置 `SessionConfig.UserDataDir` 时沿用原有清理配置。
+本地浏览器默认从实际安装的 Chrome 版本生成桌面 UA，并将其作为会话 profile 的身份设置；只有显式设置 `SessionConfig.UserAgent` 才覆盖 UA。无法读取版本时沿用 Chrome 自身的身份。启动时移除 Rod 的自动化标记和站点隔离覆盖，并禁用 Blink 的 `AutomationControlled` 特性。远程浏览器保持原有 profile 与启动设置。
 不传 `--url` 时，由 Agent 创建页面。
 
 ### `--url`

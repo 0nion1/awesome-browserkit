@@ -148,7 +148,8 @@ browserkit --url 'https://example.com'
 ```
 
 The default `new` mode runs headless with a temporary profile.
-Cookies and local storage are isolated from the everyday browser; exiting closes the browser and removes the profile.
+Every locally launched session, including library and HTTP server sessions, gets its own temporary profile. Cookies and local storage are isolated from the everyday browser; closing the session removes the profile. An explicit `SessionConfig.UserDataDir` keeps its existing cleanup setting.
+The local launcher builds a desktop user agent from the installed Chrome version and keeps it with the session profile, unless `SessionConfig.UserAgent` is explicitly set. If the version cannot be read, Chrome's own identity is used. It removes Rod's automation flag and site isolation overrides and disables Blink's `AutomationControlled` feature. Remote browser sessions retain their existing profile and launch settings.
 Without `--url`, the agent creates a page through a tool call.
 
 ### `--url`

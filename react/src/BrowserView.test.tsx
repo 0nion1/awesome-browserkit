@@ -202,7 +202,7 @@ describe('BrowserLiveWindow', () => {
     expect(sentInputs()).toHaveLength(2)
   })
 
-  it('debounces hover inspection and cancels pending positions on drag, Escape and unmount', async () => {
+  it('samples continuous hover at 20Hz with an immediate first check and the latest position', async () => {
     mockedFetchBrowserState.mockResolvedValue(singleTabState())
     const source = { ...httpBrowserSource, inspectPoint: vi.fn(async () => ({ ref: 'r_1', revision: 1, role: 'button', url: 'https://example.com', bounds: { x: 90, y: 90, width: 80, height: 30 } })) }
     const { unmount } = render(<BrowserView endpoint="/browser" source={source} onElementSelect={vi.fn()} />)
@@ -216,28 +216,58 @@ describe('BrowserLiveWindow', () => {
       fireEvent(overlay, event)
     }
     move(100)
-    await act(async () => { await vi.advanceTimersByTimeAsync(60) })
-    move(200)
-    await act(async () => { await vi.advanceTimersByTimeAsync(99) })
-    expect(source.inspectPoint).not.toHaveBeenCalled()
-    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
-    expect(source.inspectPoint).toHaveBeenCalledExactlyOnceWith('/browser', 'page-a', 200, 100, expect.any(String))
-    move(300)
+    expect(source.inspectPoint).toHaveBeenCalledExactlyOnceWith('/browser', 'page-a', 100, 100, expect.any(String))
+    for (const x of [200, 300, 400, 500]) {
+      await act(async () => { await vi.advanceTimersByTimeAsync(10) })
+      move(x)
+    }
+    expect(source.inspectPoint).toHaveBeenCalledTimes(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(10) })
+    expect(source.inspectPoint).toHaveBeenLastCalledWith('/browser', 'page-a', expect.closeTo(500, 5), 100, expect.any(String))
+    expect(source.inspectPoint).toHaveBeenCalledTimes(2)
+    expect(document.querySelector('.browser-element-inspector-outline')).toBeInTheDocument()
+    move(600)
     fireEvent(overlay, pointerEvent('pointerdown'))
     await act(async () => { await vi.advanceTimersByTimeAsync(100) })
-    expect(source.inspectPoint).toHaveBeenCalledTimes(1)
+    expect(source.inspectPoint).toHaveBeenCalledTimes(2)
     fireEvent.keyDown(overlay, { key: 'Escape' })
     fireEvent.click(screen.getByRole('button', { name: '选择页面元素' }))
     const freshOverlay = document.querySelector('.browser-element-inspector')!
     fireEvent(freshOverlay, pointerEvent('pointermove', 0))
+    expect(source.inspectPoint).toHaveBeenCalledTimes(3)
+    fireEvent(freshOverlay, pointerEvent('pointermove', 0))
     fireEvent.keyDown(freshOverlay, { key: 'Escape' })
     await act(async () => { await vi.advanceTimersByTimeAsync(100) })
-    expect(source.inspectPoint).toHaveBeenCalledTimes(1)
+    expect(source.inspectPoint).toHaveBeenCalledTimes(3)
     fireEvent.click(screen.getByRole('button', { name: '选择页面元素' }))
+    fireEvent(document.querySelector('.browser-element-inspector')!, pointerEvent('pointermove', 0))
     fireEvent(document.querySelector('.browser-element-inspector')!, pointerEvent('pointermove', 0))
     unmount()
     await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+    expect(source.inspectPoint).toHaveBeenCalledTimes(4)
+  })
+
+  it('shows a slow hover reply during movement and samples only the latest waiting point', async () => {
+    mockedFetchBrowserState.mockResolvedValue(singleTabState())
+    const element = { ref: 'r_1', revision: 1, role: 'button', url: 'https://example.com', bounds: { x: 90, y: 90, width: 80, height: 30 } }
+    let finish!: (value: typeof element) => void
+    const source = { ...httpBrowserSource, inspectPoint: vi.fn(() => new Promise<typeof element>((resolve) => { finish = resolve })) }
+    render(<BrowserView endpoint="/browser" source={source} onElementSelect={vi.fn()} />)
+    await configuredFrame()
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: '选择页面元素' }))
+    const overlay = document.querySelector('.browser-element-inspector')!
+    fireEvent(overlay, pointerEvent('pointermove', 0))
+    for (let i = 0; i < 5; i++) {
+      await act(async () => { await vi.advanceTimersByTimeAsync(30) })
+      fireEvent(overlay, pointerEvent('pointermove', 0))
+    }
     expect(source.inspectPoint).toHaveBeenCalledTimes(1)
+    await act(async () => { finish(element) })
+    expect(document.querySelector('.browser-element-inspector-outline')).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+    expect(source.inspectPoint).toHaveBeenCalledTimes(2)
+    await act(async () => { finish(element) })
   })
 
   it('keeps a clicked selection while its inspect reply is pending instead of issuing hover calls', async () => {

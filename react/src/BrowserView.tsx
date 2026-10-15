@@ -12,6 +12,7 @@ type ViewportTarget = BrowserViewport & { sessionID: string; pageID: string; gen
 const viewportResizeDebounceMS = 200
 const viewportResizeRetryMS = 500
 const agentBusyOverlayCloseDelayMS = 300
+const inspectSampleIntervalMS = 50
 
 const sameViewport = (left: BrowserViewport | undefined, right: BrowserViewport) =>
   left?.width === right.width && left.height === right.height
@@ -99,8 +100,12 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
   const inspectSequence = useRef(0)
   const inspectSelectionPending = useRef(false)
   const inspectTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const inspectSample = useRef<(() => void) | undefined>(undefined)
+  const inspectLastSample = useRef(-Infinity)
+  const inspectHoverPending = useRef(false)
   useEffect(() => () => {
     clearTimeout(inspectTimer.current)
+    inspectSample.current = undefined
     inspectSequence.current++
   }, [])
   const inspectingRef = useRef(false)
@@ -744,6 +749,9 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
   }
   const clearInspection = () => {
     clearTimeout(inspectTimer.current)
+    inspectTimer.current = undefined
+    inspectSample.current = undefined
+    inspectLastSample.current = -Infinity
     inspectSelectionPending.current = false
     inspectSequence.current++
     selectionLockedRef.current = false
@@ -762,14 +770,9 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
       if (select) setNotice('当前数据源不支持元素选择')
       return
     }
-    clearTimeout(inspectTimer.current)
-    const sequence = ++inspectSequence.current
-    if (select) {
-      inspectSelectionPending.current = true
-      selectionLockedRef.current = true
-    }
     const inspect = () => {
-      if (sequence !== inspectSequence.current || pageID !== activePageRef.current || !inspectingRef.current) return
+      const sequence = ++inspectSequence.current
+      if (!select) inspectHoverPending.current = true
       void source.inspectPoint!(sessionID, pageID, point.x, point.y, viewerID).then((element) => {
         if (sequence !== inspectSequence.current || pageID !== activePageRef.current || !inspectingRef.current) return
         inspectSelectionPending.current = false
@@ -779,11 +782,41 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
         if (sequence !== inspectSequence.current) return
         inspectSelectionPending.current = false
         if (select) { selectionLockedRef.current = false; setNotice(error.message) }
+      }).finally(() => {
+        if (!select) inspectHoverPending.current = false
       })
     }
-    // 悬停停止后检查最新坐标；点击直接检查，取消或拖动后不再发送旧位置。
-    if (select) inspect()
-    else inspectTimer.current = setTimeout(inspect, 100)
+    if (select) {
+      clearTimeout(inspectTimer.current)
+      inspectTimer.current = undefined
+      inspectSample.current = undefined
+      inspectSelectionPending.current = true
+      selectionLockedRef.current = true
+      inspect()
+      return
+    }
+    // 首次移动立即检查，其后按 20Hz 采样最新坐标；慢响应期间不积压悬停请求。
+    inspectSample.current = inspect
+    const sample = () => {
+      inspectTimer.current = undefined
+      if (!inspectingRef.current || selectionLockedRef.current || dragStart.current) {
+        inspectSample.current = undefined
+        return
+      }
+      if (inspectHoverPending.current) {
+        inspectTimer.current = setTimeout(sample, inspectSampleIntervalMS)
+        return
+      }
+      const next = inspectSample.current
+      inspectSample.current = undefined
+      inspectLastSample.current = performance.now()
+      next?.()
+    }
+    if (inspectTimer.current === undefined) {
+      const delay = Math.max(0, inspectSampleIntervalMS - (performance.now() - inspectLastSample.current))
+      if (delay === 0) sample()
+      else inspectTimer.current = setTimeout(sample, delay)
+    }
   }
 
   const finishArea = (clientX: number, clientY: number) => {
@@ -1085,7 +1118,7 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
             if (end) setDragArea({ x: Math.min(dragStart.current.x, end.x), y: Math.min(dragStart.current.y, end.y), width: Math.abs(dragStart.current.x - end.x), height: Math.abs(dragStart.current.y - end.y) })
           } else if (onElementSelect && !selectionLockedRef.current) inspectAt(event.clientX, event.clientY, false)
         }}
-        onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); if (selectionLockedRef.current) return; clearTimeout(inspectTimer.current); const point = pointAt(event.clientX, event.clientY, false); if (point) { inspectSequence.current++; setHovered(undefined); dragStart.current = { x: point.x, y: point.y }; try { event.currentTarget.setPointerCapture?.(event.pointerId) } catch { /* 继续处理当前指针。 */ } } }}
+        onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); if (selectionLockedRef.current) return; clearTimeout(inspectTimer.current); inspectTimer.current = undefined; inspectSample.current = undefined; const point = pointAt(event.clientX, event.clientY, false); if (point) { inspectSequence.current++; setHovered(undefined); dragStart.current = { x: point.x, y: point.y }; try { event.currentTarget.setPointerCapture?.(event.pointerId) } catch { /* 继续处理当前指针。 */ } } }}
         onPointerUp={(event) => { event.stopPropagation(); if (dragStart.current) { ignoreInspectClick.current = true; try { event.currentTarget.releasePointerCapture?.(event.pointerId) } catch { /* 捕获未建立。 */ } if (!finishArea(event.clientX, event.clientY) && onElementSelect) inspectAt(event.clientX, event.clientY, true) } }}
         onClick={(event) => { event.stopPropagation(); if (ignoreInspectClick.current) { ignoreInspectClick.current = false; return } if (inspected || area) clearInspection() }}
         onWheel={(event) => { if (inspected || area) { event.preventDefault(); event.stopPropagation() } }}

@@ -12,7 +12,7 @@ type ViewportTarget = BrowserViewport & { sessionID: string; pageID: string; gen
 const viewportResizeDebounceMS = 200
 const viewportResizeRetryMS = 500
 const agentBusyOverlayCloseDelayMS = 300
-const inspectSampleIntervalMS = 50
+const inspectSampleIntervalMS = 100
 
 const sameViewport = (left: BrowserViewport | undefined, right: BrowserViewport) =>
   left?.width === right.width && left.height === right.height
@@ -795,7 +795,7 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
       inspect()
       return
     }
-    // 首次移动立即检查，其后按 20Hz 采样最新坐标；慢响应期间不积压悬停请求。
+    // 首次移动立即检查，其后按 10Hz 采样最新坐标；慢响应期间不积压悬停请求。
     inspectSample.current = inspect
     const sample = () => {
       inspectTimer.current = undefined

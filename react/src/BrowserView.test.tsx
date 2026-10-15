@@ -202,7 +202,7 @@ describe('BrowserLiveWindow', () => {
     expect(sentInputs()).toHaveLength(2)
   })
 
-  it('samples continuous hover at 20Hz with an immediate first check and the latest position', async () => {
+  it('samples continuous hover at 10Hz with an immediate first check and the latest position', async () => {
     mockedFetchBrowserState.mockResolvedValue(singleTabState())
     const source = { ...httpBrowserSource, inspectPoint: vi.fn(async () => ({ ref: 'r_1', revision: 1, role: 'button', url: 'https://example.com', bounds: { x: 90, y: 90, width: 80, height: 30 } })) }
     const { unmount } = render(<BrowserView endpoint="/browser" source={source} onElementSelect={vi.fn()} />)
@@ -218,11 +218,13 @@ describe('BrowserLiveWindow', () => {
     move(100)
     expect(source.inspectPoint).toHaveBeenCalledExactlyOnceWith('/browser', 'page-a', 100, 100, expect.any(String))
     for (const x of [200, 300, 400, 500]) {
-      await act(async () => { await vi.advanceTimersByTimeAsync(10) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(20) })
       move(x)
     }
     expect(source.inspectPoint).toHaveBeenCalledTimes(1)
-    await act(async () => { await vi.advanceTimersByTimeAsync(10) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(19) })
+    expect(source.inspectPoint).toHaveBeenCalledTimes(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
     expect(source.inspectPoint).toHaveBeenLastCalledWith('/browser', 'page-a', expect.closeTo(500, 5), 100, expect.any(String))
     expect(source.inspectPoint).toHaveBeenCalledTimes(2)
     expect(document.querySelector('.browser-element-inspector-outline')).toBeInTheDocument()

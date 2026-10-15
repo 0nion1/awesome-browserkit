@@ -202,6 +202,84 @@ describe('BrowserLiveWindow', () => {
     expect(sentInputs()).toHaveLength(2)
   })
 
+  it('debounces hover inspection and cancels pending positions on drag, Escape and unmount', async () => {
+    mockedFetchBrowserState.mockResolvedValue(singleTabState())
+    const source = { ...httpBrowserSource, inspectPoint: vi.fn(async () => ({ ref: 'r_1', revision: 1, role: 'button', url: 'https://example.com', bounds: { x: 90, y: 90, width: 80, height: 30 } })) }
+    const { unmount } = render(<BrowserView endpoint="/browser" source={source} onElementSelect={vi.fn()} />)
+    await configuredFrame()
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: '选择页面元素' }))
+    const overlay = document.querySelector('.browser-element-inspector')!
+    const move = (x: number) => {
+      const event = new Event('pointermove', { bubbles: true, cancelable: true })
+      Object.defineProperties(event, { clientX: { value: x }, clientY: { value: 100 }, pointerId: { value: 7 }, pointerType: { value: 'mouse' }, buttons: { value: 0 } })
+      fireEvent(overlay, event)
+    }
+    move(100)
+    await act(async () => { await vi.advanceTimersByTimeAsync(60) })
+    move(200)
+    await act(async () => { await vi.advanceTimersByTimeAsync(99) })
+    expect(source.inspectPoint).not.toHaveBeenCalled()
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(source.inspectPoint).toHaveBeenCalledExactlyOnceWith('/browser', 'page-a', 200, 100, expect.any(String))
+    move(300)
+    fireEvent(overlay, pointerEvent('pointerdown'))
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+    expect(source.inspectPoint).toHaveBeenCalledTimes(1)
+    fireEvent.keyDown(overlay, { key: 'Escape' })
+    fireEvent.click(screen.getByRole('button', { name: '选择页面元素' }))
+    const freshOverlay = document.querySelector('.browser-element-inspector')!
+    fireEvent(freshOverlay, pointerEvent('pointermove', 0))
+    fireEvent.keyDown(freshOverlay, { key: 'Escape' })
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+    expect(source.inspectPoint).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByRole('button', { name: '选择页面元素' }))
+    fireEvent(document.querySelector('.browser-element-inspector')!, pointerEvent('pointermove', 0))
+    unmount()
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+    expect(source.inspectPoint).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a clicked selection while its inspect reply is pending instead of issuing hover calls', async () => {
+    mockedFetchBrowserState.mockResolvedValue(singleTabState())
+    let resolve!: (element: {
+      ref: string
+      revision: number
+      role: string
+      url: string
+      bounds: { x: number; y: number; width: number; height: number }
+    }) => void
+    const source = {
+      ...httpBrowserSource,
+      inspectPoint: vi.fn(
+        () =>
+          new Promise<Parameters<typeof resolve>[0]>((done) => {
+            resolve = done
+          }),
+      ),
+    }
+    render(<BrowserView endpoint="/browser" source={source} onElementSelect={vi.fn()} />)
+    await configuredFrame()
+    fireEvent.click(screen.getByRole('button', { name: '选择页面元素' }))
+    const overlay = document.querySelector('.browser-element-inspector')!
+    fireEvent(overlay, pointerEvent('pointerdown'))
+    fireEvent(overlay, pointerEvent('pointerup', 0))
+    fireEvent(overlay, pointerEvent('pointermove'))
+    expect(source.inspectPoint).toHaveBeenCalledTimes(1)
+    fireEvent.wheel(overlay, { clientX: 100, clientY: 100, deltaY: 20 })
+    expect(sentInputs()).toHaveLength(0)
+    await act(async () =>
+      resolve({
+        ref: 'r_1',
+        revision: 1,
+        role: 'button',
+        url: 'https://example.com',
+        bounds: { x: 90, y: 90, width: 80, height: 30 },
+      }),
+    )
+    expect(screen.getByRole('dialog', { name: '选中页面内容' })).toBeInTheDocument()
+  })
+
   it('captures a dragged page region with viewport coordinates and a PNG', async () => {
     mockedFetchBrowserState.mockResolvedValue(singleTabState())
     vi.spyOn(HTMLCanvasElement.prototype, 'toBlob').mockImplementation((callback) => callback(new Blob(['png'], { type: 'image/png' })))

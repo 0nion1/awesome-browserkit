@@ -254,6 +254,12 @@ Pass each function’s `Name`, `Description`, and `Handler` to the host tool reg
 
 Requests and responses are exported named structs.
 The host provides schema validation and the tool invocation protocol.
+All tool input fields, including nested fields, provide Chinese parameter descriptions through `jsonschema_description`, covering purpose, defaults, and constraints.
+`browserNavigate` no longer accepts the unused `timeout_ms` field.
+Opening or navigating a page shares a two-second budget for load completion and page idleness; browser startup and the navigation request remain subject to `Session.OperationTimeout` and the host context.
+When that budget expires, the page keeps loading and the call succeeds with `load_status: "timeout"`, a current-page `snapshot`, and an incomplete-load `warning`.
+The model can use the snapshot's element references immediately or call `browserWait` or `browserSnapshot` to check progress, without reopening or repeating navigation.
+If the current content cannot be read, `warning` includes the reason and the page remains available.
 See [examples/functions](examples/functions/main.go) for an adapter example.
 
 ### React

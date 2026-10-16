@@ -95,7 +95,6 @@ type NavigateRequest struct {
 	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。留空时使用当前活动 session。"`
 	PageID    string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
 	URL       string `json:"url" jsonschema_description:"目标 HTTP/HTTPS 地址，也支持相对于该 Tab 当前地址的 URL；导航后原有快照引用失效。"`
-	TimeoutMS int    `json:"timeout_ms,omitempty" jsonschema_description:"当前导航实现未读取此字段，填写也不会改变超时；导航仍受宿主 context 和浏览器 OperationTimeout 限制，页面空闲等待最多 5 秒。"`
 }
 
 // NavigateResponse 是 browserNavigate 的输出。

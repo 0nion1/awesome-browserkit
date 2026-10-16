@@ -9,8 +9,8 @@ import (
 
 // Viewport 描述页面视口尺寸。
 type Viewport struct {
-	Width  int `json:"width"`
-	Height int `json:"height"`
+	Width  int `json:"width" jsonschema_description:"视口宽度，单位 CSS 像素；有效尺寸必须大于 0 且不超过 16384，宽度与高度之积不超过 67108864。"`
+	Height int `json:"height" jsonschema_description:"视口高度，单位 CSS 像素；有效尺寸必须大于 0 且不超过 16384，宽度与高度之积不超过 67108864。"`
 }
 
 const maxViewportDimension = 16_384

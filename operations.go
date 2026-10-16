@@ -38,7 +38,11 @@ func (manager *Manager) Snapshot(ctx context.Context, request SnapshotRequest) (
 		return SnapshotResponse{}, errors.New("browserSnapshot 的 max_chars、max_elements 和 offset 无效")
 	}
 
-	snapshot, err := currentPage.page.Snapshot(ctx, SnapshotOptions{MaxChars: request.MaxChars, MaxElements: request.MaxElements, Offset: request.Offset})
+	return manager.snapshotPage(ctx, current, currentPage, SnapshotOptions{MaxChars: request.MaxChars, MaxElements: request.MaxElements, Offset: request.Offset})
+}
+
+func (manager *Manager) snapshotPage(ctx context.Context, current *session, currentPage *page, options SnapshotOptions) (SnapshotResponse, error) {
+	snapshot, err := currentPage.page.Snapshot(ctx, options)
 	if err != nil {
 		return SnapshotResponse{}, err
 	}
@@ -51,7 +55,7 @@ func (manager *Manager) Snapshot(ctx context.Context, request SnapshotRequest) (
 	activePageID := current.activeTab
 	tabs := tabViewsLocked(current)
 	current.mu.Unlock()
-	return SnapshotResponse{SessionID: current.id, PageID: currentPage.id, Revision: snapshot.Revision, URL: snapshot.Info.URL, Title: snapshot.Info.Title, Text: snapshot.Text, Elements: snapshot.Elements, Truncated: snapshot.Truncated, NextOffset: request.Offset + len(snapshot.Elements), ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged, Tabs: tabs}, nil
+	return SnapshotResponse{SessionID: current.id, PageID: currentPage.id, Revision: snapshot.Revision, URL: snapshot.Info.URL, Title: snapshot.Info.Title, Text: snapshot.Text, Elements: snapshot.Elements, Truncated: snapshot.Truncated, NextOffset: options.Offset + len(snapshot.Elements), ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged, Tabs: tabs}, nil
 }
 
 // Click 执行浏览器页面操作，使用普通 context 和明确目标。

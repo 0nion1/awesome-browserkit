@@ -38,7 +38,7 @@ type Manager struct {
 	devtoolsStateSubs map[chan struct{}]struct{}
 }
 
-var openIdleTimeout = 5 * time.Second
+var openIdleTimeout = 2 * time.Second
 var tabReconcileTimeout = 2 * time.Second
 var tabReconcileInterval = 2 * time.Second
 var liveFirstFrameTimeout = 2 * time.Second
@@ -215,7 +215,8 @@ func (manager *Manager) openExisting(ctx context.Context, request OpenRequest) (
 		currentPage.info = info
 		current.mu.Unlock()
 	}
-	return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, LoadStatus: loadStatus}, nil
+	snapshot, warning := manager.loadSnapshot(ctx, current, currentPage, loadStatus)
+	return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning}, nil
 }
 
 // applyInjectScript 允许复用已有 session 时继续使用 inject_js：脚本只向
@@ -360,7 +361,8 @@ func (manager *Manager) addSession(created *session) error {
 
 func (manager *Manager) finishNewPage(ctx context.Context, current *session, currentPage *page, address string, loadStatus OpenLoadStatus) (OpenResponse, error) {
 	if address == "" {
-		return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: "about:blank", LoadStatus: loadStatus}, nil
+		snapshot, warning := manager.loadSnapshot(ctx, current, currentPage, loadStatus)
+		return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: "about:blank", LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning}, nil
 	}
 	if _, err := currentPage.page.Navigate(ctx, address); err != nil {
 		return OpenResponse{}, err
@@ -378,7 +380,8 @@ func (manager *Manager) finishNewPage(ctx context.Context, current *session, cur
 	currentPage.status = "ready"
 	current.mu.Unlock()
 	manager.emit(ctx, Event{Kind: "navigation_finished", SessionID: current.id, PageID: currentPage.id, URL: info.URL})
-	return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, LoadStatus: loadStatus}, nil
+	snapshot, warning := manager.loadSnapshot(ctx, current, currentPage, loadStatus)
+	return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning}, nil
 }
 
 func resolveURL(address, base string) string {
@@ -406,7 +409,10 @@ func pageLoadStatus(ctx context.Context, page Page) (OpenLoadStatus, error) {
 func waitPageIdle(ctx context.Context, page Page) (bool, error) {
 	idleCtx, cancel := context.WithTimeout(ctx, openIdleTimeout)
 	defer cancel()
-	err := page.WaitIdle(idleCtx, openIdleTimeout)
+	err := page.Wait(idleCtx, WaitOptions{Condition: "load_complete"})
+	if err == nil {
+		err = page.WaitIdle(idleCtx, openIdleTimeout)
+	}
 	if err == nil {
 		return false, nil
 	}
@@ -414,6 +420,20 @@ func waitPageIdle(ctx context.Context, page Page) (bool, error) {
 		return true, nil
 	}
 	return false, err
+}
+
+// loadSnapshot 只读取超时页面的现有内容，不再次等待加载或枚举 Tab。
+// 快照沿用 browserSnapshot 的状态投影，保证返回的 ref 可直接操作。
+func (manager *Manager) loadSnapshot(ctx context.Context, current *session, currentPage *page, status OpenLoadStatus) (*SnapshotResponse, string) {
+	if status != OpenLoadTimeout {
+		return nil, ""
+	}
+	warning := fmt.Sprintf("页面在 %g 秒内未完成加载或进入空闲，当前内容可能不完整；请根据已有内容决定继续操作，或调用 browserWait/browserSnapshot 检查后续状态。", openIdleTimeout.Seconds())
+	snapshot, err := manager.snapshotPage(ctx, current, currentPage, SnapshotOptions{})
+	if err != nil {
+		return nil, warning + " 当前内容读取失败：" + err.Error() + "；页面仍保留，请勿重复打开或导航。"
+	}
+	return &snapshot, warning
 }
 
 func openFailed(err error) error {

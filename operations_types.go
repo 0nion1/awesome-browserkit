@@ -19,7 +19,7 @@ type ViewportRequest struct {
 	Viewport  Viewport `json:"viewport"`
 }
 
-// OpenLoadStatus 是 browserOpen 完成页面空闲等待后的状态。
+// OpenLoadStatus 是打开或导航页面最多等待 2 秒后的加载状态。
 type OpenLoadStatus string
 
 const (
@@ -36,6 +36,10 @@ type OpenResponse struct {
 	URL        string         `json:"url"`
 	Title      string         `json:"title,omitempty"`
 	LoadStatus OpenLoadStatus `json:"load_status"`
+	// Snapshot 是加载超时时当前可读取的页面快照，可直接使用其中的元素引用。
+	Snapshot *SnapshotResponse `json:"snapshot,omitempty"`
+	// Warning 提醒模型当前内容可能不完整，由模型决定是否继续等待。
+	Warning string `json:"warning,omitempty"`
 }
 
 // TabView 是模型和宿主可见的浏览器 Tab 摘要。
@@ -99,6 +103,13 @@ type NavigateRequest struct {
 
 // NavigateResponse 是 browserNavigate 的输出。
 type NavigateResponse struct {
+	// LoadStatus 表示最多等待 2 秒后的加载状态。
+	LoadStatus OpenLoadStatus `json:"load_status"`
+	// Snapshot 是加载超时时当前可读取的页面快照，可直接使用其中的元素引用。
+	Snapshot *SnapshotResponse `json:"snapshot,omitempty"`
+	// Warning 提醒模型当前内容可能不完整，由模型决定是否继续等待。
+	Warning string `json:"warning,omitempty"`
+
 	SessionID    string `json:"session_id"`
 	PageID       string `json:"page_id"`
 	URL          string `json:"url"`

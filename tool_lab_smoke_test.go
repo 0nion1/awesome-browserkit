@@ -450,13 +450,18 @@ func TestRealBrowserFunctionToolLab(t *testing.T) {
 	if !closed.Closed {
 		t.Fatalf("browserClose 没有关闭 session: %+v", closed)
 	}
+	checkedFunctions := 0
 	for _, function := range manager.Functions() {
+		if strings.HasPrefix(function.Name, "sequence") {
+			continue
+		}
+		checkedFunctions++
 		if !lab.called[function.Name] {
 			t.Errorf("靶场未调用函数 %s", function.Name)
 		}
 	}
-	if len(lab.called) != len(manager.Functions()) {
-		t.Errorf("调用数=%d，函数数=%d: %v", len(lab.called), len(manager.Functions()), lab.called)
+	if len(lab.called) != checkedFunctions {
+		t.Errorf("调用数=%d，基础函数数=%d: %v", len(lab.called), checkedFunctions, lab.called)
 	}
 	t.Logf("靶场验证了 %d 个工具函数，以及分页、异步数据、悬停、嵌套滚动、长页滚动、失效引用和多 Tab", len(lab.called))
 }

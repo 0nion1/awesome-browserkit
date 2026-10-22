@@ -65,4 +65,10 @@ ref 属于对应 page_id；引用失效时重新读取快照。
 截图返回文件路径，由宿主读取并展示。
 
 `browserkit --list-functions` 列出函数名称和说明，browserTabs 列出 Tab。
-每个进程最多一个 session；切换模式需结束当前进程，旧 session_id、page_id 和 ref 不跨进程复用。
+每个进程最多两个 session，以便保留探索页面并在全新临时 profile 中执行序列回放；不用的 session 应及时调用 browserClose。旧 session_id、page_id 和 ref 不跨进程复用。
+
+## 操作序列
+
+需要生成可重复执行的流程时，先调用 `sequenceStart`，再照常使用 `browserSnapshot`、`browserClick`、`browserType` 和 `browserNavigate` 探索。脚本动作使用 `sequenceScript`，外部验证码或人工结果使用 `sequenceProviderCall`。调用 `sequenceRead` 获取候选 ID，删除试错步骤并保持原顺序后传给 `sequenceFinish`。
+
+`sequenceFinish` 会把最终序列保存为 JSON；省略 `output_path` 时使用权限为 `0600` 的临时文件，指定路径时不会覆盖已有文件，并从响应 `path` 取得实际绝对路径。使用 `sequenceReplay` 回放最终序列。它会另启全新临时 Chrome，不继承当前浏览器登录态。返回 `needs_provider` 时，根据响应中的说明取得外部结果，再使用同一 replay_id、resume_token 调用 `sequenceResume`。序列工具没有 `browser` 前缀；其他工具名称不变。

@@ -3,7 +3,7 @@ import {
   closeBrowser, closeBrowserTab, decodeFrame, fetchBrowserAssets, fetchBrowserDevtoolsState,
   fetchBrowserState, fetchCachedBrowserFrame, navigateBrowserTab, newBrowserTab,
   reloadBrowserTab, setBrowserTabViewport, startBrowserDevtools, stopBrowserDevtools,
-  takeBrowserControl,
+  takeBrowserControl, startBrowserSequenceRecording, finishBrowserSequenceRecording,
   type BrowserAsset, type BrowserControlState, type BrowserDevtoolsState,
   type BrowserFrame, type BrowserViewState,
 } from './client'
@@ -46,6 +46,8 @@ export interface BrowserSource {
   viewport(sessionID: string, pageID: string, size: { width: number; height: number }, viewerID: string): Promise<void>
   takeControl(sessionID: string, viewerID: string): Promise<BrowserControlState>
   closeBrowser(sessionID: string, viewerID: string): Promise<void>
+  startRecording?(sessionID: string, pageID: string, viewerID: string): Promise<void>
+  finishRecording?(sessionID: string, outputPath: string, viewerID: string): Promise<{ path: string }>
   diagnostics: BrowserDiagnosticsSource
 }
 
@@ -105,6 +107,8 @@ export const httpBrowserSource: BrowserSource = {
   viewport: (sessionID, pageID, size, viewerID) => setBrowserTabViewport(sessionID, pageID, size, viewerID),
   takeControl: (sessionID, viewerID) => takeBrowserControl(sessionID, viewerID),
   closeBrowser: (sessionID, viewerID) => closeBrowser(sessionID, viewerID),
+  startRecording: (sessionID, pageID, viewerID) => startBrowserSequenceRecording(sessionID, pageID, viewerID),
+  finishRecording: (sessionID, outputPath, viewerID) => finishBrowserSequenceRecording(sessionID, outputPath, viewerID),
   diagnostics: {
     read: (sessionID, pageID, after, limit) => fetchBrowserDevtoolsState(sessionID, pageID, after, limit),
     subscribe(sessionID, pageID, onState) {

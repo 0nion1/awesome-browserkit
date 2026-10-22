@@ -153,7 +153,7 @@ func (page *fakePage) Navigate(_ context.Context, address string) (PageInfo, err
 	return page.info, nil
 }
 func (page *fakePage) Snapshot(context.Context, SnapshotOptions) (Snapshot, error) {
-	return Snapshot{Info: page.info, Revision: 1, Text: "hello", Elements: []Element{{Ref: "e1", Role: "button", Name: "Save"}}}, nil
+	return Snapshot{Info: page.info, Revision: 1, Text: "hello", Elements: []Element{{Ref: "e1", Role: "button", Name: "Save", Locator: ElementLocator{Selector: "#save", XPath: `//*[@id="save"]`, Role: "button", Name: "Save"}}}}, nil
 }
 func (page *fakePage) Click(_ context.Context, ref ElementRef) error {
 	page.lastRef = ref

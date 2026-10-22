@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { activateBrowserTab, navigateBrowserTab, browserDevtoolsStreamURL, browserStateStreamURL, browserStreamURL, closeBrowser, closeBrowserTab, fetchBrowserAssets, fetchBrowserDevtoolsState, fetchBrowserState, fetchCachedBrowserFrame, setBrowserTabViewport, takeBrowserControl, type BrowserTabView, type BrowserViewState } from './client'
+import { activateBrowserTab, navigateBrowserTab, browserDevtoolsStreamURL, browserStateStreamURL, browserStreamURL, closeBrowser, closeBrowserTab, fetchBrowserAssets, fetchBrowserDevtoolsState, fetchBrowserState, fetchCachedBrowserFrame, setBrowserTabViewport, takeBrowserControl, startBrowserSequenceRecording, finishBrowserSequenceRecording, type BrowserTabView, type BrowserViewState } from './client'
 import { BrowserView, type BrowserViewProps } from './BrowserView'
 import { httpBrowserSource } from './source'
 function BrowserLiveWindow({sessionID, devtoolsEnabled, liveViewEnabled, agentOperating}: {sessionID?:string;devtoolsEnabled?:boolean;liveViewEnabled?:boolean;agentOperating?:boolean;[key:string]:unknown}) { return <BrowserView endpoint={sessionID || '/browser'} devtools={devtoolsEnabled} liveView={liveViewEnabled} busy={agentOperating} /> }
@@ -24,6 +24,8 @@ vi.mock('./client', () => ({
   fetchCachedBrowserFrame: vi.fn(),
   setBrowserTabViewport: vi.fn(),
   takeBrowserControl: vi.fn(),
+  startBrowserSequenceRecording: vi.fn(),
+  finishBrowserSequenceRecording: vi.fn(),
 }))
 
 const mockedActivateBrowserTab = vi.mocked(activateBrowserTab)
@@ -38,6 +40,8 @@ const mockedCloseBrowser = vi.mocked(closeBrowser)
 const mockedCloseBrowserTab = vi.mocked(closeBrowserTab)
 const mockedSetBrowserTabViewport = vi.mocked(setBrowserTabViewport)
 const mockedTakeBrowserControl = vi.mocked(takeBrowserControl)
+const mockedStartRecording = vi.mocked(startBrowserSequenceRecording)
+const mockedFinishRecording = vi.mocked(finishBrowserSequenceRecording)
 
 const defaultViewport = { width: 1_920, height: 1_080 }
 
@@ -130,6 +134,10 @@ describe('BrowserLiveWindow', () => {
     mockedSetBrowserTabViewport.mockResolvedValue()
     mockedTakeBrowserControl.mockReset()
     mockedTakeBrowserControl.mockResolvedValue({ type: 'browser_control', controller: true, can_takeover: false, retry_after_ms: 30_000, revision: 2 })
+    mockedStartRecording.mockReset()
+    mockedStartRecording.mockResolvedValue()
+    mockedFinishRecording.mockReset()
+    mockedFinishRecording.mockResolvedValue({ session_id: 'session-a', path: '/tmp/sequence.json', sequence: {} })
     socketMessages = []
     sockets = []
     drawImage = vi.fn()
@@ -383,13 +391,32 @@ describe('BrowserLiveWindow', () => {
     expect(screen.queryByRole('button', { name: '新建浏览器 Tab' })).toBeNull()
     expect(screen.queryByRole('button', { name: '前往页面' })).toBeNull()
     expect(screen.queryByRole('button', { name: '关闭 浏览器 Tab' })).toBeNull()
-    rerender(<BrowserView endpoint="/browser" devtools controls={{ tabs: false, addressBar: false, reload: false, closeBrowser: false, devtools: false, devtoolsFloating: false, keyboard: false }} />)
+    rerender(<BrowserView endpoint="/browser" devtools controls={{ tabs: false, addressBar: false, reload: false, closeBrowser: false, devtools: false, devtoolsFloating: false, recording: false, keyboard: false }} />)
     expect(document.querySelector('[data-part="toolbar"]')).toBeNull()
     expect(sockets).toHaveLength(count)
     rerender(<BrowserView endpoint="/browser" devtools />)
     expect(screen.getByRole('textbox', { name: '浏览器页面地址' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '新建浏览器 Tab' })).toBeInTheDocument()
     expect(sockets).toHaveLength(count)
+  })
+
+  it('starts manual recording and saves it through the stop dialog', async () => {
+    mockedFetchBrowserState.mockResolvedValue(singleTabState())
+    render(<BrowserView endpoint="/browser" />)
+    await configuredFrame()
+    fireEvent.click(screen.getByRole('button', { name: '开始操作录制' }))
+    await act(async () => { await Promise.resolve() })
+    expect(mockedStartRecording).toHaveBeenCalledWith('/browser', 'page-a', expect.any(String))
+    await receiveState(singleTabState({}, { recording: true, recorded_steps: 3 }))
+    fireEvent.click(screen.getByRole('button', { name: '停止并保存操作录制' }))
+    expect(screen.getByRole('dialog', { name: '保存操作录制' })).toBeInTheDocument()
+    fireEvent.click(screen.getByLabelText('保存到指定文件'))
+    fireEvent.change(screen.getByLabelText('操作序列保存路径'), { target: { value: '/tmp/manual.json' } })
+    fireEvent.click(screen.getByRole('button', { name: '停止并保存' }))
+    await act(async () => { await Promise.resolve() })
+    expect(mockedFinishRecording).toHaveBeenCalledWith('/browser', '/tmp/manual.json', expect.any(String))
+    expect(screen.queryByRole('dialog', { name: '保存操作录制' })).toBeNull()
+    expect(screen.getByRole('alert')).toHaveTextContent('/tmp/sequence.json')
   })
 
   it('requires the explicit keyboard button in manual activation mode', async () => {

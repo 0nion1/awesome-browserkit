@@ -103,7 +103,7 @@ func (manager *Manager) reconcileTabs(ctx context.Context, current *session) err
 		if info.TargetID == "" || info.Type != "" && info.Type != "page" {
 			continue
 		}
-		if manager.externalBrowser() && !strings.HasPrefix(info.URL, "http://") && !strings.HasPrefix(info.URL, "https://") {
+		if current.external && !strings.HasPrefix(info.URL, "http://") && !strings.HasPrefix(info.URL, "https://") {
 			continue
 		}
 		seen[info.TargetID] = true
@@ -114,7 +114,7 @@ func (manager *Manager) reconcileTabs(ctx context.Context, current *session) err
 			atLimit := len(current.tabs) >= manager.config.MaxTabsPerSession
 			current.mu.Unlock()
 			if atLimit {
-				if manager.externalBrowser() {
+				if current.external {
 					continue
 				}
 				// 限制必须作用于真实 target；只忽略本地登记会让
@@ -165,19 +165,19 @@ func (manager *Manager) reconcileTabs(ctx context.Context, current *session) err
 			// popup 激活请求覆盖，造成状态与真实 CDP target 分叉。
 			current.tabMu.Lock()
 			var activationErr error
-			if !manager.externalBrowser() {
+			if !current.external {
 				activationErr = tabSession.ActivateTab(ctx, info.TargetID)
 			}
 			current.mu.Lock()
 			value.status = "loading"
-			if !manager.externalBrowser() && activationErr == nil && current.tabs[value.id] == value && current.activeTab != value.id {
+			if !current.external && activationErr == nil && current.tabs[value.id] == value && current.activeTab != value.id {
 				current.activeTab = value.id
 				invalidateInputsLocked(current)
 			}
 			current.mu.Unlock()
 			current.tabMu.Unlock()
 			manager.emit(ctx, Event{Kind: "tab_opened", SessionID: current.id, PageID: value.id, URL: info.URL})
-			if viewportSession, viewportOK := browser.(ViewportTabSession); viewportOK && !manager.externalBrowser() {
+			if viewportSession, viewportOK := browser.(ViewportTabSession); viewportOK && !current.external {
 				go func() {
 					viewportCtx, cancel := context.WithTimeout(current.ctx, time.Second)
 					defer cancel()
@@ -592,9 +592,12 @@ func (manager *Manager) Navigate(ctx context.Context, request NavigateRequest) (
 	currentPage.info = info
 	currentPage.status = "ready"
 	current.mu.Unlock()
+	candidateID := recordSequenceStep(current, currentPage, SequenceStep{Type: "navigate", URL: info.URL}, "succeeded")
 	manager.emit(ctx, Event{Kind: "navigation_finished", SessionID: current.id, PageID: currentPage.id, URL: info.URL})
 	activePageID, tabsRevision, tabsChanged := manager.tabChange(ctx, current, beforeTabsRevision)
-	return NavigateResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}, nil
+	response := NavigateResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
+	response.CandidateID = candidateID
+	return response, nil
 }
 
 // Reload 刷新指定网页 Tab 的当前地址。

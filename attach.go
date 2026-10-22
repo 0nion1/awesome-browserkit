@@ -56,7 +56,11 @@ func (manager *Manager) Attach(ctx context.Context, request AttachRequest) (Open
 }
 
 func (manager *Manager) externalBrowser() bool {
-	return manager.config.Session.RemoteAddress != "" || isRemoteAddress(manager.config.Session.ExecPath)
+	return externalBrowserConfig(manager.config.Session)
+}
+
+func externalBrowserConfig(config SessionConfig) bool {
+	return config.RemoteAddress != "" || isRemoteAddress(config.ExecPath)
 }
 
 func attachPage(ctx context.Context, browser Session) (Page, error) {

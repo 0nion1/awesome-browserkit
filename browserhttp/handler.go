@@ -54,6 +54,8 @@ func NewHandler(manager *browserkit.Manager, options Options) *Handler {
 	h.mux.HandleFunc("GET /cached-frame", h.frame)
 	h.mux.HandleFunc("GET /ws", h.stream)
 	h.mux.HandleFunc("POST /control", h.takeControl)
+	h.mux.HandleFunc("POST /sequence-recording", h.startSequenceRecording)
+	h.mux.HandleFunc("DELETE /sequence-recording", h.finishSequenceRecording)
 	h.mux.HandleFunc("POST /close", h.closeBrowser)
 	h.mux.HandleFunc("POST /tabs", h.newTab)
 	h.mux.HandleFunc("POST /tabs/{pageID}/activate", h.tab)
@@ -73,6 +75,30 @@ func NewHandler(manager *browserkit.Manager, options Options) *Handler {
 	}
 	h.auth = authorized
 	return h
+}
+
+func (h *Handler) startSequenceRecording(w http.ResponseWriter, r *http.Request) {
+	if !h.live(w) || !h.writable(w, r) {
+		return
+	}
+	var request browserkit.SequenceRecordingStartRequest
+	if !decode(w, r, &request) {
+		return
+	}
+	value, err := h.manager.StartSequenceRecording(r.Context(), request)
+	result(w, value, err)
+}
+
+func (h *Handler) finishSequenceRecording(w http.ResponseWriter, r *http.Request) {
+	if !h.live(w) || !h.writable(w, r) {
+		return
+	}
+	var request browserkit.SequenceRecordingFinishRequest
+	if !decode(w, r, &request) {
+		return
+	}
+	value, err := h.manager.FinishSequenceRecording(r.Context(), request)
+	result(w, value, err)
 }
 
 // ServeHTTP 服务一次浏览器请求；可通过 StripPrefix 挂载到任意路径。

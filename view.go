@@ -9,15 +9,17 @@ import (
 
 // BrowserViewState 是 Web 查询当前 Browser Page 的临时状态。
 type BrowserViewState struct {
-	Available    bool             `json:"available"`
-	Closed       bool             `json:"closed"`
-	SessionID    string           `json:"session_id,omitempty"`
-	ActivePageID string           `json:"active_page_id,omitempty"`
-	TabsRevision uint64           `json:"tabs_revision"`
-	Tabs         []BrowserTabView `json:"tabs"`
-	URL          string           `json:"url,omitempty"`
-	Title        string           `json:"title,omitempty"`
-	Viewport     Viewport         `json:"viewport,omitempty"`
+	Available     bool             `json:"available"`
+	Closed        bool             `json:"closed"`
+	SessionID     string           `json:"session_id,omitempty"`
+	ActivePageID  string           `json:"active_page_id,omitempty"`
+	TabsRevision  uint64           `json:"tabs_revision"`
+	Tabs          []BrowserTabView `json:"tabs"`
+	URL           string           `json:"url,omitempty"`
+	Title         string           `json:"title,omitempty"`
+	Viewport      Viewport         `json:"viewport,omitempty"`
+	Recording     bool             `json:"recording"`
+	RecordedSteps int              `json:"recorded_steps"`
 }
 
 // BrowserTabView 是 Web 浏览器侧栏使用的 Tab 摘要。
@@ -167,7 +169,19 @@ func (manager *Manager) View(ctx context.Context) (BrowserViewState, error) {
 		// 这不是 browserClose，前端应保留已经显示的浮窗等待下一次同步。
 		return BrowserViewState{}, nil
 	}
-	return BrowserStateFromTabs(list), nil
+	view := BrowserStateFromTabs(list)
+	manager.mu.Lock()
+	current := manager.sessions[list.SessionID]
+	manager.mu.Unlock()
+	if current != nil {
+		current.mu.Lock()
+		if current.sequenceDraft != nil && current.sequenceDraft.manual {
+			view.Recording = true
+			view.RecordedSteps = len(current.sequenceDraft.candidates)
+		}
+		current.mu.Unlock()
+	}
+	return view, nil
 }
 
 // BrowserAssetsFromResponse 将观测资源投影为前端列表。

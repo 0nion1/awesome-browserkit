@@ -98,11 +98,13 @@ func (page *rodPage) TargetID() string {
 }
 
 type domSnapshot struct {
-	URL      string    `json:"url"`
-	Title    string    `json:"title"`
-	Text     string    `json:"text"`
-	Elements []Element `json:"elements"`
-	Refs     []string  `json:"refs"`
+	URL                string    `json:"url"`
+	Title              string    `json:"title"`
+	Text               string    `json:"text"`
+	Elements           []Element `json:"elements"`
+	Refs               []string  `json:"refs"`
+	ActiveElementRef   string    `json:"active_element_ref"`
+	ActiveElementValue string    `json:"active_element_value"`
 }
 
 type domState struct {
@@ -236,6 +238,35 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 	args := map[string]int{"max_chars": options.MaxChars, "max_elements": options.MaxElements, "offset": options.Offset}
 	result, err := page.page.Context(operationCtx).Eval(`(options) => {
 		const clean = value => (value || '').replace(/[\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim();
+		const xpathFor = (el, useId) => {
+			const segments = [];
+			for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+				if (useId && node.id) {
+					const escaped = String(node.id).replace(/"/g, '\\"');
+					segments.unshift('*[@id="' + escaped + '"]');
+					return '//' + segments.join('/');
+				}
+				let index = 1;
+				for (let sibling = node.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
+					if (sibling.localName === node.localName) index++;
+				}
+				segments.unshift(node.localName + '[' + index + ']');
+			}
+			return segments.length ? '/' + segments.join('/') : '';
+		};
+		const cssFor = el => {
+			if (el.id) return '#' + CSS.escape(el.id);
+			const parts = [];
+			for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+				if (node.id) { parts.unshift('#' + CSS.escape(node.id)); break; }
+				let part = node.localName;
+				const siblings = node.parentElement ? [...node.parentElement.children].filter(item => item.localName === node.localName) : [];
+				if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(node) + 1) + ')';
+				parts.unshift(part);
+				if (node.localName === 'html') break;
+			}
+			return parts.join(' > ');
+		};
 		const selectors = 'button,a,input,textarea,select,summary,iframe,[contenteditable="true"],[role="button"],[role="link"],[role="textbox"],[role="menuitem"],[role="option"],[role="tab"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="combobox"],[aria-haspopup],[aria-expanded],[onclick],[tabindex]:not([tabindex="-1"])';
 		const visible = el => {
 			const style = getComputedStyle(el);
@@ -302,11 +333,26 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 			const nativeLabel = [...(el.labels || [])].map(label => label.innerText || label.textContent || '').join(' ');
 			const label = el.getAttribute('aria-label') || labelledBy || nativeLabel || el.getAttribute('placeholder') || el.getAttribute('title') || text(el) || el.getAttribute('name') || '';
 			const options = el.tagName === 'SELECT' ? [...el.options].slice(0, 100).map(option => ({value: option.value, label: clean(option.label).slice(0, 160), selected: option.selected})) : undefined;
-			return {ref, role, name: clean(label).slice(0, 160), type: type === 'password' ? 'password' : type, frame_url: el.tagName === 'IFRAME' ? el.src : undefined, options, options_truncated: el.tagName === 'SELECT' && el.options.length > 100};
+			const name = clean(label).slice(0, 160);
+			const publicType = type === 'password' ? 'password' : type;
+			const ownerFrame = el.ownerDocument === document ? null : el.ownerDocument.defaultView?.frameElement;
+			const frameURL = ownerFrame ? (el.ownerDocument.location.href || ownerFrame.src || '') : (el.tagName === 'IFRAME' ? el.src : '');
+			return {ref, role, name, type: publicType, frame_url: frameURL || undefined,
+				locator: {selector: cssFor(el), xpath: xpathFor(el, true), absolute_xpath: xpathFor(el, false), role, name, type: publicType, frame_url: frameURL || undefined},
+				options, options_truncated: el.tagName === 'SELECT' && el.options.length > 100};
 		});
 		state.refs = new Set(roots.flatMap(root => [...root.querySelectorAll('[data-browserkit-ref]')].map(el => el.getAttribute('data-browserkit-ref')).filter(ref => ref?.startsWith(state.refPrefix + '_'))));
+		let active = document.activeElement;
+		for (;;) {
+			let nested;
+			try { nested = active?.shadowRoot?.activeElement || (active?.tagName === 'IFRAME' ? active.contentDocument?.activeElement : null); } catch {}
+			if (!nested || nested === active) break;
+			active = nested;
+		}
+		const activeRef = active?.getAttribute?.('data-browserkit-ref') || '';
+		const activeValue = active && ('value' in active) ? String(active.value ?? '') : (active?.isContentEditable ? String(active.textContent || '') : '');
 		const bodyText = clean(roots.map(root => root.body?.innerText || [...(root.children || [])].map(el => el.innerText || '').join(' ')).join(' '));
-		return {url: location.href, title: document.title, text: bodyText.slice(0, Math.max(0, options.max_chars || 12000)), elements, refs: [...state.refs]};
+		return {url: location.href, title: document.title, text: bodyText.slice(0, Math.max(0, options.max_chars || 12000)), elements, refs: [...state.refs], active_element_ref: activeRef, active_element_value: activeValue};
 	}`, args)
 	if err != nil {
 		return Snapshot{}, err
@@ -326,7 +372,7 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 	page.stateMu.Lock()
 	if page.revision != revision {
 		page.stateMu.Unlock()
-		return Snapshot{Info: PageInfo{URL: raw.URL, Title: raw.Title}, Revision: revision, Text: raw.Text, Elements: raw.Elements, Truncated: truncated || len(raw.Elements) == options.MaxElements, ActiveRefs: raw.Refs}, nil
+		return Snapshot{Info: PageInfo{URL: raw.URL, Title: raw.Title}, Revision: revision, Text: raw.Text, Elements: raw.Elements, Truncated: truncated || len(raw.Elements) == options.MaxElements, ActiveElementRef: raw.ActiveElementRef, ActiveElementValue: raw.ActiveElementValue, ActiveRefs: raw.Refs}, nil
 	}
 	for ref := range page.refs {
 		if _, ok := activeRefs[ref]; !ok {
@@ -338,7 +384,7 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 	}
 	revision = page.revision
 	page.stateMu.Unlock()
-	return Snapshot{Info: PageInfo{URL: raw.URL, Title: raw.Title}, Revision: revision, Text: raw.Text, Elements: raw.Elements, Truncated: truncated || len(raw.Elements) == options.MaxElements, ActiveRefs: raw.Refs}, nil
+	return Snapshot{Info: PageInfo{URL: raw.URL, Title: raw.Title}, Revision: revision, Text: raw.Text, Elements: raw.Elements, Truncated: truncated || len(raw.Elements) == options.MaxElements, ActiveElementRef: raw.ActiveElementRef, ActiveElementValue: raw.ActiveElementValue, ActiveRefs: raw.Refs}, nil
 }
 
 // InspectPoint 为任意可见元素建立与 Snapshot 相同命名空间的 ref。

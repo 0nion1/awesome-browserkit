@@ -172,6 +172,10 @@ func (manager *Manager) dispatchLiveInputs(current *session) {
 			case input = <-current.inputQueue:
 			}
 		}
+		if input.barrier != nil {
+			close(input.barrier)
+			continue
+		}
 		input, pending = coalesceLiveInputs(input, current.inputQueue)
 		if input.viewerID != "" && !manager.CanControl(input.viewerID) {
 			continue
@@ -203,12 +207,19 @@ func (manager *Manager) dispatchLiveInputs(current *session) {
 			current.mu.Lock()
 			valid = !current.closed && current.activeTab == input.page.id &&
 				current.tabs[input.page.id] == input.page && current.inputEpoch == input.epoch
+			recording := valid && current.sequenceDraft != nil && current.sequenceDraft.manual
 			current.mu.Unlock()
 			if input.viewerID != "" {
 				valid = valid && manager.CanControl(input.viewerID)
 			}
 			if valid {
-				_ = inputPage.DispatchInput(operationCtx, input.event)
+				var clicked Element
+				if recording && input.event.Kind == "mouse" && input.event.Action == "up" && input.event.Button == "left" {
+					clicked, _ = manager.manualSequenceElementAt(operationCtx, current, input.page, input.event.X, input.event.Y)
+				}
+				if err := inputPage.DispatchInput(operationCtx, input.event); err == nil && recording {
+					manager.recordManualSequenceInput(operationCtx, current, input.page, input.event, clicked)
+				}
 			}
 			current.interactionMu.Unlock()
 		}
@@ -216,6 +227,28 @@ func (manager *Manager) dispatchLiveInputs(current *session) {
 		current.mu.Lock()
 		current.inputCancel = nil
 		current.mu.Unlock()
+	}
+}
+
+func (manager *Manager) waitLiveInputBarrier(ctx context.Context, current *session) error {
+	barrier := make(chan struct{})
+	current.mu.Lock()
+	epoch := current.inputEpoch
+	current.mu.Unlock()
+	select {
+	case current.inputQueue <- liveInput{epoch: epoch, barrier: barrier}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-current.ctx.Done():
+		return errors.New("浏览器 session 已关闭")
+	}
+	select {
+	case <-barrier:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-current.ctx.Done():
+		return errors.New("浏览器 session 已关闭")
 	}
 }
 

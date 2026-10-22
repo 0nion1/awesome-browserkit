@@ -123,6 +123,7 @@ func (manager *Manager) closeSession(ctx context.Context, current *session) erro
 	if current == nil {
 		return nil
 	}
+	manager.forgetSequenceReplays(current.id)
 	current.mu.Lock()
 	if current.closed {
 		current.mu.Unlock()
@@ -161,7 +162,7 @@ func (manager *Manager) closeSession(ctx context.Context, current *session) erro
 	}
 	shutdownCtx, cancel := shutdownContext(ctx)
 	defer cancel()
-	if active != nil && !manager.externalBrowser() {
+	if active != nil && !current.external {
 		_ = active.page.Close(shutdownCtx)
 	}
 	return browser.Close()

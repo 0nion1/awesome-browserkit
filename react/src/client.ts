@@ -11,6 +11,13 @@ export interface BrowserViewState {
         width: number;
         height: number;
     };
+    recording?: boolean;
+    recorded_steps?: number;
+}
+export interface BrowserSequenceRecordingResult {
+    session_id: string;
+    path: string;
+    sequence: unknown;
 }
 export interface BrowserControlState {
     type: 'browser_control';
@@ -146,6 +153,12 @@ const withBrowserViewer = (init: RequestInit, viewerID?: string): RequestInit =>
 };
 export async function takeBrowserControl(sessionID: string, viewerID: string): Promise<BrowserControlState> {
     return request(`${sessionID.replace(/\/$/, "")}/control`, withBrowserViewer({ method: 'POST' }, viewerID));
+}
+export async function startBrowserSequenceRecording(sessionID: string, pageID: string, viewerID: string): Promise<void> {
+    await request(`${sessionID.replace(/\/$/, "")}/sequence-recording`, withBrowserViewer(jsonRequest('POST', { page_id: pageID }), viewerID));
+}
+export async function finishBrowserSequenceRecording(sessionID: string, outputPath: string, viewerID: string): Promise<BrowserSequenceRecordingResult> {
+    return request(`${sessionID.replace(/\/$/, "")}/sequence-recording`, withBrowserViewer(jsonRequest('DELETE', { output_path: outputPath }), viewerID));
 }
 export async function closeBrowser(sessionID: string, viewerID: string): Promise<void> {
     const response = await checkedFetch(`${sessionID.replace(/\/$/, "")}/close`, withBrowserViewer({ method: 'POST' }, viewerID));

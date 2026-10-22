@@ -19,7 +19,7 @@ type Function struct {
 }
 
 // Functions 返回绑定当前 Manager 的浏览器函数清单。
-// 默认提供 16 个函数；AllowEvaluate 增加脚本执行，AllowDevtools 增加三个诊断函数，UploadDir 增加文件上传。
+// 默认提供 22 个函数；AllowEvaluate 增加普通与序列脚本执行，AllowDevtools 增加三个诊断函数，UploadDir 增加文件上传。
 // 每次返回独立切片，宿主可以筛选；同一 Manager 的操作与 HTTP/React 共用 session 和 Tab。
 // 请求解码、输入/输出 schema 校验、审批、进度和模型协议由宿主工具框架处理。
 func (manager *Manager) Functions() []Function {
@@ -43,9 +43,18 @@ func (manager *Manager) Functions() []Function {
 		{Name: "browserScreenshot", Description: "把指定 page_id 页面截图保存为宿主可读取的 PNG 文件。", Handler: manager.Screenshot},
 		{Name: "browserAssets", Description: "读取指定 page_id 当前页面已经观测到的资源列表；返回脚本、样式、图片、字体和 XHR/Fetch 等资源的名称、实际地址、发起类型、状态、大小与耗时；可用 host 过滤域名。不会主动爬取未访问页面。", Handler: manager.ListAssets},
 		{Name: "browserClose", Description: "显式关闭指定浏览器 session。", Handler: manager.CloseSession},
+		{Name: "sequenceStart", Description: "开始记录当前 session 中由宿主 AI 探索产生的操作候选；保存用户目标和变量默认值，并以当前页面生成首个导航候选。", Handler: manager.StartSequence},
+		{Name: "sequenceRead", Description: "读取当前操作序列草稿的候选步骤、执行结果、页面别名和变量；模型应据此删除试错步骤并保持原执行顺序。", Handler: manager.ReadSequence},
+		{Name: "sequenceProviderCall", Description: "使用宿主已取得的外部能力结果填写目标元素，并记录可在回放时暂停求值的 provider-call 候选。", Handler: manager.ExecuteSequenceProviderCall},
+		{Name: "sequenceFinish", Description: "按候选 ID 删除和分组探索步骤，生成版本化可回放序列并保存为 JSON 文件；output_path 为空时创建临时文件，指定路径时拒绝覆盖已有文件，响应 path 始终为绝对路径。不能重排或改写候选动作内容。", Handler: manager.FinishSequence},
+		{Name: "sequenceReplay", Description: "在全新本地临时 Chrome profile 中回放版本化操作序列；遇到 provider-call 时返回暂停状态和续播 token。", Handler: manager.ReplaySequence},
+		{Name: "sequenceResume", Description: "向暂停的 provider-call 提交外部结果并从断点继续操作序列回放。", Handler: manager.ResumeSequence},
 	}
 	if manager.config.AllowEvaluate {
-		functions = append(functions, Function{Name: "browserEvaluate", Description: "在指定页面的 console 域执行一段 JavaScript，并返回有限 JSON 值。", Handler: manager.Evaluate})
+		functions = append(functions,
+			Function{Name: "browserEvaluate", Description: "在指定页面的 console 域执行一段 JavaScript，并返回有限 JSON 值。", Handler: manager.Evaluate},
+			Function{Name: "sequenceScript", Description: "显式执行并记录一个脚本候选；支持 action 和必须返回 true 的 assertion，只在启用 JavaScript 能力时提供。", Handler: manager.ExecuteSequenceScript},
+		)
 	}
 	if manager.config.UploadDir != "" {
 		functions = append(functions, Function{Name: "browserUploadFile", Description: "将宿主 UploadDir 目录内一个普通文件设置到指定 page_id 的原生 file input；需要快照 ref、revision 和绝对路径，响应只返回文件名及字节数。设置文件后页面内容或控件状态可能变化，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.UploadFile})

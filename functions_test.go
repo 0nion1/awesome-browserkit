@@ -65,9 +65,9 @@ func TestFunctionsFollowCapabilitiesAndDoNotShareCatalog(t *testing.T) {
 	for _, config := range []Config{{}, {AllowEvaluate: true}, {AllowDevtools: true}, {AllowEvaluate: true, AllowDevtools: true}} {
 		manager, _ := fakeManager(t, config)
 		functions := manager.Functions()
-		expected := 16
+		expected := 22
 		if config.AllowEvaluate {
-			expected++
+			expected += 2
 		}
 		if config.AllowDevtools {
 			expected += 3
@@ -95,7 +95,7 @@ func TestFunctionsFollowCapabilitiesAndDoNotShareCatalog(t *testing.T) {
 func TestUploadFunctionRequiresConfiguredDirectory(t *testing.T) {
 	manager, _ := fakeManager(t, Config{UploadDir: t.TempDir()})
 	defer manager.Close(context.Background())
-	if len(manager.Functions()) != 17 {
+	if len(manager.Functions()) != 23 {
 		t.Fatalf("配置上传目录后的函数数量=%d", len(manager.Functions()))
 	}
 	function := functionByName(t, manager, "browserUploadFile")

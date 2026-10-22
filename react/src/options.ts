@@ -18,6 +18,8 @@ export interface BrowserControls {
   closeBrowser?: boolean
   /** 工具栏中的开发诊断按钮。 */
   devtools?: boolean
+  /** 工具栏中的用户操作录制按钮。 */
+  recording?: boolean
   /** 画面内悬浮的开发诊断入口。 */
   devtoolsFloating?: boolean
   /** 唤起或收起页面键盘的按钮。 */

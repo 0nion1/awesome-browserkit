@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/png"
 	"math"
@@ -75,6 +76,7 @@ func (manager *Manager) Click(ctx context.Context, request ClickRequest) (ClickR
 	if request.WaitAfterMS < 0 {
 		return ClickResponse{}, errors.New("browserClick wait_after_ms 不能为负数")
 	}
+	element, _ := sequenceElement(current, currentPage, request.Ref)
 	unlockInteraction, err := lockSessionInteraction(operationCtx, current)
 	if err != nil {
 		return ClickResponse{}, err
@@ -95,10 +97,11 @@ func (manager *Manager) Click(ctx context.Context, request ClickRequest) (ClickR
 			return ClickResponse{}, err
 		}
 	}
+	candidateID := recordSequenceStep(current, currentPage, SequenceStep{Type: "click", Locator: locatorForSequenceElement(element), WaitAfterMS: request.WaitAfterMS}, "succeeded")
 	manager.emit(operationCtx, Event{Kind: "interaction_finished", SessionID: current.id, PageID: currentPage.id})
 	unlockInteraction()
 	activePageID, tabsRevision, tabsChanged := manager.tabChange(operationCtx, current, beforeTabsRevision)
-	response := ClickResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, Changed: true, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
+	response := ClickResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, Changed: true, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged, CandidateID: candidateID}
 	return response, nil
 }
 
@@ -146,6 +149,10 @@ func (manager *Manager) Hover(ctx context.Context, request HoverRequest) (HoverR
 
 // Type 执行浏览器页面操作，使用普通 context 和明确目标。
 func (manager *Manager) Type(ctx context.Context, request TypeRequest) (TypeResponse, error) {
+	return manager.typeElement(ctx, request, true)
+}
+
+func (manager *Manager) typeElement(ctx context.Context, request TypeRequest, record bool) (TypeResponse, error) {
 	if err := contextErr(ctx); err != nil {
 		return TypeResponse{}, err
 	}
@@ -160,6 +167,10 @@ func (manager *Manager) Type(ctx context.Context, request TypeRequest) (TypeResp
 	if request.Ref == "" || request.Revision == 0 {
 		return TypeResponse{}, errors.New("browserType 需要 ref 和 revision")
 	}
+	if request.SequenceVariable != "" && !sequenceVariablePattern.MatchString(strings.TrimSpace(request.SequenceVariable)) {
+		return TypeResponse{}, fmt.Errorf("序列变量名 %q 无效", request.SequenceVariable)
+	}
+	element, _ := sequenceElement(current, currentPage, request.Ref)
 	unlockInteraction, err := lockSessionInteraction(ctx, current)
 	if err != nil {
 		return TypeResponse{}, err
@@ -180,9 +191,13 @@ func (manager *Manager) Type(ctx context.Context, request TypeRequest) (TypeResp
 			return TypeResponse{}, err
 		}
 	}
+	candidateID := ""
+	if record {
+		candidateID = recordSequenceInput(current, currentPage, element, request)
+	}
 	unlockInteraction()
 	activePageID, tabsRevision, tabsChanged := manager.tabChange(ctx, current, beforeTabsRevision)
-	response := TypeResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, TextLength: len([]rune(request.Text)), Submitted: request.Submit, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
+	response := TypeResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, TextLength: len([]rune(request.Text)), Submitted: request.Submit, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged, CandidateID: candidateID}
 	return response, nil
 }
 
@@ -592,6 +607,7 @@ func rememberSnapshotRefs(value *page, snapshot Snapshot) {
 	}
 	if value.refs == nil || value.refRevision != snapshot.Revision {
 		value.refs = make(map[string]struct{})
+		value.elements = make(map[string]Element)
 		value.refRevision = snapshot.Revision
 	}
 	if snapshot.ActiveRefs != nil {
@@ -602,12 +618,14 @@ func rememberSnapshotRefs(value *page, snapshot Snapshot) {
 		for ref := range value.refs {
 			if _, ok := active[ref]; !ok {
 				delete(value.refs, ref)
+				delete(value.elements, ref)
 			}
 		}
 	}
 	for _, element := range snapshot.Elements {
 		if element.Ref != "" {
 			value.refs[element.Ref] = struct{}{}
+			value.elements[element.Ref] = element
 		}
 	}
 }
@@ -617,6 +635,7 @@ func clearPageRefs(value *page) {
 		return
 	}
 	value.refs = make(map[string]struct{})
+	value.elements = make(map[string]Element)
 	value.refRevision = 0
 }
 

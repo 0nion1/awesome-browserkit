@@ -252,6 +252,16 @@ handler := browserhttp.NewHandler(manager, browserhttp.Options{
 请求和响应使用导出的命名结构体，宿主负责 Schema 校验和工具调用协议。
 适配示例见 [examples/functions](examples/functions/main.go)。
 
+### 操作序列生成与回放
+
+BrowserKit 不内置模型调用；宿主 AI 使用现有 `browserSnapshot`、`browserClick`、`browserType` 等工具探索页面。调用 `sequenceStart` 后，成功的导航、点击和输入会成为候选步骤；脚本和外部能力分别通过 `sequenceScript`、`sequenceProviderCall` 显式加入候选。模型用 `sequenceRead` 检查候选，再由 `sequenceFinish` 按原执行顺序删减和分组，不能改写定位器或动作内容。
+
+最终序列使用 `schema_version: 1`，输入保存为变量占位符并在变量表保留默认值。`sequenceFinish` 将序列保存为 JSON：未提供 `output_path` 时创建权限为 `0600` 的临时文件，提供路径时写入该文件且拒绝覆盖已有文件；响应中的 `path` 始终返回实际绝对路径。`sequenceReplay` 总是另启本地临时 Chrome profile，不继承探索浏览器的 Cookie 或本地存储。点击不会回放旧 mousemove 或旧坐标，而是在重新定位元素后，从当前指针位置到元素当前可点击中心生成平滑轨迹。遇到 `provider-call` 时回放返回 `needs_provider` 和一次性 token；宿主取得验证码等外部结果后调用 `sequenceResume` 继续。
+
+BrowserView 工具栏还提供用户手动录制按钮。开启后，后端把用户的页面导航、点击和连续文本输入归并为与 Agent 探索相同的定位器、变量和语义步骤，不保存鼠标移动或逐键低层事件。点击停止后可选择临时文件或指定 JSON 文件；指定文件同样不会覆盖已有内容。录制状态和候选数量通过现有 state WebSocket 同步，刷新页面不会在前端伪造第二份状态。
+
+序列相关工具刻意不使用 `browser` 前缀；已有 Function Tool 名称保持不变。回放完成、失败或暂停后 session 都会保留，调用方检查完毕后使用 `browserClose` 释放。
+
 ### React
 
 完成[组件安装](#react-install)后，在应用中使用：

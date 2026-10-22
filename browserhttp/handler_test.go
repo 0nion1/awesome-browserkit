@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -196,11 +197,37 @@ func TestOriginAndReadOnlyPolicies(t *testing.T) {
 	if w.Code != 403 {
 		t.Fatalf("origin: %d", w.Code)
 	}
-	for _, path := range []string{"/tabs/" + opened.PageID + "/activate", "/control", "/close"} {
+	for _, path := range []string{"/tabs/" + opened.PageID + "/activate", "/control", "/close", "/sequence-recording"} {
 		w = call(t, NewHandler(m, Options{ReadOnly: true}), "POST", path, "{}", "viewer")
 		if w.Code != 403 {
 			t.Fatalf("readonly %s: %d", path, w.Code)
 		}
+	}
+}
+
+func TestSequenceRecordingHTTPStartsAndSaves(t *testing.T) {
+	m, _, opened := fixture(t)
+	_, leave, err := m.JoinViewer("controller", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leave()
+	h := NewHandler(m, Options{})
+	w := call(t, h, http.MethodPost, "/sequence-recording", `{"page_id":"`+opened.PageID+`"}`, "controller")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"recording":true`) {
+		t.Fatalf("start recording status=%d body=%s", w.Code, w.Body.String())
+	}
+	w = call(t, h, http.MethodDelete, "/sequence-recording", `{}`, "controller")
+	if w.Code != 200 {
+		t.Fatalf("finish recording status=%d body=%s", w.Code, w.Body.String())
+	}
+	var response browserkit.SequenceResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(response.Path)
+	if response.Path == "" || len(response.Sequence.Steps) != 1 {
+		t.Fatalf("finish recording response=%+v", response)
 	}
 }
 

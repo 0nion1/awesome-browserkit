@@ -1,4 +1,4 @@
-import { Plus, Code2, ArrowRight, Keyboard, RefreshCw, X, MousePointer2 } from 'lucide-react'
+import { Plus, Code2, ArrowRight, Keyboard, RefreshCw, X, MousePointer2, Circle, Square } from 'lucide-react'
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { type BrowserControlState, type BrowserTabView, type BrowserViewState } from './client'
 import { httpBrowserSource, type BrowserInputConnection, type BrowserSource, type BrowserInspectedElement } from './source'
@@ -89,6 +89,12 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
   const [closing, setClosing] = useState(false)
   const closingRef = useRef(false)
   const [notice, setNotice] = useState<string>()
+  const [recording, setRecording] = useState(false)
+  const [recordedSteps, setRecordedSteps] = useState(0)
+  const [recordingDialog, setRecordingDialog] = useState(false)
+  const [recordingSaveMode, setRecordingSaveMode] = useState<'temporary' | 'path'>('temporary')
+  const [recordingPath, setRecordingPath] = useState('')
+  const [recordingPending, setRecordingPending] = useState(false)
   const [inspecting, setInspecting] = useState(false)
   const [inspected, setInspected] = useState<BrowserInspectedElement>()
   const [hovered, setHovered] = useState<BrowserInspectedElement>()
@@ -530,6 +536,8 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
       if (!active) return
       if (!acceptState(state)) return
       stateCallback.current?.(state)
+      setRecording(Boolean(state.recording))
+      setRecordedSteps(state.recorded_steps || 0)
       if (state.closed) {
         seenRef.current = false
 
@@ -1030,6 +1038,44 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
     }
   }
 
+  const toggleRecording = async () => {
+    const pageID = activePageRef.current || activePageID
+    if (!sessionID || !pageID || !source.startRecording || !source.finishRecording) return
+    if (recording) {
+      setRecordingDialog(true)
+      return
+    }
+    setRecordingPending(true)
+    try {
+      await source.startRecording(sessionID, pageID, viewerID)
+      setRecording(true)
+      setRecordedSteps(1)
+      setNotice('已开始记录浏览器操作')
+    } catch (error) {
+      setNotice(error instanceof Error ? `开启录制失败：${error.message}` : '开启录制失败')
+    } finally {
+      setRecordingPending(false)
+    }
+  }
+
+  const saveRecording = async () => {
+    if (!sessionID || !source.finishRecording) return
+    const outputPath = recordingSaveMode === 'path' ? recordingPath.trim() : ''
+    if (recordingSaveMode === 'path' && !outputPath) return
+    setRecordingPending(true)
+    try {
+      const result = await source.finishRecording(sessionID, outputPath, viewerID)
+      setRecording(false)
+      setRecordingDialog(false)
+      setRecordedSteps(0)
+      setNotice(`操作序列已保存到 ${result.path}`)
+    } catch (error) {
+      setNotice(error instanceof Error ? `保存录制失败：${error.message}` : '保存录制失败')
+    } finally {
+      setRecordingPending(false)
+    }
+  }
+
   const activeTab = tabs.find((tab) => tab.page_id === activePageID)
   const controller = !readOnly && !interactionBusy && !closing && browserControl?.controller === true
   const inspectionLocked = inspecting && Boolean(inspected || area)
@@ -1038,8 +1084,9 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
   const showNavigate = showAddress && visible('navigate')
   const showClose = visible('toolbar') && visible('closeBrowser') && liveViewEnabled && !readOnly
   const showDevtools = visible('toolbar') && visible('devtools') && devtoolsEnabled
+  const showRecording = visible('toolbar') && visible('recording') && Boolean(source.startRecording && source.finishRecording) && liveViewEnabled && !readOnly
   const showInspect = visible('toolbar') && Boolean(onElementSelect || onAreaSelect)
-  const showToolbar = showAddress || showReload || showClose || showDevtools || showInspect
+  const showToolbar = showAddress || showReload || showClose || showDevtools || showInspect || showRecording
   const takeoverSeconds = Math.ceil(controlRetryAfterMS / 1000)
 
   const content = <section ref={setPanelHost} data-part="root" className={`browserkit ${className} browser-live-window browser-live-window-side-panel ${devtoolsEnabled ? 'browser-live-window-devtools-enabled' : ''} ${devtoolsPanelOpen ? 'browser-live-window-devtools-open' : ''} ${devtoolsOptions?.resizable === false ? 'browser-live-window-devtools-fixed' : ''}   ${syncing ? 'browser-live-window-syncing' : ''} `} style={style} aria-busy={interactionBusy || closing || undefined} aria-label={liveViewEnabled ? syncing ? '浏览器页面直播（同步中）' : '浏览器页面直播' : '浏览器开发诊断'} onKeyDownCapture={(event) => { if (inspecting) return; if (devtoolsEnabled && devtoolsOptions?.shortcut !== false && event.key === "F12") { event.preventDefault(); event.stopPropagation(); devtoolsPanelOpen ? closeDevtoolsPanel() : openDevtoolsPanel() } }}>
@@ -1073,6 +1120,7 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
         {showNavigate && <button type="button" aria-label="前往页面" disabled={!liveViewEnabled || !controller || !activePageID || !addressValue.trim() || inspectionLocked} onClick={() => void navigateAddress()}><ArrowRight size={13} /></button>}
       </div>
       <div>
+        {showRecording && <button type="button" className={recording ? 'browser-sequence-recording-active' : undefined} aria-label={recording ? '停止并保存操作录制' : '开始操作录制'} aria-pressed={recording} title={recording ? `正在录制，已记录 ${recordedSteps} 步` : '录制用户浏览器操作'} disabled={!controller || !activePageID || recordingPending || inspectionLocked} onClick={() => void toggleRecording()}>{recording ? <Square size={12} /> : <Circle size={14} />}</button>}
         {showClose && <button type="button" aria-label="关闭浏览器" disabled={!browserControl?.controller || closing || inspectionLocked} onClick={() => void close()}><X size={14} /></button>}
         {showDevtools && <button type="button" aria-label="切换开发诊断 F12" aria-pressed={devtoolsPanelOpen} onClick={() => devtoolsPanelOpen ? closeDevtoolsPanel() : openDevtoolsPanel()}><Code2 size={15} /></button>}
         {showInspect && <button type="button" aria-label="选择页面元素" aria-pressed={inspecting} disabled={!controller || !hasFrame || interactionBusy} onClick={() => { if (inspecting) stopInspecting(); else { clearKeyboardState(); inputRef.current?.blur(); inspectingRef.current = true; setInspecting(true) } }}><MousePointer2 size={15} /></button>}
@@ -1170,6 +1218,16 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
       {devtoolsEnabled && sessionID && <BrowserDevtoolsPanel source={source.diagnostics} className={classNames?.devtools} sessionID={sessionID} pageID={activePageID} viewerID={viewerID} controlEnabled={controller} hidden={!devtoolsPanelOpen} panels={devtoolsOptions?.panels} captureControl={devtoolsOptions?.captureControl} onClose={devtoolsOptions?.closeButton === false ? undefined : closeDevtoolsPanel} />}
     </div>}
     {notice && <div role="alert" className="browser-live-window-notice">{notice}</div>}
+    {recordingDialog && <div className="browser-sequence-dialog-backdrop" role="presentation" onPointerDown={(event) => event.stopPropagation()}>
+      <div className="browser-sequence-dialog" role="dialog" aria-modal="true" aria-labelledby="browser-sequence-dialog-title" onKeyDown={(event) => { if (event.key === 'Escape' && !recordingPending) setRecordingDialog(false) }}>
+        <h3 id="browser-sequence-dialog-title">保存操作录制</h3>
+        <p>已记录 {recordedSteps} 个候选步骤。选择保存位置后结束录制。</p>
+        <label><input type="radio" name="browser-sequence-save-mode" checked={recordingSaveMode === 'temporary'} onChange={() => setRecordingSaveMode('temporary')} />保存到临时文件</label>
+        <label><input type="radio" name="browser-sequence-save-mode" checked={recordingSaveMode === 'path'} onChange={() => setRecordingSaveMode('path')} />保存到指定文件</label>
+        {recordingSaveMode === 'path' && <input autoFocus aria-label="操作序列保存路径" value={recordingPath} onChange={(event) => setRecordingPath(event.target.value)} placeholder="/absolute/path/sequence.json" />}
+        <div><button type="button" disabled={recordingPending} onClick={() => setRecordingDialog(false)}>继续录制</button><button type="button" disabled={recordingPending || recordingSaveMode === 'path' && !recordingPath.trim()} onClick={() => void saveRecording()}>{recordingPending ? '保存中…' : '停止并保存'}</button></div>
+      </div>
+    </div>}
 
     </section>
   return content

@@ -256,6 +256,14 @@ Requests and responses are exported named structs.
 The host provides schema validation and the tool invocation protocol.
 See [examples/functions](examples/functions/main.go) for an adapter example.
 
+### Generate and replay operation sequences
+
+BrowserKit does not call an AI model itself. A host agent explores with the existing `browserSnapshot`, `browserClick`, and `browserType` tools. After `sequenceStart`, successful navigation, click, and input operations become candidates; scripts and external capabilities are added explicitly through `sequenceScript` and `sequenceProviderCall`. The agent inspects candidates with `sequenceRead` and uses `sequenceFinish` to remove or group them without reordering or rewriting action contents.
+
+The resulting `schema_version: 1` sequence stores inputs as variables with defaults. `sequenceFinish` saves it as JSON: without `output_path` it creates a `0600` temporary file; with a path it writes that file without replacing an existing file. The response always reports the resulting absolute `path`. `sequenceReplay` always launches a separate local Chrome temporary profile. Click replay resolves the element again and generates a smooth path from the current pointer position to the element's current clickable center instead of retaining old mouse coordinates. A `provider-call` pauses with `needs_provider`; submit the external result through `sequenceResume`. Sequence tool names intentionally omit the `browser` prefix, while all existing tool names remain unchanged. Replay sessions remain available for inspection until explicitly released with `browserClose`.
+
+BrowserView also exposes a manual recording button. While active, the backend folds user navigation, clicks, and continuous text input into the same locator-, variable-, and semantic-step model used by agent exploration; it does not persist mouse movement or raw per-key events. Stopping opens a choice between a temporary file and a specific JSON path. Recording state and candidate count travel over the existing state stream, so the backend remains the sole source of truth across refreshes and viewers.
+
 ### React
 
 After [installing the component](#react-install):

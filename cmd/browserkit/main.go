@@ -68,7 +68,7 @@ func mainRun() error {
 	manager, err := browserkit.NewManager(browserkit.Config{
 		AllowEvaluate:       *allowEvaluate,
 		AllowPrivateNetwork: *private,
-		MaxSessions:         1,
+		MaxSessions:         2,
 		AllowDevtools:       *devtools,
 		ScreenshotDir:       *screenshotDir,
 		Session:             sessionConfig,

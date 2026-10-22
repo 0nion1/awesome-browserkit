@@ -89,8 +89,21 @@ type Element struct {
 	Name             string          `json:"name,omitempty"`
 	Type             string          `json:"type,omitempty"`
 	FrameURL         string          `json:"frame_url,omitempty"`
+	Locator          ElementLocator  `json:"locator,omitempty"`
 	Options          []ElementOption `json:"options,omitempty"`
 	OptionsTruncated bool            `json:"options_truncated,omitempty"`
+}
+
+// ElementLocator 描述可跨页面重载重新解析的元素定位信息。
+// Ref 仍用于当前 document 内的安全操作；Locator 只用于操作序列回放。
+type ElementLocator struct {
+	Selector      string `json:"selector,omitempty"`
+	XPath         string `json:"xpath,omitempty"`
+	AbsoluteXPath string `json:"absolute_xpath,omitempty"`
+	Role          string `json:"role,omitempty"`
+	Name          string `json:"name,omitempty"`
+	Type          string `json:"type,omitempty"`
+	FrameURL      string `json:"frame_url,omitempty"`
 }
 
 // ElementOption 是原生下拉框中可供选择的选项。
@@ -125,6 +138,10 @@ type Snapshot struct {
 	Text      string    `json:"text"`
 	Elements  []Element `json:"elements"`
 	Truncated bool      `json:"truncated"`
+	// ActiveElementRef 和 ActiveElementValue 只供手动操作序列录制合并输入，
+	// 不进入 Snapshot 的公开 JSON，避免把页面字段值暴露给普通快照调用方。
+	ActiveElementRef   string `json:"-"`
+	ActiveElementValue string `json:"-"`
 	// ActiveRefs 是当前 DOM 中仍存在的内部 ref，供宿主回收已删除节点引用。
 	ActiveRefs []string `json:"-"`
 }

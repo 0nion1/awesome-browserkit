@@ -36,6 +36,8 @@ type Manager struct {
 	stateSubs         map[chan struct{}]struct{}
 	devtoolsStateMu   sync.Mutex
 	devtoolsStateSubs map[chan struct{}]struct{}
+	replayMu          sync.Mutex
+	replays           map[string]*sequenceReplayState
 }
 
 var openIdleTimeout = 5 * time.Second
@@ -55,11 +57,13 @@ type liveInput struct {
 	page     *page
 	event    InputEvent
 	epoch    uint64
+	barrier  chan struct{}
 }
 
 type session struct {
 	id        string
 	browser   Session
+	external  bool
 	tabs      map[string]*page
 	tabOrder  []string
 	activeTab string
@@ -77,6 +81,7 @@ type session struct {
 	inputQueue    chan liveInput
 	inputEpoch    uint64
 	inputCancel   context.CancelFunc
+	sequenceDraft *sequenceDraft
 	// tabsSignature/tabsRevision 是 session 级 Tab 状态投影。revision 只在
 	// active、Tab 集合或 Tab 的地址/标题/状态/视口实际变化后递增，重复读取保持稳定。
 	tabsSignature       string
@@ -96,6 +101,7 @@ type page struct {
 	// refs 只记录本页面快照返回的 ref，作为 manager 层的归属校验，
 	// 防止不同 Tab 的 Page 实现意外接受同名 ref。
 	refs               map[string]struct{}
+	elements           map[string]Element
 	refRevision        uint64
 	injectedScripts    map[string]struct{}
 	injectMu           sync.Mutex
@@ -124,6 +130,7 @@ func NewManager(config Config) (*Manager, error) {
 		idleCheckInterval: sessionIdleCheckInterval,
 		stateSubs:         make(map[chan struct{}]struct{}),
 		devtoolsStateSubs: make(map[chan struct{}]struct{}),
+		replays:           make(map[string]*sequenceReplayState),
 	}
 	for _, origin := range config.AllowedOrigins {
 		key, err := allowedOriginKey(origin)
@@ -245,11 +252,15 @@ func (manager *Manager) applyInjectScript(ctx context.Context, currentPage *page
 }
 
 func (manager *Manager) openNew(ctx context.Context, request OpenRequest) (OpenResponse, error) {
+	return manager.openNewWithConfig(ctx, request, manager.config.Session)
+}
+
+func (manager *Manager) openNewWithConfig(ctx context.Context, request OpenRequest, sessionConfig SessionConfig) (OpenResponse, error) {
 	if err := manager.beginOpening(); err != nil {
 		return OpenResponse{}, err
 	}
 	defer manager.finishOpening()
-	created, createdPage, loadStatus, err := manager.createSession(ctx, request, false)
+	created, createdPage, loadStatus, err := manager.createSessionWithConfig(ctx, request, false, sessionConfig)
 	if err != nil {
 		return OpenResponse{}, openFailed(err)
 	}
@@ -288,7 +299,11 @@ func (manager *Manager) beginOpening() error {
 }
 
 func (manager *Manager) createSession(ctx context.Context, request OpenRequest, attach bool) (*session, *page, OpenLoadStatus, error) {
-	browser, err := manager.config.Factory(ctx, manager.config.Session)
+	return manager.createSessionWithConfig(ctx, request, attach, manager.config.Session)
+}
+
+func (manager *Manager) createSessionWithConfig(ctx context.Context, request OpenRequest, attach bool, sessionConfig SessionConfig) (*session, *page, OpenLoadStatus, error) {
+	browser, err := manager.config.Factory(ctx, sessionConfig)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -298,7 +313,8 @@ func (manager *Manager) createSession(ctx context.Context, request OpenRequest, 
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	created := &session{
 		id: manager.newID("bsess"), browser: browser,
-		tabs: make(map[string]*page), createdAt: time.Now(), lastUsed: time.Now(),
+		external: externalBrowserConfig(sessionConfig),
+		tabs:     make(map[string]*page), createdAt: time.Now(), lastUsed: time.Now(),
 		ctx: sessionCtx, cancel: sessionCancel, inputQueue: make(chan liveInput, liveInputQueueSize), inputEpoch: 1,
 	}
 	viewport := request.Viewport

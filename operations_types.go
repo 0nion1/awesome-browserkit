@@ -107,6 +107,7 @@ type NavigateResponse struct {
 	ActivePageID string `json:"active_page_id,omitempty"`
 	TabsRevision uint64 `json:"tabs_revision"`
 	TabsChanged  bool   `json:"tabs_changed"`
+	CandidateID  string `json:"candidate_id,omitempty"`
 }
 
 // SnapshotRequest 是 browserSnapshot 的输入。
@@ -155,6 +156,7 @@ type ClickResponse struct {
 	ActivePageID string `json:"active_page_id,omitempty"`
 	TabsRevision uint64 `json:"tabs_revision"`
 	TabsChanged  bool   `json:"tabs_changed"`
+	CandidateID  string `json:"candidate_id,omitempty"`
 }
 
 // HoverRequest 是 browserHover 的输入。
@@ -184,6 +186,8 @@ type TypeRequest struct {
 	Text      string `json:"text"`
 	Append    bool   `json:"append,omitempty" jsonschema_description:"是否把文本追加到元素当前值末尾；省略或为 false 时先清空当前值。"`
 	Submit    bool   `json:"submit,omitempty"`
+	// SequenceVariable 在操作序列录制期间指定该输入使用的变量名。
+	SequenceVariable string `json:"sequence_variable,omitempty"`
 }
 
 // TypeResponse 是 browserType 的输出，不回显输入内容。
@@ -196,6 +200,7 @@ type TypeResponse struct {
 	ActivePageID string `json:"active_page_id,omitempty"`
 	TabsRevision uint64 `json:"tabs_revision"`
 	TabsChanged  bool   `json:"tabs_changed"`
+	CandidateID  string `json:"candidate_id,omitempty"`
 }
 
 // SelectOptionRequest 是 browserSelectOption 的输入。value 和 label 二选一。

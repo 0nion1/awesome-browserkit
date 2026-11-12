@@ -31,7 +31,12 @@ type Manager struct {
 	liveMu            sync.Mutex
 	live              *liveHub
 	idleCheckInterval time.Duration
+	timing            timing
 	sequence          atomic.Uint64
+	// interactiveUntil 在用户输入后短暂放开直播帧间隔，优先保证跟手；
+	// 停顿后自然回到档位帧率。interactiveWake 用于立即唤醒图流发布。
+	interactiveUntil  atomic.Int64
+	interactiveWake   chan struct{}
 	stateMu           sync.Mutex
 	stateSubs         map[chan struct{}]struct{}
 	devtoolsStateMu   sync.Mutex
@@ -40,13 +45,24 @@ type Manager struct {
 	replays           map[string]*sequenceReplayState
 }
 
-var openIdleTimeout = 2 * time.Second
-var tabReconcileTimeout = 2 * time.Second
-var tabReconcileInterval = 2 * time.Second
-var liveFirstFrameTimeout = 2 * time.Second
-var defaultSessionIdleTimeout = 30 * time.Minute
-var sessionIdleCheckInterval = time.Minute
-var defaultBrowserViewport = Viewport{Width: 1920, Height: 1080}
+type timing struct {
+	openIdle             time.Duration
+	tabReconcileTimeout  time.Duration
+	tabReconcileInterval time.Duration
+	liveFirstFrame       time.Duration
+	sessionIdle          time.Duration
+	sessionIdleCheck     time.Duration
+	viewport             Viewport
+}
+
+func defaultTiming() timing {
+	return timing{
+		openIdle: 3 * time.Second, tabReconcileTimeout: 2 * time.Second,
+		tabReconcileInterval: 2 * time.Second, liveFirstFrame: 2 * time.Second,
+		sessionIdle: 30 * time.Minute, sessionIdleCheck: time.Minute,
+		viewport: Viewport{Width: 1920, Height: 1080},
+	}
+}
 
 const liveInputQueueSize = 64
 
@@ -57,7 +73,22 @@ type liveInput struct {
 	page     *page
 	event    InputEvent
 	epoch    uint64
-	barrier  chan struct{}
+	// received 是单条直播输入通过远程链路到达 Manager 的时刻，
+	// 本地指针插值据此恢复相邻真实目标的节奏。
+	received time.Time
+	// lossless 表示该输入来自批量轨迹，必须逐点投递，不能与相邻采样合并。
+	lossless bool
+	// pace 是同一批采样的共享回放锚点，offset 是相对批次首个点的偏移。
+	pace   *inputBatchPace
+	offset time.Duration
+	// done 非空时表示顺序屏障；消费者到达该位置后关闭它。
+	done chan struct{}
+}
+
+// inputBatchPace 在批次首个点真正投递时建立时间锚点，保证回放节奏稳定。
+type inputBatchPace struct {
+	once  sync.Once
+	start time.Time
 }
 
 type session struct {
@@ -100,9 +131,13 @@ type page struct {
 	status      string
 	// refs 只记录本页面快照返回的 ref，作为 manager 层的归属校验，
 	// 防止不同 Tab 的 Page 实现意外接受同名 ref。
-	refs               map[string]struct{}
+	refs        map[string]struct{}
+	refRevision uint64
+	// lastSnapshot 是 renderer 被原生弹窗暂停时可返回的最近页面投影。
+	lastSnapshot *Snapshot
+	// generation 在导航或外部 Tab 状态变化时递增，用于丢弃并发旧快照。
+	generation         uint64
 	elements           map[string]Element
-	refRevision        uint64
 	injectedScripts    map[string]struct{}
 	injectMu           sync.Mutex
 	frameMu            sync.Mutex
@@ -112,8 +147,17 @@ type page struct {
 	devtoolsGeneration uint64
 }
 
+// EvaluateEnabled 报告宿主是否允许 browserEvaluate 和 browserAct 的 evaluate 步骤。
+func (manager *Manager) EvaluateEnabled() bool {
+	return manager != nil && manager.config.AllowEvaluate
+}
+
 // NewManager 创建一个独立浏览器管理器。
 func NewManager(config Config) (*Manager, error) {
+	return newManager(config, defaultTiming())
+}
+
+func newManager(config Config, timing timing) (*Manager, error) {
 	config, err := config.normalized()
 	if err != nil {
 		return nil, err
@@ -127,10 +171,12 @@ func NewManager(config Config) (*Manager, error) {
 		lifecycleCtx:      lifecycleCtx,
 		lifecycleCancel:   lifecycleCancel,
 		reclaimDone:       make(chan struct{}),
-		idleCheckInterval: sessionIdleCheckInterval,
+		idleCheckInterval: timing.sessionIdleCheck,
+		timing:            timing,
 		stateSubs:         make(map[chan struct{}]struct{}),
 		devtoolsStateSubs: make(map[chan struct{}]struct{}),
 		replays:           make(map[string]*sequenceReplayState),
+		interactiveWake:   make(chan struct{}, 1),
 	}
 	for _, origin := range config.AllowedOrigins {
 		key, err := allowedOriginKey(origin)
@@ -182,7 +228,23 @@ func (manager *Manager) validateOpen(request OpenRequest) error {
 func (manager *Manager) openExisting(ctx context.Context, request OpenRequest) (OpenResponse, error) {
 	current, currentPage, err := manager.get(ctx, request.SessionID, "")
 	if err != nil {
-		return OpenResponse{}, err
+		// get 直接返回生命周期错误；解释类型不能交给原生 errors.As 校验。
+		browserErr, ok := err.(*Error)
+		if ok && browserErr.Kind == "page_not_found" {
+			// 本地 Tab 映射可能落后于外部浏览器；先做一次有界 reconcile，
+			// 再决定是否真的需要新建页面。
+			if recovered, recoveredPage, recoveryErr := manager.recoverSessionPage(ctx, request.SessionID); recoveryErr == nil {
+				current, currentPage, err = recovered, recoveredPage, nil
+			}
+		}
+		if err != nil {
+			// 最后一个 Tab 被关闭后 session 仍然存在；此时允许 browserOpen
+			// 在原 session 中新建页面，避免只能关闭整个 session 重来。
+			if ok && browserErr.Kind == "page_not_found" {
+				return manager.NewTab(ctx, request)
+			}
+			return OpenResponse{}, err
+		}
 	}
 	info, err := currentPage.page.Info(ctx)
 	if err != nil {
@@ -209,21 +271,26 @@ func (manager *Manager) openExisting(ctx context.Context, request OpenRequest) (
 		}
 		current.mu.Lock()
 		clearPageRefs(currentPage)
+		currentPage.generation++
 		current.mu.Unlock()
-		loadStatus, err = pageLoadStatus(ctx, currentPage.page)
+		loadStatus, err = manager.pageLoadStatus(ctx, currentPage.page)
 		if err != nil {
 			return OpenResponse{}, openFailed(err)
 		}
-		info, err = currentPage.page.Info(ctx)
-		if err != nil {
-			return OpenResponse{}, openFailed(err)
+		if pendingPageDialog(currentPage.page) == nil {
+			info, err = currentPage.page.Info(ctx)
+			if err != nil {
+				return OpenResponse{}, openFailed(err)
+			}
+		} else {
+			info = PageInfo{URL: target}
 		}
 		current.mu.Lock()
 		currentPage.info = info
 		current.mu.Unlock()
 	}
 	snapshot, warning := manager.loadSnapshot(ctx, current, currentPage, loadStatus)
-	return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning}, nil
+	return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning, Dialogs: pendingPageDialogs(currentPage.page)}, nil
 }
 
 // applyInjectScript 允许复用已有 session 时继续使用 inject_js：脚本只向
@@ -320,7 +387,7 @@ func (manager *Manager) createSessionWithConfig(ctx context.Context, request Ope
 	}
 	viewport := request.Viewport
 	if viewport.Width <= 0 || viewport.Height <= 0 {
-		viewport = defaultBrowserViewport
+		viewport = manager.timing.viewport
 	}
 	var pageValue Page
 	if attach {
@@ -353,7 +420,7 @@ func (manager *Manager) createSessionWithConfig(ctx context.Context, request Ope
 	go manager.dispatchLiveInputs(created)
 	loadStatus := OpenLoadLoaded
 	if request.URL == "" && !attach {
-		loadStatus, err = pageLoadStatus(ctx, createdPage.page)
+		loadStatus, err = manager.pageLoadStatus(ctx, createdPage.page)
 		if err != nil {
 			stopPageDevtools(createdPage)
 			sessionCancel()
@@ -366,30 +433,36 @@ func (manager *Manager) createSessionWithConfig(ctx context.Context, request Ope
 
 func (manager *Manager) addSession(created *session) error {
 	manager.mu.Lock()
-	defer manager.mu.Unlock()
 	if manager.stopped {
+		manager.mu.Unlock()
 		return browserError("browser_closed", "Browser Manager 已关闭", "调用 NewManager 重新创建浏览器运行时", true)
 	}
 	manager.sessions[created.id] = created
 	manager.active = created.id
+	manager.mu.Unlock()
+	manager.watchTabEvents(created)
+	manager.watchConnection(created)
 	return nil
 }
 
 func (manager *Manager) finishNewPage(ctx context.Context, current *session, currentPage *page, address string, loadStatus OpenLoadStatus) (OpenResponse, error) {
 	if address == "" {
 		snapshot, warning := manager.loadSnapshot(ctx, current, currentPage, loadStatus)
-		return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: "about:blank", LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning}, nil
+		return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: "about:blank", LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning, Dialogs: pendingPageDialogs(currentPage.page)}, nil
 	}
 	if _, err := currentPage.page.Navigate(ctx, address); err != nil {
 		return OpenResponse{}, err
 	}
-	loadStatus, err := pageLoadStatus(ctx, currentPage.page)
+	loadStatus, err := manager.pageLoadStatus(ctx, currentPage.page)
 	if err != nil {
 		return OpenResponse{}, err
 	}
-	info, err := currentPage.page.Info(ctx)
-	if err != nil {
-		return OpenResponse{}, err
+	info := PageInfo{URL: address}
+	if pendingPageDialog(currentPage.page) == nil {
+		info, err = currentPage.page.Info(ctx)
+		if err != nil {
+			return OpenResponse{}, err
+		}
 	}
 	current.mu.Lock()
 	currentPage.info = info
@@ -397,7 +470,7 @@ func (manager *Manager) finishNewPage(ctx context.Context, current *session, cur
 	current.mu.Unlock()
 	manager.emit(ctx, Event{Kind: "navigation_finished", SessionID: current.id, PageID: currentPage.id, URL: info.URL})
 	snapshot, warning := manager.loadSnapshot(ctx, current, currentPage, loadStatus)
-	return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning}, nil
+	return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning, Dialogs: pendingPageDialogs(currentPage.page)}, nil
 }
 
 func resolveURL(address, base string) string {
@@ -412,9 +485,43 @@ func resolveURL(address, base string) string {
 	return origin.ResolveReference(parsed).String()
 }
 
-func pageLoadStatus(ctx context.Context, page Page) (OpenLoadStatus, error) {
-	timedOut, err := waitPageIdle(ctx, page)
+func (manager *Manager) pageLoadStatus(ctx context.Context, page Page) (OpenLoadStatus, error) {
+	if pendingPageDialog(page) != nil {
+		return OpenLoadTimeout, nil
+	}
+	changes := dialogChanges(page)
+	if pendingPageDialog(page) != nil {
+		return OpenLoadTimeout, nil
+	}
+	type idleResult struct {
+		timedOut bool
+		err      error
+	}
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan idleResult, 1)
+	go func() {
+		timedOut, waitErr := waitPageIdle(waitCtx, page, manager.timing.openIdle)
+		done <- idleResult{timedOut: timedOut, err: waitErr}
+	}()
+	var timedOut bool
+	var err error
+	select {
+	case result := <-done:
+		timedOut, err = result.timedOut, result.err
+	case <-changes:
+		cancel()
+		if pendingPageDialog(page) != nil {
+			return OpenLoadTimeout, nil
+		}
+		return "", errors.New("页面弹窗状态发生变化")
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 	if err != nil {
+		if pendingPageDialog(page) != nil {
+			return OpenLoadTimeout, nil
+		}
 		return "", err
 	}
 	if timedOut {
@@ -422,12 +529,12 @@ func pageLoadStatus(ctx context.Context, page Page) (OpenLoadStatus, error) {
 	}
 	return OpenLoadLoaded, nil
 }
-func waitPageIdle(ctx context.Context, page Page) (bool, error) {
-	idleCtx, cancel := context.WithTimeout(ctx, openIdleTimeout)
+func waitPageIdle(ctx context.Context, page Page, timeout time.Duration) (bool, error) {
+	idleCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	err := page.Wait(idleCtx, WaitOptions{Condition: "load_complete"})
 	if err == nil {
-		err = page.WaitIdle(idleCtx, openIdleTimeout)
+		err = page.WaitIdle(idleCtx, timeout)
 	}
 	if err == nil {
 		return false, nil
@@ -440,14 +547,31 @@ func waitPageIdle(ctx context.Context, page Page) (bool, error) {
 
 // loadSnapshot 只读取超时页面的现有内容，不再次等待加载或枚举 Tab。
 // 快照沿用 browserSnapshot 的状态投影，保证返回的 ref 可直接操作。
-func (manager *Manager) loadSnapshot(ctx context.Context, current *session, currentPage *page, status OpenLoadStatus) (*SnapshotResponse, string) {
-	if status != OpenLoadTimeout {
-		return nil, ""
+func (manager *Manager) recoverSessionPage(ctx context.Context, sessionID string) (*session, *page, error) {
+	current, err := manager.lockSession(sessionID)
+	if err != nil {
+		return nil, nil, err
 	}
-	warning := fmt.Sprintf("页面在 %g 秒内未完成加载或进入空闲，当前内容可能不完整；请根据已有内容决定继续操作，或调用 browserWait/browserSnapshot 检查后续状态。", openIdleTimeout.Seconds())
+	current.mu.Unlock()
+	if err := manager.reconcileTabsWait(ctx, current); err != nil {
+		return nil, nil, err
+	}
+	return manager.get(ctx, sessionID, "")
+}
+
+func (manager *Manager) loadSnapshot(ctx context.Context, current *session, currentPage *page, status OpenLoadStatus) (*SnapshotResponse, string) {
+	warning := ""
+	if status == OpenLoadTimeout {
+		warning = fmt.Sprintf("页面未在总计 %g 秒的等待预算内完成加载并进入空闲，当前内容可能不完整；请根据已有内容决定继续操作，或调用 browserWait/browserSnapshot 检查后续状态。", manager.timing.openIdle.Seconds())
+	}
+	// 成功导航也返回快照：绝大多数调用方紧接着就会读取页面，
+	// 提前附带可省掉一次额外的 browserSnapshot 往返。
 	snapshot, err := manager.snapshotPage(ctx, current, currentPage, SnapshotOptions{})
 	if err != nil {
-		return nil, warning + " 当前内容读取失败：" + err.Error() + "；页面仍保留，请勿重复打开或导航。"
+		if status == OpenLoadTimeout {
+			return nil, warning + " 当前内容读取失败：" + err.Error() + "；页面仍保留，请勿重复打开或导航。"
+		}
+		return nil, ""
 	}
 	return &snapshot, warning
 }
@@ -487,14 +611,7 @@ func invalidateInputsLocked(current *session) {
 }
 
 func (manager *Manager) emit(ctx context.Context, event Event) {
-	manager.stateMu.Lock()
-	for subscriber := range manager.stateSubs {
-		select {
-		case subscriber <- struct{}{}:
-		default:
-		}
-	}
-	manager.stateMu.Unlock()
+	manager.notifyState()
 	if manager.config.EventSink != nil {
 		event.At = time.Now()
 		manager.config.EventSink.OnBrowserEvent(ctx, event)

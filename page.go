@@ -3,14 +3,18 @@ package browserkit
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/proto"
 )
 
@@ -21,6 +25,10 @@ const targetCloseTimeout = 2 * time.Second
 type rodPage struct {
 	page             *rod.Page
 	stateMu          sync.Mutex
+	frameMu          sync.Mutex
+	frameWorlds      map[proto.PageFrameID]proto.RuntimeExecutionContextID
+	frameLoaders     map[proto.PageFrameID]proto.NetworkLoaderID
+	oopifs           map[proto.TargetTargetID]*rod.Page
 	interactionMu    sync.Mutex
 	releaseOnce      sync.Once
 	cancel           context.CancelFunc
@@ -34,6 +42,215 @@ type rodPage struct {
 	pointerX         float64
 	pointerY         float64
 	pointerKnown     bool
+	dialogMu         sync.Mutex
+	pendingDialog    *Dialog
+	dialogSequence   uint64
+	dialogChanges    chan struct{}
+	sameDocSeq       uint64
+	sameDocURL       string
+}
+
+// startDialogWatcher 记录原生 JavaScript 弹窗，但不替用户决定接受或取消。
+// 弹窗存在时 renderer 会暂停；Manager 使用最近快照返回页面状态，直到
+// browserHandleDialog 显式处理当前弹窗。
+func (page *rodPage) startDialogWatcher() {
+	if page == nil || page.page == nil {
+		return
+	}
+	// EachEvent 的注册本身是同步的；先注册回调，再在 goroutine 中等待事件，
+	// 避免页面在 goroutine 调度前就弹出对话框而漏处理。
+	wait := page.page.EachEvent(func(event *proto.PageJavascriptDialogOpening) {
+		page.dialogMu.Lock()
+		page.dialogSequence++
+		options := []string{"accept", "dismiss"}
+		if event.Type == proto.PageDialogTypeAlert {
+			options = []string{"accept"}
+		}
+		page.pendingDialog = &Dialog{
+			ID:         page.dialogSequence,
+			Type:       string(event.Type),
+			Message:    event.Message,
+			URL:        event.URL,
+			Options:    options,
+			PromptText: event.DefaultPrompt,
+		}
+		page.notifyDialogLocked()
+		page.dialogMu.Unlock()
+	}, func(event *proto.PageNavigatedWithinDocument) {
+		// 只记录主 frame 的同文档导航；iframe 的 pushState 不能证明
+		// 当前页面的历史导航已经完成。
+		if event.FrameID != page.page.FrameID {
+			return
+		}
+		page.stateMu.Lock()
+		page.sameDocSeq++
+		page.sameDocURL = event.URL
+		page.stateMu.Unlock()
+	})
+	go wait()
+}
+
+func (page *rodPage) notifyDialogLocked() {
+	if page.dialogChanges != nil {
+		close(page.dialogChanges)
+	}
+	page.dialogChanges = make(chan struct{})
+}
+
+// PendingDialog 返回当前仍阻塞页面的弹窗，不消费状态。
+func (page *rodPage) PendingDialog() *Dialog {
+	if page == nil {
+		return nil
+	}
+	page.dialogMu.Lock()
+	defer page.dialogMu.Unlock()
+	if page.pendingDialog == nil {
+		return nil
+	}
+	value := *page.pendingDialog
+	value.Options = append([]string(nil), value.Options...)
+	return &value
+}
+
+// DialogChanges 返回下一次弹窗出现时关闭的通知通道。
+func (page *rodPage) DialogChanges() <-chan struct{} {
+	if page == nil {
+		return nil
+	}
+	page.dialogMu.Lock()
+	defer page.dialogMu.Unlock()
+	if page.dialogChanges == nil {
+		page.dialogChanges = make(chan struct{})
+	}
+	return page.dialogChanges
+}
+
+// registerTitleBindingAsync 异步恢复标题变化通知。标题通知只是页面投影的
+// 辅助能力，不能占用导航或弹窗处理的关键路径；弹窗出现时优先取消请求。
+func (page *rodPage) registerTitleBindingAsync() {
+	if page == nil || page.page == nil || page.PendingDialog() != nil {
+		return
+	}
+	changes := page.DialogChanges()
+	if page.PendingDialog() != nil {
+		return
+	}
+	base := page.page.GetContext()
+	if base == nil {
+		base = context.Background()
+	}
+	go func() {
+		bindCtx, cancel := context.WithTimeout(base, time.Second)
+		defer cancel()
+		done := make(chan struct{}, 1)
+		go func() {
+			registerTitleBinding(bindCtx, page.page)
+			done <- struct{}{}
+		}()
+		select {
+		case <-done:
+		case <-changes:
+			// 原生弹窗暂停 renderer；标题通知让路给弹窗状态和
+			// browserHandleDialog，不能等待普通 OperationTimeout。
+			cancel()
+		case <-bindCtx.Done():
+		}
+	}()
+}
+
+// runUntilDialog 执行一个可能触发原生弹窗的页面动作。CDP 输入请求可能在
+// renderer 弹窗后仍等待脚本返回；此时弹窗事件就是动作已经派发的边界，
+// 立即取消等待并让调用方通过 browserHandleDialog 决定后续行为。
+func (page *rodPage) runUntilDialog(ctx context.Context, action func(context.Context) error) error {
+	if pending := page.PendingDialog(); pending != nil {
+		return newError("dialog_open", "页面存在待处理弹窗", "调用 browserSnapshot 获取 dialog id，再使用 browserHandleDialog", true)
+	}
+	changes := page.DialogChanges()
+	// 弹窗可能恰好出现在第一次检查与订阅之间；订阅后必须再检查一次，
+	// 否则会等待下一次变化直到操作超时。
+	if page.PendingDialog() != nil {
+		return nil
+	}
+	actionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- action(actionCtx) }()
+	for {
+		select {
+		case err := <-done:
+			if page.PendingDialog() != nil {
+				return nil
+			}
+			return err
+		case <-changes:
+			if page.PendingDialog() != nil {
+				cancel()
+				return nil
+			}
+			changes = page.DialogChanges()
+		case <-ctx.Done():
+			if page.PendingDialog() != nil {
+				return nil
+			}
+			return ctx.Err()
+		}
+	}
+}
+
+// HandleDialog 按调用方的明确选择处理当前弹窗。
+func (page *rodPage) HandleDialog(ctx context.Context, options DialogHandleOptions) (Dialog, error) {
+	if page == nil || page.page == nil {
+		return Dialog{}, errors.New("浏览器 page 不能为空")
+	}
+	page.dialogMu.Lock()
+	pending := page.pendingDialog
+	if pending == nil {
+		page.dialogMu.Unlock()
+		return Dialog{}, newError("dialog_not_found", "页面当前没有待处理弹窗", "重新调用 browserSnapshot 获取页面状态", true)
+	}
+	value := *pending
+	value.Options = append([]string(nil), pending.Options...)
+	page.dialogMu.Unlock()
+	if options.ID == 0 || options.ID != value.ID {
+		return Dialog{}, newError("dialog_stale", "弹窗身份已经变化", "重新调用 browserSnapshot，并使用当前 dialog id", true)
+	}
+	accept := options.Action == "accept"
+	if !accept && options.Action != "dismiss" {
+		return Dialog{}, newError("invalid_dialog_action", "弹窗动作必须是 accept 或 dismiss", "使用 browserSnapshot 返回的 options", true)
+	}
+	allowed := false
+	for _, action := range value.Options {
+		if action == options.Action {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return Dialog{}, newError("invalid_dialog_action", "当前弹窗不支持该动作", "使用 browserSnapshot 返回的 options", true)
+	}
+	if value.Type != string(proto.PageDialogTypePrompt) && options.PromptText != "" {
+		return Dialog{}, newError("invalid_prompt_text", "只有 prompt 弹窗可以填写 prompt_text", "移除 prompt_text 后重试", true)
+	}
+	operationCtx, cancel, err := page.ctx(ctx)
+	if err != nil {
+		return Dialog{}, err
+	}
+	defer cancel()
+	if err := (proto.PageHandleJavaScriptDialog{Accept: accept, PromptText: options.PromptText}).Call(page.page.Context(operationCtx)); err != nil {
+		return Dialog{}, err
+	}
+	page.dialogMu.Lock()
+	if page.pendingDialog != nil && page.pendingDialog.ID == value.ID {
+		page.pendingDialog = nil
+	}
+	page.dialogMu.Unlock()
+	page.registerTitleBindingAsync()
+	value.Handled = true
+	value.Accepted = accept
+	if value.Type == string(proto.PageDialogTypePrompt) && accept {
+		value.PromptText = options.PromptText
+	}
+	return value, nil
 }
 
 func (page *rodPage) release() {
@@ -41,6 +258,7 @@ func (page *rodPage) release() {
 		return
 	}
 	page.releaseOnce.Do(func() {
+		page.closeOOPIFs()
 		if page.cancel != nil {
 			page.cancel()
 		}
@@ -98,22 +316,32 @@ func (page *rodPage) TargetID() string {
 }
 
 type domSnapshot struct {
-	URL                string    `json:"url"`
-	Title              string    `json:"title"`
-	Text               string    `json:"text"`
-	Elements           []Element `json:"elements"`
-	Refs               []string  `json:"refs"`
-	ActiveElementRef   string    `json:"active_element_ref"`
-	ActiveElementValue string    `json:"active_element_value"`
+	URL      string    `json:"url"`
+	Title    string    `json:"title"`
+	Text     string    `json:"text"`
+	Elements []Element `json:"elements"`
+	Refs     []string  `json:"refs"`
+	HasMore  bool      `json:"has_more"`
+	// TextTruncated 表示正文被 max_chars 截断。
+	TextTruncated bool `json:"text_truncated"`
+	// CrossFrame 表示存在无法从主文档读取的跨域 iframe。
+	CrossFrame         bool   `json:"cross_frame"`
+	ActiveElementRef   string `json:"active_element_ref"`
+	ActiveElementValue string `json:"active_element_value"`
 }
 
 type domState struct {
 	DocumentID string `json:"document_id"`
 }
 
+// titleBindingName 是页面标题变化上报使用的 CDP binding。
+// Headless Chrome 不会为纯标题变化发送 Target.targetInfoChanged，
+// 因此由页面内的 MutationObserver 主动通知 Session。
+const titleBindingName = "__browserkit_title_v1__"
+
 // pageStateObserverBody 在每个 document 中维护唯一的文档身份，并由
 // MutationObserver 清理已从 DOM 移除节点上的 ref，避免 SPA 长时间运行时
-// ref 集合无限增长。
+// ref 集合无限增长。标题变化同时通过 CDP binding 上报给 Session。
 const pageStateObserverBody = `
   const key = '__browserkit_page_state_v1__';
   const current = window[key];
@@ -141,6 +369,42 @@ const pageStateObserverBody = `
   else document.addEventListener('DOMContentLoaded', () => {
     if (document.documentElement) state.observer.observe(document.documentElement, {subtree: true, childList: true});
   }, {once: true});
+  if (!state.titleObserverInstalled) {
+    state.titleObserverInstalled = true;
+    let titleObserver = null;
+    let headObserver = null;
+    const reportTitle = () => {
+      try {
+        if (typeof window['` + titleBindingName + `'] === 'function') window['` + titleBindingName + `']('changed');
+      } catch (error) {}
+    };
+    const watchTitle = () => {
+      if (titleObserver) titleObserver.disconnect();
+      titleObserver = null;
+      state.titleObserver = null;
+      const title = document.querySelector('title');
+      if (!title) return;
+      titleObserver = new MutationObserver(reportTitle);
+      state.titleObserver = titleObserver;
+      titleObserver.observe(title, {childList: true, characterData: true, subtree: true});
+    };
+    const watchHead = (attempts) => {
+      const head = document.head;
+      if (!head) {
+        // 文档起始脚本运行时 head 尚未创建；短暂重试直到解析器建立 head。
+        if (attempts > 0) setTimeout(() => watchHead(attempts - 1), 50);
+        return;
+      }
+      watchTitle();
+      if (!headObserver) {
+        headObserver = new MutationObserver(watchTitle);
+        state.headObserver = headObserver;
+        headObserver.observe(head, {childList: true});
+      }
+    };
+    document.addEventListener('DOMContentLoaded', () => watchHead(0), {once: true});
+    watchHead(200);
+  }
   Object.defineProperty(window, key, { configurable: true, value: state });
   return state;`
 
@@ -192,15 +456,23 @@ func (page *rodPage) Navigate(ctx context.Context, address string) (PageInfo, er
 		return PageInfo{}, err
 	}
 	defer operationCancel()
-	if err := page.page.Context(operationCtx).Navigate(address); err != nil {
+	if err := page.runUntilDialog(operationCtx, func(actionCtx context.Context) error {
+		return page.page.Context(actionCtx).Navigate(address)
+	}); err != nil {
 		return PageInfo{}, err
 	}
+	// Navigation 会产生新的文档，CDP binding 不会自动保留。标题通知是
+	// 辅助能力，异步恢复并在弹窗出现时立即让路，不能阻塞导航结果。
+	page.registerTitleBindingAsync()
 	page.stateMu.Lock()
 	page.revision++
 	page.refs = make(map[string]struct{})
 	page.documentID = ""
 	page.stateKnown = false
 	page.stateMu.Unlock()
+	if page.PendingDialog() != nil {
+		return PageInfo{URL: address}, nil
+	}
 	return page.info(operationCtx)
 }
 
@@ -267,17 +539,58 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 			}
 			return parts.join(' > ');
 		};
-		const selectors = 'button,a,input,textarea,select,summary,iframe,[contenteditable="true"],[role="button"],[role="link"],[role="textbox"],[role="menuitem"],[role="option"],[role="tab"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="combobox"],[aria-haspopup],[aria-expanded],[onclick],[tabindex]:not([tabindex="-1"])';
+		const cleanValue = value => (value || '').replace(/[\u0000-\u0008\u000b-\u001f]/g, ' ');
+		const truncate = (value, limit) => {
+			if (value.length <= limit) return {text: value, truncated: false};
+			// 只对前 2*limit 个 UTF-16 单元做码点转换，避免超大值先被完整展开。
+			const chars = Array.from(value.slice(0, Math.min(value.length, limit * 2)));
+			return {text: chars.slice(0, limit).join(''), truncated: chars.length > limit || value.length > limit * 2};
+		};
+		const selectors = 'button,a,input,textarea,select,summary,iframe,[contenteditable]:not([contenteditable="false"]),[role="button"],[role="link"],[role="textbox"],[role="checkbox"],[role="radio"],[role="switch"],[role="slider"],[draggable="true"],[ondrop],[ondragover],[role="menuitem"],[role="option"],[role="tab"],[role="menuitemcheckbox"],[role="menuitemradio"],[role="combobox"],[aria-haspopup],[aria-expanded],[onclick],[tabindex]:not([tabindex="-1"])';
 		const visible = el => {
 			const style = getComputedStyle(el);
 			const rect = el.getBoundingClientRect();
 			return !el.hidden && !el.closest('[hidden],[aria-hidden="true"]') && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && style.pointerEvents !== 'none' && rect.width > 0 && rect.height > 0;
 		};
-		const disabled = el => el.disabled || el.getAttribute('aria-disabled') === 'true';
+		const clippedAway = style => {
+			const value = style.clipPath;
+			if (!value || value === 'none') return false;
+			const match = value.match(/inset\(([^)]*)\)/);
+			if (!match) return false;
+			const parts = match[1].trim().split(/\s+/).filter(Boolean);
+			const pct = part => part.endsWith('%') ? parseFloat(part) : (parseFloat(part) === 0 ? 0 : NaN);
+			if (parts.length === 0) return false;
+			const values = parts.length === 1 ? [parts[0], parts[0], parts[0], parts[0]]
+				: parts.length === 2 ? [parts[0], parts[1], parts[0], parts[1]]
+				: parts.length === 3 ? [parts[0], parts[1], parts[2], parts[1]] : parts;
+			const [top, right, bottom, left] = values.map(pct);
+			if ([top, right, bottom, left].some(Number.isNaN)) return false;
+			return top + bottom >= 100 || left + right >= 100;
+		};
+		// 同源 iframe 的正文/元素由主文档脚本遍历，必须自行检查宿主及其祖先，
+		// 否则隐藏容器里的 iframe 内容仍会进入快照。
+		const hiddenHost = el => {
+			for (let node = el; node;) {
+				const style = getComputedStyle(node);
+				if (style.display === 'none' || Number(style.opacity) < 0.05 || style.contentVisibility === 'hidden' || clippedAway(style)) return true;
+				if (node.parentElement) { node = node.parentElement; continue; }
+				const root = node.getRootNode ? node.getRootNode() : null;
+				if (root && root.host) { node = root.host; continue; }
+				break;
+			}
+			const rect = el.getBoundingClientRect();
+			const view = el.ownerDocument && el.ownerDocument.defaultView;
+			const width = view ? view.innerWidth : 0;
+			const height = view ? view.innerHeight : 0;
+			return rect.width <= 1 || rect.height <= 1 || rect.right < -1000 || rect.bottom < -1000 || rect.left > width + 5000 || rect.top > height + 5000;
+		};
+		const disabled = el => el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true';
 		const text = el => clean(el.innerText || el.textContent || '');
 		const offset = Math.max(0, options.offset || 0);
 		const maxElements = Math.max(1, options.max_elements || 100);
-		const scanLimit = offset + maxElements;
+		// 多扫描一个候选只用于判断是否还有下一页，避免把“恰好满页”
+		// 误报成还需继续分页。
+		const scanLimit = offset + maxElements + 1;
 		const roots = [];
 		const visit = root => {
 			roots.push(root);
@@ -298,7 +611,8 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 		};
 		for (const root of roots) {
 			for (const el of root.querySelectorAll(selectors)) {
-				if (disabled(el) || !visible(el)) continue;
+				if (el.hasAttribute('contenteditable') && !el.isContentEditable) continue;
+				if (!visible(el)) continue;
 				addCandidate(el);
 				if (candidates.length >= scanLimit) break;
 			}
@@ -306,7 +620,13 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 		}
 		if (candidates.length < scanLimit) for (const root of roots) {
 			for (const el of root.querySelectorAll('*')) {
-				if (disabled(el) || !visible(el) || getComputedStyle(el).cursor !== 'pointer') continue;
+				// 先看 cursor 再看布局：大页面里绝大多数元素不是可点击卡片，
+				// 这样只在命中时才付出 getBoundingClientRect 和文本提取成本。
+				if (el.hidden) continue;
+				const style = getComputedStyle(el);
+				if (style.cursor !== 'pointer' || style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || style.pointerEvents === 'none') continue;
+				const rect = el.getBoundingClientRect();
+				if (rect.width <= 0 || rect.height <= 0 || el.closest('[hidden],[aria-hidden="true"]')) continue;
 				const name = text(el);
 				if (name.length === 0 || name.length > 160) continue;
 				const parent = el.parentElement;
@@ -319,27 +639,95 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 		}
 		const windowed = candidates.slice(offset, offset + maxElements);
 		const state = window.__browserkit_page_state_v1__;
+		let valueBudget = 4000;
+		// 沿祖先、shadow host 和 iframe 宿主链计算有效可见性；隐藏宿主
+		// 下的值不应因为子文档坐标系看起来正常而泄露。
+		const effectivelyHidden = start => {
+				let node = start;
+				let first = true;
+				while (node) {
+					const style = getComputedStyle(node);
+					const fill = style.webkitTextFillColor || '';
+					if (style.display === 'none' || Number(style.opacity) < 0.05 || style.contentVisibility === 'hidden' || clippedAway(style) || (style.clip && style.clip !== 'auto')) return true;
+					// visibility、font-size 和 text-fill 可被子元素覆盖；start 的
+					// computed style 已包含继承或覆盖结果，只检查 start。
+					if (first && (style.visibility === 'hidden' || style.visibility === 'collapse' || parseFloat(style.fontSize) === 0 || fill === 'transparent' || fill === 'rgba(0, 0, 0, 0)')) return true;
+					first = false;
+				const rect = node.getBoundingClientRect();
+				const view = node.ownerDocument && node.ownerDocument.defaultView;
+				const doc = node.ownerDocument && node.ownerDocument.documentElement;
+				const left = rect.left + (view ? view.scrollX : 0);
+				const top = rect.top + (view ? view.scrollY : 0);
+				// 用文档坐标判断屏外，避免长页面滚动后把顶部正常字段误删。
+				if (doc && (left < -1000 || top < -1000 || top > doc.scrollHeight + 1000)) return true;
+				// 正方向越界用视口判断：绝对定位元素会把文档 scrollWidth 撑大。
+				if (view && (rect.left > view.innerWidth + 5000 || rect.top > view.innerHeight + 5000)) return true;
+				if (node.parentElement) { node = node.parentElement; continue; }
+				const root = node.getRootNode ? node.getRootNode() : null;
+				if (root && root.host) { node = root.host; continue; }
+				const frameElement = view ? view.frameElement : null;
+				if (frameElement) {
+					const frameStyle = getComputedStyle(frameElement);
+					if (frameStyle.display === 'none' || frameStyle.visibility === 'hidden' || frameStyle.visibility === 'collapse' || frameElement.clientWidth <= 1 || frameElement.clientHeight <= 1) return true;
+					node = frameElement;
+					continue;
+				}
+				node = null;
+			}
+			return false;
+		};
 		const elements = windowed.map(el => {
 			const previous = el.getAttribute('data-browserkit-ref') || '';
 			const ref = previous.startsWith(state.refPrefix + '_') ? previous : state.refPrefix + '_' + (++state.nextRef);
 			el.setAttribute('data-browserkit-ref', ref);
 			state.refs.add(ref);
 			const type = (el.getAttribute('type') || '').toLowerCase();
+			const contentEditableRoot = el.isContentEditable && !(el.parentElement && el.parentElement.isContentEditable);
 			const inputRole = type === 'file' ? 'button' : type === 'checkbox' ? 'checkbox' : type === 'radio' ? 'radio' :
 				(type === 'button' || type === 'submit' || type === 'reset' || type === 'image') ? 'button' :
 				type === 'range' ? 'slider' : type === 'number' ? 'spinbutton' : type === 'search' ? 'searchbox' : 'textbox';
-			const role = el.getAttribute('role') || (el.tagName === 'IFRAME' ? 'frame' : el.tagName === 'A' ? 'link' : el.tagName === 'BUTTON' ? 'button' : el.tagName === 'INPUT' ? inputRole : el.tagName === 'SELECT' ? 'combobox' : el.tagName === 'TEXTAREA' ? 'textbox' : 'button');
+			const role = el.getAttribute('role') || (el.tagName === 'IFRAME' ? 'frame' : el.tagName === 'A' ? 'link' : el.tagName === 'BUTTON' ? 'button' : el.tagName === 'INPUT' ? inputRole : el.tagName === 'SELECT' ? 'combobox' : el.tagName === 'TEXTAREA' || contentEditableRoot ? 'textbox' : 'button');
 			const labelledBy = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map(id => el.getRootNode().getElementById?.(id)?.textContent || el.ownerDocument.getElementById(id)?.textContent || '').join(' ');
 			const nativeLabel = [...(el.labels || [])].map(label => label.innerText || label.textContent || '').join(' ');
-			const label = el.getAttribute('aria-label') || labelledBy || nativeLabel || el.getAttribute('placeholder') || el.getAttribute('title') || text(el) || el.getAttribute('name') || '';
-			const options = el.tagName === 'SELECT' ? [...el.options].slice(0, 100).map(option => ({value: option.value, label: clean(option.label).slice(0, 160), selected: option.selected})) : undefined;
-			const name = clean(label).slice(0, 160);
-			const publicType = type === 'password' ? 'password' : type;
-			const ownerFrame = el.ownerDocument === document ? null : el.ownerDocument.defaultView?.frameElement;
-			const frameURL = ownerFrame ? (el.ownerDocument.location.href || ownerFrame.src || '') : (el.tagName === 'IFRAME' ? el.src : '');
-			return {ref, role, name, type: publicType, frame_url: frameURL || undefined,
-				locator: {selector: cssFor(el), xpath: xpathFor(el, true), absolute_xpath: xpathFor(el, false), role, name, type: publicType, frame_url: frameURL || undefined},
-				options, options_truncated: el.tagName === 'SELECT' && el.options.length > 100};
+			const buttonValue = el.tagName === 'INPUT' && ['button', 'submit', 'reset'].includes(type) ? el.value : '';
+			const label = el.getAttribute('aria-label') || labelledBy || nativeLabel || el.getAttribute('placeholder') || el.getAttribute('title') || text(el) || buttonValue || el.getAttribute('name') || el.id || '';
+			const optionsFor = el => [...el.options].slice(0, 100).map(option => ({value: option.value, label: clean(option.label).slice(0, 160), selected: option.selected}));
+			const checkable = el.tagName === 'INPUT' && (type === 'checkbox' || type === 'radio');
+			const ariaChecked = el.getAttribute('aria-checked');
+			const checked = checkable ? el.checked : ariaChecked === 'true' ? true : ariaChecked === 'false' || ariaChecked === 'mixed' ? false : undefined;
+			const readonly = (el.tagName === 'TEXTAREA' || el.isContentEditable || (el.tagName === 'INPUT' && !['checkbox', 'radio', 'file', 'button', 'submit', 'reset', 'image', 'range', 'color'].includes(type))) && (el.readOnly === true || el.getAttribute('aria-readonly') === 'true');
+			const pressedAttr = el.getAttribute('aria-pressed');
+			const pressed = pressedAttr === 'true' ? true : pressedAttr === 'false' ? false : undefined;
+			const pressedMixed = pressedAttr === 'mixed';
+			const expanded = el.hasAttribute('aria-expanded') ? el.getAttribute('aria-expanded') === 'true' : undefined;
+			const placeholder = el.getAttribute('placeholder') || '';
+			const multiline = el.tagName === 'TEXTAREA' || (contentEditableRoot && el.getAttribute('aria-multiline') !== 'false') || el.getAttribute('aria-multiline') === 'true';
+			const valueCapable = contentEditableRoot || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || (el.tagName === 'INPUT' && !['password', 'hidden', 'file', 'button', 'submit', 'reset', 'image', 'checkbox', 'radio'].includes(type));
+			const autocomplete = ((el.getAttribute('autocomplete') || '') + ' ' + (el.form?.getAttribute('autocomplete') || '')).toLowerCase().split(/\s+/);
+			const maskedToken = item => item === 'current-password' || item === 'new-password' || item === 'one-time-code' || item === 'username' || item.startsWith('cc-');
+			const valueStyle = getComputedStyle(el);
+			const masked = (valueStyle.getPropertyValue('-webkit-text-security') || 'none') !== 'none' || autocomplete.some(maskedToken);
+			const valueRect = el.getBoundingClientRect();
+			const valueHidden = masked || valueRect.width <= 1 || valueRect.height <= 1 || effectivelyHidden(el);
+			const options = el.tagName === 'SELECT' && !valueHidden ? optionsFor(el) : undefined;
+			let value, valueTruncated;
+			if (valueCapable && !valueHidden) {
+				const raw = contentEditableRoot ? (el.innerText || '') : (typeof el.value === 'string' ? el.value : '');
+				const cleaned = cleanValue(raw);
+				if (valueBudget > 0) {
+					if (cleaned !== '') {
+						const take = Math.min(120, valueBudget);
+						const cut = truncate(cleaned, take);
+						value = cut.text.length > 0 ? cut.text : undefined;
+						valueTruncated = cut.truncated || undefined;
+						const used = Array.from(cleaned.slice(0, Math.min(cleaned.length, take * 2))).length;
+						valueBudget -= Math.min(used, take);
+					}
+				} else if (cleaned !== '') {
+					valueTruncated = true;
+				}
+			}
+			return {locator: {selector: cssFor(el), xpath: xpathFor(el, true), absolute_xpath: xpathFor(el, false), role, name: clean(label).slice(0, 160), type, frame_url: el.ownerDocument === document ? undefined : el.ownerDocument.location.href}, ref, role, checked, indeterminate: checkable ? el.indeterminate : ariaChecked === 'mixed', disabled: disabled(el), readonly, contenteditable: contentEditableRoot, multiline, pressed, pressed_mixed: pressedMixed, expanded, draggable: el.draggable === true, name: clean(label).slice(0, 160), id: el.id ? el.id.replace(/[\u0000-\u001f]/g, ' ').slice(0, 160) : undefined, placeholder: placeholder ? clean(placeholder).slice(0, 160) : undefined, value, value_truncated: valueTruncated, type: type === 'password' ? 'password' : type, frame_url: el.tagName === 'IFRAME' ? el.src : undefined, options, options_truncated: el.tagName === 'SELECT' && !valueHidden && el.options.length > 100};
 		});
 		state.refs = new Set(roots.flatMap(root => [...root.querySelectorAll('[data-browserkit-ref]')].map(el => el.getAttribute('data-browserkit-ref')).filter(ref => ref?.startsWith(state.refPrefix + '_'))));
 		let active = document.activeElement;
@@ -351,8 +739,75 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 		}
 		const activeRef = active?.getAttribute?.('data-browserkit-ref') || '';
 		const activeValue = active && ('value' in active) ? String(active.value ?? '') : (active?.isContentEditable ? String(active.textContent || '') : '');
-		const bodyText = clean(roots.map(root => root.body?.innerText || [...(root.children || [])].map(el => el.innerText || '').join(' ')).join(' '));
-		return {url: location.href, title: document.title, text: bodyText.slice(0, Math.max(0, options.max_chars || 12000)), elements, refs: [...state.refs], active_element_ref: activeRef, active_element_value: activeValue};
+		const visibleForText = el => {
+			try {
+				return !el.checkVisibility || el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
+			} catch { return true; }
+		};
+		const visibleText = (node, limit) => {
+			const out = [];
+			let size = 0;
+			let stopped = false;
+			let crossFrame = false;
+			// 只收集到正文预算即可；长页面不需要为截断后的文本继续扫描整棵 DOM。
+			const push = value => {
+				if (stopped || value === '') return;
+				const gap = out.length > 0 ? 1 : 0;
+				const remain = limit - size - gap;
+				if (remain <= 0) { stopped = true; return; }
+				if (value.length > remain) {
+					out.push(value.slice(0, remain));
+					size = limit;
+					stopped = true;
+					return;
+				}
+				out.push(value);
+				size += value.length + gap;
+			};
+			const walk = (parent, parentStyle) => {
+				if (stopped) return;
+				const textHidden = parentStyle.visibility === 'hidden' || parentStyle.visibility === 'collapse' || parseFloat(parentStyle.fontSize) === 0 || parentStyle.webkitTextFillColor === 'transparent' || parentStyle.webkitTextFillColor === 'rgba(0, 0, 0, 0)';
+				for (const child of parent.childNodes) {
+					if (stopped) return;
+					if (child.nodeType === 3) {
+						if (!textHidden && visibleForText(parent)) push(child.textContent || '');
+						continue;
+					}
+					if (child.nodeType !== 1) continue;
+					if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'].includes(child.tagName)) continue;
+					const style = getComputedStyle(child);
+					// display:none 和近透明子树不可能渲染出可见文本；visibility 和
+					// font-size 可被子元素覆盖，因此逐元素判断而不整棵剪枝。
+					if (style.display === 'none' || Number(style.opacity) < 0.05) continue;
+					if (child.tagName === 'TEXTAREA' || child.tagName === 'SELECT') continue;
+					if ((style.getPropertyValue('-webkit-text-security') || 'none') !== 'none') continue;
+					if (child.tagName === 'IFRAME') {
+						if (style.visibility === 'hidden' || style.visibility === 'collapse' || hiddenHost(child)) continue;
+						try {
+							if (child.contentDocument) {
+								const body = child.contentDocument.body || child.contentDocument;
+								walk(body, getComputedStyle(body));
+							} else {
+								// 跨域 iframe 的 contentDocument 为 null，交给 CDP 只读聚合。
+								crossFrame = true;
+							}
+						} catch { crossFrame = true; }
+						continue;
+					}
+					if (child.shadowRoot) walk(child.shadowRoot, style);
+					walk(child, style);
+				}
+			};
+			const rootStyle = getComputedStyle(node);
+			if (rootStyle.display === 'none' || Number(rootStyle.opacity) < 0.05) return {text: '', stopped: false, crossFrame: false};
+			walk(node, rootStyle);
+			return {text: out.join(' '), stopped, crossFrame};
+		};
+		const maxChars = Math.max(0, options.max_chars || 12000);
+		// 多收一点给 clean 的空白折叠留余量，避免刚好卡在预算边界时误判截断。
+		const collected = visibleText(document.body || document.documentElement, maxChars + 64);
+		const bodyText = clean(collected.text);
+		return {url: location.href, title: document.title, text: bodyText.slice(0, maxChars), elements, refs: [...state.refs], has_more: candidates.length > offset + elements.length, text_truncated: bodyText.length > maxChars || collected.stopped, cross_frame: collected.crossFrame, active_element_ref: activeRef, active_element_value: activeValue};
 	}`, args)
 	if err != nil {
 		return Snapshot{}, err
@@ -364,7 +819,42 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 	if raw.URL == "" {
 		raw.URL = "about:blank"
 	}
-	truncated := len(raw.Text) >= options.MaxChars
+	// 跨域子 frame 的内容无法从主文档读取；用 CDP isolated world 只读聚合正文，
+	// 让模型至少能看到嵌入式表单、合同或说明文本。
+	if raw.CrossFrame || page.hasOOPIFs() {
+		// frame tree 只读取一次，正文与元素共用同一份快照。
+		frames, frameErr := page.frameBindings(operationCtx)
+		if frameErr == nil && len(frames) > 0 {
+			if !raw.TextTruncated && options.MaxChars > len(raw.Text) {
+				if extra, cut := page.crossFrameText(operationCtx, frames, options.MaxChars-len(raw.Text)); extra != "" {
+					raw.Text += extra
+					raw.TextTruncated = cut
+				}
+			}
+			// 分页快照不会重新采集跨域元素，但已有 frame ref 仍然有效，
+			// 需要保留在 ActiveRefs 中，避免被下一次快照误删。
+			if options.Offset > 0 {
+				page.stateMu.Lock()
+				for ref := range page.refs {
+					if isFrameRef(ref) {
+						raw.Refs = append(raw.Refs, ref)
+					}
+				}
+				page.stateMu.Unlock()
+			}
+			// 跨域 frame 内的可交互元素使用独立 ref 前缀；只在第一页追加，
+			// 保持主文档的分页语义不被跨域元素打乱。
+			if options.Offset == 0 && len(raw.Elements) < options.MaxElements {
+				if extra, ok := page.captureCrossFrameElements(operationCtx, frames, options.MaxElements-len(raw.Elements)); ok {
+					for _, element := range extra {
+						raw.Refs = append(raw.Refs, element.Ref)
+					}
+					raw.Elements = append(raw.Elements, extra...)
+				}
+			}
+		}
+	}
+	truncated := raw.TextTruncated
 	activeRefs := make(map[string]struct{}, len(raw.Refs))
 	for _, ref := range raw.Refs {
 		activeRefs[ref] = struct{}{}
@@ -372,7 +862,7 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 	page.stateMu.Lock()
 	if page.revision != revision {
 		page.stateMu.Unlock()
-		return Snapshot{Info: PageInfo{URL: raw.URL, Title: raw.Title}, Revision: revision, Text: raw.Text, Elements: raw.Elements, Truncated: truncated || len(raw.Elements) == options.MaxElements, ActiveElementRef: raw.ActiveElementRef, ActiveElementValue: raw.ActiveElementValue, ActiveRefs: raw.Refs}, nil
+		return Snapshot{Info: PageInfo{URL: raw.URL, Title: raw.Title}, Revision: revision, Text: raw.Text, Elements: raw.Elements, Truncated: truncated || raw.HasMore, HasMore: raw.HasMore, TextTruncated: truncated, PaginationKnown: true, ActiveElementRef: raw.ActiveElementRef, ActiveElementValue: raw.ActiveElementValue, ActiveRefs: raw.Refs}, nil
 	}
 	for ref := range page.refs {
 		if _, ok := activeRefs[ref]; !ok {
@@ -384,7 +874,57 @@ func (page *rodPage) Snapshot(ctx context.Context, options SnapshotOptions) (Sna
 	}
 	revision = page.revision
 	page.stateMu.Unlock()
-	return Snapshot{Info: PageInfo{URL: raw.URL, Title: raw.Title}, Revision: revision, Text: raw.Text, Elements: raw.Elements, Truncated: truncated || len(raw.Elements) == options.MaxElements, ActiveElementRef: raw.ActiveElementRef, ActiveElementValue: raw.ActiveElementValue, ActiveRefs: raw.Refs}, nil
+	return Snapshot{Info: PageInfo{URL: raw.URL, Title: raw.Title}, Revision: revision, Text: raw.Text, Elements: raw.Elements, Truncated: truncated || raw.HasMore, HasMore: raw.HasMore, TextTruncated: truncated, PaginationKnown: true, ActiveElementRef: raw.ActiveElementRef, ActiveElementValue: raw.ActiveElementValue, ActiveRefs: raw.Refs}, nil
+}
+
+// crossFrameText 通过 isolated world 读取跨域子 frame 的渲染文本。
+// 只读，不注入脚本到页面主 world；每个 frame 独立创建世界，导航后自动失效。
+func (page *rodPage) crossFrameText(ctx context.Context, frames []frameBinding, limit int) (string, bool) {
+	if limit <= 0 || len(frames) == 0 {
+		return "", false
+	}
+	var builder strings.Builder
+	for _, frame := range frames {
+		expression := `(() => { const body = document.body; return {url: location.url || location.href, text: body ? (body.innerText || '').slice(0, 16000) : ''}; })()`
+		raw, ok := page.frameEvaluate(ctx, frame, expression)
+		if !ok {
+			continue
+		}
+		var payload struct {
+			URL  string `json:"url"`
+			Text string `json:"text"`
+		}
+		if unmarshalErr := json.Unmarshal(raw, &payload); unmarshalErr != nil {
+			continue
+		}
+		if payload.URL == "" {
+			payload.URL = frame.URL
+		}
+		text := strings.Join(strings.Fields(payload.Text), " ")
+		if text == "" {
+			continue
+		}
+		label := "\n[frame " + payload.URL + "]\n"
+		remaining := limit - builder.Len()
+		if remaining <= len(label) {
+			return builder.String(), true
+		}
+		room := remaining - len(label)
+		if len(text) > room {
+			// 按字节截断可能切开 UTF-8；回退到最近的有效边界。
+			cut := room
+			for cut > 0 && !utf8.RuneStart(text[cut]) {
+				cut--
+			}
+			text = text[:cut]
+			builder.WriteString(label)
+			builder.WriteString(text)
+			return builder.String(), true
+		}
+		builder.WriteString(label)
+		builder.WriteString(text)
+	}
+	return builder.String(), false
 }
 
 // InspectPoint 为任意可见元素建立与 Snapshot 相同命名空间的 ref。
@@ -440,6 +980,9 @@ func (page *rodPage) InspectPoint(ctx context.Context, x, y float64) (InspectedE
 // elementLocked 只在持有 page.interactionMu 时调用。返回的 Element 仍会使用传入的
 // operationCtx，因此不能在这里创建并取消一个临时 context。
 func (page *rodPage) elementLocked(ctx context.Context, ref ElementRef) (*rod.Element, error) {
+	if isFrameRef(ref.Ref) {
+		return nil, newError("frame_unavailable", "跨域 frame 已失效或当前不可见", "重新调用 browserSnapshot 获取当前 frame ref", true)
+	}
 	if err := page.syncState(ctx); err != nil {
 		return nil, err
 	}
@@ -475,7 +1018,10 @@ func (page *rodPage) elementLocked(ctx context.Context, ref ElementRef) (*rod.El
 	return el, nil
 }
 
-func (page *rodPage) Click(ctx context.Context, ref ElementRef) error {
+func (page *rodPage) Click(ctx context.Context, ref ElementRef, options ClickOptions) error {
+	if _, _, err := clickParameters(options); err != nil {
+		return err
+	}
 	operationCtx, operationCancel, err := page.ctx(ctx)
 	if err != nil {
 		return err
@@ -485,21 +1031,21 @@ func (page *rodPage) Click(ctx context.Context, ref ElementRef) error {
 		return err
 	}
 	defer page.interactionMu.Unlock()
+	if binding, ok := page.frameBindingForRef(operationCtx, ref.Ref); ok {
+		if err := page.validateFrameRef(operationCtx, ref); err != nil {
+			return err
+		}
+		return page.runUntilDialog(operationCtx, func(actionCtx context.Context) error {
+			return page.clickFrameElement(actionCtx, binding, ref.Ref, options)
+		})
+	}
 	el, err := page.elementLocked(operationCtx, ref)
 	if err != nil {
 		return err
 	}
-	if err := scrollElementNaturally(operationCtx, el); err != nil {
-		return err
-	}
-	target, err := page.elementPoint(operationCtx, el)
-	if err != nil {
-		return err
-	}
-	if err := page.movePointer(page.page.Context(operationCtx), target.X, target.Y); err != nil {
-		return err
-	}
-	return dispatchAtomicClick(page.page.Context(operationCtx), target.X, target.Y)
+	return page.runUntilDialog(operationCtx, func(actionCtx context.Context) error {
+		return page.clickElementLocked(actionCtx, el, options)
+	})
 }
 
 // Hover 将真实指针移动到快照元素的可交互坐标。移动轨迹由 movePointer
@@ -514,6 +1060,16 @@ func (page *rodPage) Hover(ctx context.Context, ref ElementRef) error {
 		return err
 	}
 	defer page.interactionMu.Unlock()
+	if binding, ok := page.frameBindingForRef(operationCtx, ref.Ref); ok {
+		if err := page.validateFrameRef(operationCtx, ref); err != nil {
+			return err
+		}
+		x, y, pointErr := page.frameElementPoint(operationCtx, binding, ref.Ref)
+		if pointErr != nil {
+			return pointErr
+		}
+		return page.movePointer(page.page.Context(operationCtx), x, y)
+	}
 	el, err := page.elementLocked(operationCtx, ref)
 	if err != nil {
 		return err
@@ -557,7 +1113,7 @@ func (page *rodPage) elementPoint(ctx context.Context, element *rod.Element) (el
 				style.display !== 'none' && style.visibility !== 'hidden' &&
 				style.opacity !== '0' && style.pointerEvents !== 'none' &&
 				rect.width > 0 && rect.height > 0,
-			enabled: !this.disabled && this.getAttribute('aria-disabled') !== 'true',
+			enabled: !this.matches(':disabled') && this.getAttribute('aria-disabled') !== 'true',
 			covered: !hit || !(hit === this || this.contains(hit)),
 		};
 	}`).ByUser())
@@ -684,20 +1240,6 @@ func (page *rodPage) movePointer(client proto.Client, x, y float64) error {
 	return nil
 }
 
-func dispatchAtomicClick(client proto.Client, x, y float64) error {
-	pressed, released := 1, 0
-	move := proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMouseMoved, X: x, Y: y, Button: proto.InputMouseButtonNone, Buttons: &released, PointerType: proto.InputDispatchMouseEventPointerTypeMouse}
-	if err := move.Call(client); err != nil {
-		return err
-	}
-	down := proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMousePressed, X: x, Y: y, Button: proto.InputMouseButtonLeft, Buttons: &pressed, ClickCount: 1, PointerType: proto.InputDispatchMouseEventPointerTypeMouse}
-	if err := down.Call(client); err != nil {
-		return err
-	}
-	up := proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMouseReleased, X: x, Y: y, Button: proto.InputMouseButtonLeft, Buttons: &released, ClickCount: 1, PointerType: proto.InputDispatchMouseEventPointerTypeMouse}
-	return up.Call(client)
-}
-
 func (page *rodPage) Type(ctx context.Context, ref ElementRef, text string, clear bool) error {
 	operationCtx, operationCancel, err := page.ctx(ctx)
 	if err != nil {
@@ -708,9 +1250,61 @@ func (page *rodPage) Type(ctx context.Context, ref ElementRef, text string, clea
 		return err
 	}
 	defer page.interactionMu.Unlock()
+	if binding, ok := page.frameBindingForRef(operationCtx, ref.Ref); ok {
+		if err := page.validateFrameRef(operationCtx, ref); err != nil {
+			return err
+		}
+		return page.typeFrameElement(operationCtx, binding, ref, text, clear)
+	}
 	el, err := page.elementLocked(operationCtx, ref)
 	if err != nil {
 		return err
+	}
+	// 先拒绝只读、禁用和非输入控件，避免滚动、移动指针和
+	// Input.insertText 之后页面值没有变化却被报告为成功。
+	state, err := el.Evaluate(rod.Eval(`function() {
+		const tag = this.tagName;
+		const type = (this.type || '').toLowerCase();
+		const textInput = tag === 'INPUT' && ['text', 'search', 'tel', 'url', 'email', 'password', 'number'].includes(type);
+		const valueInput = tag === 'INPUT' && ['date', 'month', 'week', 'time', 'datetime-local', 'color', 'range', 'number'].includes(type);
+		const editable = this.isContentEditable || tag === 'TEXTAREA' || textInput || valueInput;
+		const readonlyCapable = this.isContentEditable || tag === 'TEXTAREA' || textInput || (valueInput && type !== 'range' && type !== 'color');
+		const readonly = readonlyCapable && (this.readOnly === true || this.getAttribute('aria-readonly') === 'true');
+		const disabled = this.matches(':disabled') || this.getAttribute('aria-disabled') === 'true';
+		if (disabled || readonly || !editable) return {error: disabled ? 'element_disabled' : readonly ? 'element_readonly' : 'element_not_editable', tag: tag, inputType: type};
+		return {type: type};
+	}`).ByUser())
+	if err != nil {
+		return err
+	}
+	var editState struct {
+		Error     string `json:"error"`
+		Type      string `json:"type"`
+		Tag       string `json:"tag"`
+		InputType string `json:"inputType"`
+	}
+	if err := state.Value.Unmarshal(&editState); err != nil {
+		return err
+	}
+	if editState.Error != "" {
+		next := "重新调用 browserSnapshot 选择可编辑的输入框或内容编辑区域"
+		switch {
+		case editState.Tag == "SELECT":
+			next = "使用 browserSelectOption 选择选项（仅支持单选原生下拉）"
+		case editState.Tag == "INPUT" && (editState.InputType == "checkbox" || editState.InputType == "radio"):
+			next = "使用 browserSetChecked 设置勾选状态"
+		case editState.Tag == "INPUT" && editState.InputType == "file":
+			next = "文件输入请使用 browserUploadFile（需要配置 upload_dir）"
+		case editState.Tag == "BUTTON" || editState.Tag == "A" || (editState.Tag == "INPUT" && (editState.InputType == "button" || editState.InputType == "submit" || editState.InputType == "reset" || editState.InputType == "image")):
+			next = "该元素不是输入框，使用 browserClick 操作"
+		}
+		return newError(editState.Error, "元素不可编辑", next, true)
+	}
+	if isValueInputType(editState.Type) {
+		if err := validateValueInput(editState.Type, text); err != nil {
+			return err
+		}
+		return setValueInput(operationCtx, el, editState.Type, text, editState.Type == "number" && !clear)
 	}
 	if err := scrollElementNaturally(operationCtx, el); err != nil {
 		return err
@@ -749,6 +1343,185 @@ func (page *rodPage) Type(ctx context.Context, ref ElementRef, text string, clea
 	return nil
 }
 
+func isValueInputType(kind string) bool {
+	switch kind {
+	case "date", "month", "week", "time", "datetime-local", "color", "range", "number":
+		return true
+	default:
+		return false
+	}
+}
+
+var rangeNumberPattern = regexp.MustCompile(`^-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`)
+
+func validateValueInput(kind, text string) error {
+	if text == "" {
+		// range 和 color 没有“空值”语义：浏览器会把空串变成中点值或黑色。
+		if kind == "range" || kind == "color" {
+			return newError("invalid_value", kind+" 需要有效取值", "填写该控件允许的取值", true)
+		}
+		return nil
+	}
+	valid := false
+	hint := ""
+	switch kind {
+	case "date":
+		parsed, err := time.Parse("2006-01-02", text)
+		valid = err == nil && parsed.Year() > 0
+		hint = "使用 YYYY-MM-DD"
+	case "month":
+		parsed, err := time.Parse("2006-01", text)
+		valid = err == nil && parsed.Year() > 0
+		hint = "使用 YYYY-MM"
+	case "week":
+		valid = len(text) == 8 && text[4] == '-' && text[5] == 'W'
+		if valid {
+			year, yearErr := strconv.Atoi(text[:4])
+			week, weekErr := strconv.Atoi(text[6:])
+			valid = yearErr == nil && weekErr == nil && year > 0 && week >= 1 && week <= 53
+		}
+		hint = "使用 YYYY-Www，例如 2026-W42"
+	case "time":
+		_, err := time.Parse("15:04", text)
+		if err != nil {
+			_, err = time.Parse("15:04:05", text)
+		}
+		if err != nil {
+			_, err = time.Parse("15:04:05.999", text)
+		}
+		valid = err == nil
+		hint = "使用 HH:MM、HH:MM:SS 或带小数的秒；秒需符合控件 step"
+	case "datetime-local":
+		parsed, err := time.Parse("2006-01-02T15:04", text)
+		if err != nil {
+			parsed, err = time.Parse("2006-01-02T15:04:05", text)
+		}
+		if err != nil {
+			parsed, err = time.Parse("2006-01-02T15:04:05.999", text)
+		}
+		valid = err == nil && parsed.Year() > 0
+		hint = "使用 YYYY-MM-DDTHH:MM[:SS[.sss]]；秒需符合控件 step"
+	case "color":
+		valid = len(text) == 7 && text[0] == '#'
+		if valid {
+			for _, char := range text[1:] {
+				if !strings.ContainsRune("0123456789abcdefABCDEF", char) {
+					valid = false
+					break
+				}
+			}
+		}
+		hint = "使用 #rrggbb"
+	case "range":
+		if !rangeNumberPattern.MatchString(text) {
+			valid, hint = false, "使用十进制数字，可带小数或指数"
+			break
+		}
+		value, err := strconv.ParseFloat(text, 64)
+		if err != nil || math.IsInf(value, 0) || math.IsNaN(value) {
+			valid, hint = false, "填写有限数字"
+			break
+		}
+		valid, hint = true, "填写有限数字"
+	case "number":
+		value, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+		valid = err == nil && !math.IsInf(value, 0) && !math.IsNaN(value)
+		hint = "填写有限数字"
+	}
+	if !valid {
+		return newError("invalid_value", kind+" 输入格式无效", hint, true)
+	}
+	return nil
+}
+
+func setValueInput(ctx context.Context, element *rod.Element, kind, text string, appendValue bool) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	result, err := element.Evaluate(rod.Eval(`function(input) {
+		const value = input.text;
+		this.focus({preventScroll: true});
+		const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), 'value');
+		const setValue = next => {
+			if (descriptor && descriptor.set) descriptor.set.call(this, next);
+			else this.value = next;
+		};
+		const oldValue = this.value;
+		const next = input.append ? oldValue + value : value;
+		const rangeRequested = this.type === 'range' && value !== '';
+		const canonicalDecimal = text => {
+			text = String(text).trim();
+			if (!text) return null;
+			let sign = '';
+			if (text[0] === '-') { sign = '-'; text = text.slice(1); }
+			else if (text[0] === '+') { text = text.slice(1); }
+			if (!text) return null;
+			let exponent = 0;
+			const e = text.search(/[eE]/);
+			if (e >= 0) {
+				const parsed = Number(text.slice(e + 1));
+				if (!Number.isInteger(parsed)) return null;
+				exponent = parsed;
+				text = text.slice(0, e);
+			}
+			let digits = text;
+			const dot = digits.indexOf('.');
+			if (dot >= 0) {
+				const fraction = digits.slice(dot + 1);
+				digits = digits.slice(0, dot) + fraction;
+				exponent -= fraction.length;
+			}
+			digits = digits.replace(/^0+/, '');
+			if (!digits) return '0';
+			while (digits.endsWith('0')) {
+				digits = digits.slice(0, -1);
+				exponent++;
+			}
+			return sign + digits + 'e' + exponent;
+		};
+		setValue(next);
+		const validity = this.validity || {};
+		let invalid = validity.badInput === true || validity.rangeUnderflow === true || validity.rangeOverflow === true || validity.stepMismatch === true;
+		// 浏览器会 sanitize 非法输入：可能是空串，也可能像 range 一样 clamp
+		// 或 round。用十进制规范形式比较请求值和实际值，既允许 5.0→5
+		// 这类等价归一化，也能抓住跨 step 或精度丢失的改写。
+		if (next !== '' && this.value === '') invalid = true;
+		if (rangeRequested && this.value !== '') {
+			const requested = canonicalDecimal(value);
+			if (!Number.isFinite(this.valueAsNumber)) invalid = true;
+			else {
+				const actual = canonicalDecimal(String(this.valueAsNumber));
+				if (requested === null || actual === null || requested !== actual) invalid = true;
+			}
+		}
+		if (invalid) {
+			setValue(oldValue);
+			return {value: oldValue, invalid: true};
+		}
+		if (this.value === oldValue) return {value: this.value, invalid: false};
+		this.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+		this.dispatchEvent(new Event('change', {bubbles: true}));
+		return {value: this.value, invalid: false};
+	}`, map[string]any{"text": text, "append": appendValue}).ByUser())
+	if err != nil {
+		return err
+	}
+	var state struct {
+		Value   string `json:"value"`
+		Invalid bool   `json:"invalid"`
+	}
+	if err := result.Value.Unmarshal(&state); err != nil {
+		return err
+	}
+	if state.Invalid {
+		return newError("invalid_value", kind+" 取值无效或超出控件范围", "检查取值格式以及 min、max 和 step 限制", true)
+	}
+	if state.Value == "" && text != "" {
+		return newError("invalid_value", kind+" 没有接受该值", "检查取值是否在该控件的合法范围内", true)
+	}
+	return nil
+}
+
 func (page *rodPage) SelectOption(ctx context.Context, ref ElementRef, value, label string) (string, error) {
 	operationCtx, operationCancel, err := page.ctx(ctx)
 	if err != nil {
@@ -759,6 +1532,12 @@ func (page *rodPage) SelectOption(ctx context.Context, ref ElementRef, value, la
 		return "", err
 	}
 	defer page.interactionMu.Unlock()
+	if binding, ok := page.frameBindingForRef(operationCtx, ref.Ref); ok {
+		if err := page.validateFrameRef(operationCtx, ref); err != nil {
+			return "", err
+		}
+		return page.selectFrameOption(operationCtx, binding, ref, value, label)
+	}
 	el, err := page.elementLocked(operationCtx, ref)
 	if err != nil {
 		return "", err
@@ -804,6 +1583,12 @@ func (page *rodPage) UploadFile(ctx context.Context, ref ElementRef, path string
 		return err
 	}
 	defer page.interactionMu.Unlock()
+	if binding, ok := page.frameBindingForRef(operationCtx, ref.Ref); ok {
+		if err := page.validateFrameRef(operationCtx, ref); err != nil {
+			return err
+		}
+		return page.uploadFrameFile(operationCtx, binding, ref.Ref, path)
+	}
 	el, err := page.elementLocked(operationCtx, ref)
 	if err != nil {
 		return err
@@ -818,33 +1603,38 @@ func (page *rodPage) UploadFile(ctx context.Context, ref ElementRef, path string
 	return el.SetFiles([]string{path})
 }
 
-func (page *rodPage) Press(ctx context.Context, key string) error {
-	if err := contextErr(ctx); err != nil {
-		return err
-	}
-	keys := map[string]input.Key{"Enter": input.Enter, "Tab": input.Tab, "Escape": input.Escape, "Backspace": input.Backspace, "ArrowUp": input.ArrowUp, "ArrowDown": input.ArrowDown, "ArrowLeft": input.ArrowLeft, "ArrowRight": input.ArrowRight, "Space": input.Space}
-	keyValue, ok := keys[key]
-	if !ok {
-		return newError("invalid_key", "不支持的按键", "使用 Enter、Tab、Escape、Backspace、方向键或 Space", true)
-	}
+// HasRef 判断一个 ref 属性选择器当前是否仍能在 document、open shadow root
+// 或同源 iframe 中命中元素。
+func (page *rodPage) HasRef(ctx context.Context, selector string) (bool, error) {
 	operationCtx, operationCancel, err := page.ctx(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer operationCancel()
-	if err := lockInteraction(operationCtx, &page.interactionMu); err != nil {
-		return err
+	if ref, ok := refFromSelector(selector); ok {
+		if binding, found := page.frameBindingForRef(operationCtx, ref); found {
+			return page.hasFrameRef(operationCtx, binding, ref)
+		}
 	}
-	defer page.interactionMu.Unlock()
-	err = page.syncState(operationCtx)
+	result, err := page.page.Context(operationCtx).Eval(`(selector) => {
+		if (document.querySelector(selector)) return true;
+		const roots = [];
+		const visit = root => {
+			roots.push(root);
+			for (const el of root.querySelectorAll('*')) {
+				if (el.shadowRoot) visit(el.shadowRoot);
+				if (el.tagName === 'IFRAME') {
+					try { if (el.contentDocument?.documentElement) visit(el.contentDocument); } catch {}
+				}
+			}
+		};
+		visit(document);
+		return roots.some(root => root.querySelector(selector));
+	}`, selector)
 	if err != nil {
-		return err
+		return false, err
 	}
-	client := page.page.Context(operationCtx)
-	if err := keyValue.Encode(proto.InputDispatchKeyEventTypeKeyDown, keyValue.Modifier()).Call(client); err != nil {
-		return err
-	}
-	return keyValue.Encode(proto.InputDispatchKeyEventTypeKeyUp, 0).Call(client)
+	return result.Value.Bool(), nil
 }
 
 func (page *rodPage) Wait(ctx context.Context, options WaitOptions) error {
@@ -869,9 +1659,32 @@ func (page *rodPage) Wait(ctx context.Context, options WaitOptions) error {
 	defer operationCancel()
 	deadline := time.NewTicker(25 * time.Millisecond)
 	defer deadline.Stop()
+	var frameWait *frameBinding
+	if options.Condition == "selector_visible" || options.Condition == "selector_hidden" {
+		if ref, ok := refFromSelector(options.Selector); ok {
+			if binding, found := page.frameBindingForRef(operationCtx, ref); found {
+				frameWait = &binding
+			}
+		}
+	}
 	for {
 		if err := contextErr(operationCtx); err != nil {
 			return err
+		}
+		if frameWait != nil {
+			visible := page.frameRefVisible(operationCtx, *frameWait, refFromSelectorValue(options.Selector))
+			if options.Condition == "selector_hidden" {
+				visible = !visible
+			}
+			if visible {
+				return nil
+			}
+			select {
+			case <-operationCtx.Done():
+				return contextErr(operationCtx)
+			case <-deadline.C:
+				continue
+			}
 		}
 		result, err := page.page.Context(operationCtx).Eval(`(condition, value) => {
 			const roots = [];
@@ -992,7 +1805,9 @@ func (page *rodPage) Close(ctx context.Context) error {
 
 func contextWithTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc, error) {
 	if err := contextErr(ctx); err != nil {
-		return nil, nil, err
+		// 返回可调用的空 cancel：CancelFunc 是函数类型，Yaegi 处理裸 nil
+		// 返回值时会在 reflect.New(nil) 处 panic；调用方仍需无条件执行 cancel。
+		return nil, func() {}, err
 	}
 	if timeout <= 0 {
 		timeout = defaultOperationTimeout

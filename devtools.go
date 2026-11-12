@@ -196,7 +196,7 @@ func readDevtoolsResponseBody(ctx context.Context, page interface {
 }, requestID proto.NetworkRequestID, timeout time.Duration) (string, bool, error) {
 	bodyCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	client := devtoolsBodyClient{Client: page, ctx: bodyCtx, sessionID: page.GetSessionID()}
+	client := cdpSessionClient{client: page, ctx: bodyCtx, sessionID: page.GetSessionID()}
 	body, err := (proto.NetworkGetResponseBody{RequestID: requestID}).Call(client)
 	if err != nil || body == nil {
 		return "", false, err
@@ -207,15 +207,6 @@ func readDevtoolsResponseBody(ctx context.Context, page interface {
 	value, truncated := limitBody(body.Body)
 	return value, truncated, nil
 }
-
-type devtoolsBodyClient struct {
-	proto.Client
-	ctx       context.Context
-	sessionID proto.TargetSessionID
-}
-
-func (client devtoolsBodyClient) GetContext() context.Context         { return client.ctx }
-func (client devtoolsBodyClient) GetSessionID() proto.TargetSessionID { return client.sessionID }
 
 func consoleLevel(value proto.RuntimeConsoleAPICalledType) string {
 	switch value {

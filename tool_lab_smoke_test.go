@@ -395,8 +395,8 @@ func TestRealBrowserFunctionToolLab(t *testing.T) {
 		"session_id": sessionID, "page_id": pageID,
 		"ref": oldTarget.Ref, "revision": snapshot.Revision,
 	}, new(ClickResponse))
-	if err == nil || !strings.Contains(err.Error(), "stale_reference") {
-		t.Fatalf("被移除元素的旧 ref 没有报 stale_reference: %v", err)
+	if err == nil || (!strings.Contains(err.Error(), "stale_reference") && !strings.Contains(err.Error(), "invalid_reference")) {
+		t.Fatalf("被移除元素的旧 ref 仍可使用: %v", err)
 	}
 
 	toolLabClick(lab, sessionID, pageID, snapshot, "link", "Open popup")
@@ -446,6 +446,50 @@ func TestRealBrowserFunctionToolLab(t *testing.T) {
 	if reused.SessionID != sessionID || reused.PageID != pageID || reused.Title != "Tool lab dashboard" {
 		t.Fatalf("browserOpen 复用已有 session 失败: %+v", reused)
 	}
+	// 新工具通过同一 JSON 调用入口验证，避免 SDK 和 CLI 工具发生契约分叉。
+	freshControls := toolLabCall[SnapshotResponse](lab, "browserSnapshot", map[string]any{"session_id": sessionID, "page_id": pageID})
+	express := toolLabElement(t, freshControls, "checkbox", "Express delivery")
+	checked := toolLabCall[SetCheckedResponse](lab, "browserSetChecked", map[string]any{
+		"session_id": sessionID, "page_id": pageID, "ref": express.Ref, "revision": freshControls.Revision, "checked": true,
+	})
+	if !checked.Checked || checked.Snapshot == nil {
+		t.Fatalf("browserSetChecked 未返回勾选状态: %+v", checked)
+	}
+	reference = toolLabElement(t, freshControls, "textbox", "Reference code")
+	batch := toolLabCall[ActResponse](lab, "browserAct", map[string]any{
+		"session_id": sessionID, "page_id": pageID, "revision": freshControls.Revision,
+		"steps": []map[string]any{{"op": "type", "ref": reference.Ref, "text": "Batch code"}, {"op": "wait", "condition": "text_contains", "ref_or_selector": "Reference: Batch code"}},
+	})
+	if batch.Completed != 2 || batch.FailedStep != 0 || batch.Snapshot == nil || !strings.Contains(batch.Snapshot.Text, "Reference: Batch code") {
+		t.Fatalf("browserAct 未完成批量输入与等待: %+v", batch)
+	}
+	toolLabCall[EvaluateResponse](lab, "browserEvaluate", map[string]any{
+		"session_id": sessionID, "page_id": pageID,
+		"code": `(() => { document.body.insertAdjacentHTML('afterbegin', '<section style="display:flex;gap:30px"><div draggable="true" role="button" aria-label="Drag source" style="width:100px;height:60px" ondragstart="event.dataTransfer.setData(\'text/plain\',\'lab\')">Source</div><div role="button" aria-label="Drop target" style="width:100px;height:60px" ondragover="event.preventDefault()" ondrop="event.preventDefault();this.textContent=\'Dropped\'">Drop</div><button onclick="alert(\'Tool lab dialog\')">Show dialog</button></section>'); return true })()`,
+	})
+	actions := toolLabCall[SnapshotResponse](lab, "browserSnapshot", map[string]any{"session_id": sessionID, "page_id": pageID})
+	dragged := toolLabCall[DragResponse](lab, "browserDrag", map[string]any{
+		"session_id": sessionID, "page_id": pageID, "revision": actions.Revision,
+		"source_ref": toolLabElement(t, actions, "button", "Drag source").Ref,
+		"target_ref": toolLabElement(t, actions, "button", "Drop target").Ref,
+	})
+	if dragged.Snapshot == nil || !strings.Contains(dragged.Snapshot.Text, "Dropped") {
+		t.Fatalf("browserDrag 未触发真实 drop: %+v", dragged)
+	}
+	alerted := toolLabCall[ClickResponse](lab, "browserClick", map[string]any{
+		"session_id": sessionID, "page_id": pageID, "revision": actions.Revision,
+		"ref": toolLabElement(t, actions, "button", "Show dialog").Ref,
+	})
+	if alerted.Snapshot == nil || len(alerted.Snapshot.Dialogs) != 1 {
+		t.Fatalf("点击未暴露待处理弹窗: %+v", alerted)
+	}
+	handled := toolLabCall[HandleDialogResponse](lab, "browserHandleDialog", map[string]any{
+		"session_id": sessionID, "page_id": pageID, "dialog_id": alerted.Snapshot.Dialogs[0].ID, "action": "accept",
+	})
+	if !handled.Dialog.Handled || !handled.Dialog.Accepted {
+		t.Fatalf("browserHandleDialog 未完成弹窗处理: %+v", handled)
+	}
+
 	closed := toolLabCall[CloseResponse](lab, "browserClose", map[string]any{"session_id": sessionID})
 	if !closed.Closed {
 		t.Fatalf("browserClose 没有关闭 session: %+v", closed)

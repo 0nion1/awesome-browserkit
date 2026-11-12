@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,32 @@ type fakeViewportSession struct {
 	closedTargets []string
 	activated     []string
 	tabs          []TabInfo
+}
+
+// fakeExternalSession 模拟外部浏览器：PageForTab 仍由 fakeViewportSession 提供，
+// ActiveTab 用来模拟 Chrome 中真正获得焦点的页面。
+type fakeExternalSession struct {
+	*fakeViewportSession
+	activeTarget string
+	activeErr    error
+}
+
+// fakeConnectionSession 模拟底层 CDP 连接断开。
+type fakeConnectionSession struct {
+	*fakeViewportSession
+	done   chan struct{}
+	closes chan struct{}
+}
+
+func (session *fakeConnectionSession) Done() <-chan struct{} { return session.done }
+
+func (session *fakeConnectionSession) Close() error {
+	session.closes <- struct{}{}
+	return session.fakeViewportSession.Close()
+}
+
+func (session *fakeExternalSession) ActiveTab(context.Context, []TabInfo) (string, error) {
+	return session.activeTarget, session.activeErr
 }
 
 type blockingCloseSession struct {
@@ -97,6 +124,24 @@ func (session *fakeSession) Close() error               { session.closed = true;
 func (session *fakeSession) Closed() bool               { return session.closed }
 
 type fakePage struct {
+	snapshotData     *Snapshot
+	snapshotCalls    int
+	clickCalls       int
+	clickPointCalled bool
+	clickPointX      float64
+	clickPointY      float64
+	clickErr         error
+	clickOptions     ClickOptions
+	pressOptions     PressOptions
+	checked          bool
+	dragSource       ElementRef
+	dragTarget       ElementRef
+	dragByCalled     bool
+	dragByDeltaX     float64
+	dragByDeltaY     float64
+	dragPointCalled  bool
+	dragPointX       float64
+	dragPointY       float64
 	info             PageInfo
 	closed           bool
 	navigated        string
@@ -105,7 +150,10 @@ type fakePage struct {
 	lastRef          ElementRef
 	waitCalled       bool
 	waitOptions      WaitOptions
+	waitBlock        <-chan struct{}
 	hoverCalled      bool
+	hoverBlock       <-chan struct{}
+	clickBlock       <-chan struct{}
 	injectedScripts  []string
 	evaluatedScripts []string
 	idleCalled       bool
@@ -113,12 +161,25 @@ type fakePage struct {
 	idleTimeout      time.Duration
 	waitErr          error
 	snapshotErr      error
+	downloadInfo     DownloadInfo
+	downloadErr      error
+	downloadCalled   bool
+	downloadDir      string
 	navigateResult   *PageInfo
 	inputMu          sync.Mutex
+	waitMu           sync.Mutex
 	inputBlock       <-chan struct{}
 	inputs           []InputEvent
 	screenshotData   []byte
 	viewport         Viewport
+	snapshotHook     func()
+	refExists        *bool
+	hasRefBlock      <-chan struct{}
+	hasRefCalls      int
+	historyDirection string
+	historyInfo      PageInfo
+	historyErr       error
+	historyNavigated bool
 }
 
 type fakeScreencastPage struct {
@@ -156,31 +217,152 @@ func (page *fakePage) Navigate(_ context.Context, address string) (PageInfo, err
 	return page.info, nil
 }
 func (page *fakePage) Snapshot(context.Context, SnapshotOptions) (Snapshot, error) {
+	page.snapshotCalls++
+	if page.snapshotHook != nil {
+		page.snapshotHook()
+	}
+	if page.snapshotData != nil {
+		return *page.snapshotData, page.snapshotErr
+	}
 	return Snapshot{Info: page.info, Revision: 1, Text: "hello", Elements: []Element{{Ref: "e1", Role: "button", Name: "Save", Locator: ElementLocator{Selector: "#save", XPath: `//*[@id="save"]`, Role: "button", Name: "Save"}}}}, page.snapshotErr
 }
-func (page *fakePage) Click(_ context.Context, ref ElementRef) error {
+func (page *fakePage) Click(ctx context.Context, ref ElementRef, options ClickOptions) error {
+	if page.clickBlock != nil {
+		select {
+		case <-page.clickBlock:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	page.clickOptions = options
 	page.lastRef = ref
+	page.clickCalls++
+	return page.clickErr
+}
+func (page *fakePage) ClickPoint(_ context.Context, x, y float64, options ClickOptions) error {
+	page.clickPointCalled = true
+	page.clickPointX, page.clickPointY = x, y
+	page.clickOptions = options
+	page.clickCalls++
+	return page.clickErr
+}
+
+func (page *fakePage) DragBy(_ context.Context, source ElementRef, dx, dy float64) error {
+	page.dragByCalled = true
+	page.dragSource = source
+	page.dragByDeltaX, page.dragByDeltaY = dx, dy
 	return nil
 }
-func (page *fakePage) Hover(_ context.Context, ref ElementRef) error {
+
+func (page *fakePage) DragPoint(_ context.Context, x, y, dx, dy float64) error {
+	page.dragPointCalled = true
+	page.dragPointX, page.dragPointY = x, y
+	page.dragByDeltaX, page.dragByDeltaY = dx, dy
+	return nil
+}
+
+func (page *fakePage) Hover(ctx context.Context, ref ElementRef) error {
 	page.lastRef = ref
 	page.hoverCalled = true
+	if page.hoverBlock != nil {
+		select {
+		case <-page.hoverBlock:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	return nil
 }
 func (page *fakePage) Type(_ context.Context, ref ElementRef, text string, clear bool) error {
 	page.lastRef, page.lastText, page.lastClear = ref, text, clear
 	return nil
 }
-func (page *fakePage) Press(context.Context, string) error { return nil }
-func (page *fakePage) Wait(_ context.Context, options WaitOptions) error {
+func (page *fakePage) Press(_ context.Context, options PressOptions) error {
+	page.pressOptions = options
+	return nil
+}
+func (page *fakePage) SetChecked(_ context.Context, ref ElementRef, checked bool) (bool, error) {
+	page.lastRef = ref
+	changed := page.checked != checked
+	page.checked = checked
+	return changed, nil
+}
+func (page *fakePage) Drag(_ context.Context, source, target ElementRef) error {
+	page.dragSource = source
+	page.dragTarget = target
+	return nil
+}
+func (page *fakePage) DragTo(_ context.Context, source ElementRef, selector string) error {
+	page.dragSource = source
+	page.dragTarget = ElementRef{Ref: selector}
+	return nil
+}
+func (page *fakePage) Wait(ctx context.Context, options WaitOptions) error {
+	page.waitMu.Lock()
+	defer page.waitMu.Unlock()
 	page.waitCalled = true
 	page.waitOptions = options
+	if page.waitBlock != nil {
+		select {
+		case <-page.waitBlock:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	return page.waitErr
 }
+
+func (page *fakePage) HasRef(ctx context.Context, _ string) (bool, error) {
+	page.hasRefCalls++
+	if page.hasRefBlock != nil {
+		select {
+		case <-page.hasRefBlock:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	if page.refExists != nil {
+		return *page.refExists, nil
+	}
+	return true, nil
+}
+
+func (page *fakePage) HistoryTarget(_ context.Context, direction string) (HistoryEntry, error) {
+	page.historyDirection = direction
+	if page.historyErr != nil {
+		return HistoryEntry{}, page.historyErr
+	}
+	address := page.historyInfo.URL
+	if address == "" {
+		address = page.info.URL
+	}
+	return HistoryEntry{ID: 1, URL: address}, nil
+}
+
+func (page *fakePage) NavigateHistory(_ context.Context, entry HistoryEntry) (PageInfo, error) {
+	page.historyNavigated = true
+	if page.historyErr != nil {
+		return PageInfo{}, page.historyErr
+	}
+	if entry.URL != "" {
+		page.info.URL = entry.URL
+		page.info.Title = page.historyInfo.Title
+	}
+	return page.info, nil
+}
 func (page *fakePage) WaitIdle(_ context.Context, timeout time.Duration) error {
+	page.waitMu.Lock()
+	defer page.waitMu.Unlock()
 	page.idleCalled = true
 	page.idleTimeout = timeout
 	return page.idleErr
+}
+func (page *fakePage) Download(_ context.Context, _ ElementRef, dir string) (DownloadInfo, error) {
+	page.waitMu.Lock()
+	defer page.waitMu.Unlock()
+	page.downloadCalled = true
+	page.downloadDir = dir
+	return page.downloadInfo, page.downloadErr
 }
 func (page *fakePage) Screenshot(context.Context, ScreenshotOptions) (Screenshot, error) {
 	data := page.screenshotData
@@ -410,13 +592,23 @@ func TestCloseActiveTabDoesNotWaitForLiveHubWhileHoldingTabLock(t *testing.T) {
 	}
 }
 
+func adjustedTiming(change func(*timing)) timing {
+	value := defaultTiming()
+	change(&value)
+	return value
+}
+
 func fakeManager(t *testing.T, config Config) (*Manager, *fakeSession) {
+	return fakeManagerWithTiming(t, config, defaultTiming())
+}
+
+func fakeManagerWithTiming(t *testing.T, config Config, timing timing) (*Manager, *fakeSession) {
 	t.Helper()
 	session := &fakeSession{}
 	config.Factory = func(_ context.Context, _ SessionConfig) (Session, error) {
 		return session, nil
 	}
-	manager, err := NewManager(config)
+	manager, err := newManager(config, timing)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -507,10 +699,10 @@ func TestManagerDispatchesValidatedLiveInputToActivePage(t *testing.T) {
 func TestManagerSetsTabViewportAfterBrowserAcceptsIt(t *testing.T) {
 	base := &fakeSession{page: &fakePage{info: PageInfo{URL: "about:blank", Title: "blank"}}}
 	session := &fakeViewportSession{fakeSession: base}
-	manager, err := NewManager(Config{
+	manager, err := newManager(Config{
 		AllowPrivateNetwork: true,
 		Factory:             func(context.Context, SessionConfig) (Session, error) { return session, nil },
-	})
+	}, adjustedTiming(func(value *timing) { value.tabReconcileTimeout = 20 * time.Millisecond }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -535,6 +727,13 @@ func TestManagerSetsTabViewportAfterBrowserAcceptsIt(t *testing.T) {
 	}
 	if len(session.viewportCalls) != 1 {
 		t.Fatalf("相同 viewport 被重复发送: %+v", session.viewportCalls)
+	}
+	// 页面可能被浏览器自身改成别的实际尺寸；记录值相同也要能强制重新下发。
+	if err := manager.SetViewport(context.Background(), ViewportRequest{SessionID: opened.SessionID, PageID: opened.PageID, Viewport: next, Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(session.viewportCalls) != 2 || session.viewportCalls[1] != next {
+		t.Fatalf("强制 viewport calls=%+v", session.viewportCalls)
 	}
 }
 
@@ -573,10 +772,10 @@ func TestStateReconcileDoesNotBlockViewportOrLiveSubscription(t *testing.T) {
 		listEntered:         make(chan struct{}),
 		releaseList:         make(chan struct{}),
 	}
-	manager, err := NewManager(Config{
+	manager, err := newManager(Config{
 		AllowPrivateNetwork: true,
 		Factory:             func(context.Context, SessionConfig) (Session, error) { return session, nil },
-	})
+	}, adjustedTiming(func(value *timing) { value.tabReconcileTimeout = 500 * time.Millisecond }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -697,10 +896,9 @@ func TestManagerLiveFramesFallBackToScreenshots(t *testing.T) {
 }
 
 func TestLiveScreencastRestartsWhenViewportChanges(t *testing.T) {
-	previousFirstFrameTimeout := liveFirstFrameTimeout
-	liveFirstFrameTimeout = 20 * time.Millisecond
-	t.Cleanup(func() { liveFirstFrameTimeout = previousFirstFrameTimeout })
-	manager, _ := fakeManager(t, Config{AllowPrivateNetwork: true})
+	manager, _ := fakeManagerWithTiming(t, Config{AllowPrivateNetwork: true}, adjustedTiming(func(value *timing) {
+		value.liveFirstFrame = 20 * time.Millisecond
+	}))
 	defer manager.Close(context.Background())
 	opened, err := manager.Open(context.Background(), OpenRequest{
 		URL: "https://example.com", Viewport: Viewport{Width: 800, Height: 600},
@@ -726,8 +924,8 @@ func TestLiveScreencastRestartsWhenViewportChanges(t *testing.T) {
 	}
 	select {
 	case frame := <-frames:
-		if string(frame.Data) != "png" {
-			t.Fatalf("无首帧时的兜底画面=%q", frame.Data)
+		if string(frame.Data) != "png" || frame.MIME != "image/png" {
+			t.Fatalf("无首帧时的兜底画面=%q, %q", frame.Data, frame.MIME)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("screencast 无首帧时没有发布有界截图")
@@ -755,6 +953,120 @@ func TestLiveScreencastRestartsWhenViewportChanges(t *testing.T) {
 	}
 }
 
+func TestLivePublishesImmediatelyAndThrottlesToFrameInterval(t *testing.T) {
+	manager, _ := fakeManager(t, Config{AllowPrivateNetwork: true, LiveQuality: LiveQualityLow})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := manager.sessions[opened.SessionID]
+	streamer := &fakeScreencastPage{fakePage: &fakePage{info: PageInfo{URL: opened.URL}}, starts: make(chan chan Screenshot, 1)}
+	current.mu.Lock()
+	current.tabs[opened.PageID].page = streamer
+	current.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	frames, err := manager.SubscribeLiveFrames(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stream chan Screenshot
+	select {
+	case stream = <-streamer.starts:
+	case <-time.After(time.Second):
+		t.Fatal("screencast 没有启动")
+	}
+	stream <- Screenshot{Data: []byte("first"), Format: "jpeg"}
+	select {
+	case frame := <-frames:
+		if string(frame.Data) != "first" {
+			t.Fatalf("首帧=%q", frame.Data)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("首帧没有立即发布")
+	}
+	stream <- Screenshot{Data: []byte("second"), Format: "jpeg"}
+	select {
+	case frame := <-frames:
+		t.Fatalf("不足帧间隔时提前发布=%q", frame.Data)
+	case <-time.After(20 * time.Millisecond):
+	}
+	select {
+	case frame := <-frames:
+		if string(frame.Data) != "second" {
+			t.Fatalf("节流后的最新帧=%q", frame.Data)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("最新帧没有在帧间隔后发布")
+	}
+}
+
+func TestLivePublishesImmediatelyDuringInputBurst(t *testing.T) {
+	manager, _ := fakeManager(t, Config{AllowPrivateNetwork: true, LiveQuality: LiveQualityLow})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := manager.sessions[opened.SessionID]
+	streamer := &fakeScreencastPage{fakePage: &fakePage{info: PageInfo{URL: opened.URL}}, starts: make(chan chan Screenshot, 1)}
+	current.mu.Lock()
+	current.tabs[opened.PageID].page = streamer
+	current.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	frames, err := manager.SubscribeLiveFrames(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stream chan Screenshot
+	select {
+	case stream = <-streamer.starts:
+	case <-time.After(time.Second):
+		t.Fatal("screencast 没有启动")
+	}
+	stream <- Screenshot{Data: []byte("first"), Format: "jpeg"}
+	select {
+	case <-frames:
+	case <-time.After(time.Second):
+		t.Fatal("首帧没有发布")
+	}
+	if err := manager.DispatchLiveInput(ctx, opened.PageID, InputEvent{Kind: "mouse", Action: "move", X: 10, Y: 10}); err != nil {
+		t.Fatal(err)
+	}
+	stream <- Screenshot{Data: []byte("burst"), Format: "jpeg"}
+	select {
+	case frame := <-frames:
+		if string(frame.Data) != "burst" {
+			t.Fatalf("交互突发帧=%q", frame.Data)
+		}
+	case <-time.After(25 * time.Millisecond):
+		t.Fatal("输入后帧仍等待档位间隔")
+	}
+	time.Sleep(liveInteractiveWindow + 20*time.Millisecond)
+	stream <- Screenshot{Data: []byte("baseline"), Format: "jpeg"}
+	select {
+	case <-frames:
+	case <-time.After(time.Second):
+		t.Fatal("突发结束后的基准帧没有发布")
+	}
+	stream <- Screenshot{Data: []byte("throttled"), Format: "jpeg"}
+	select {
+	case frame := <-frames:
+		t.Fatalf("突发结束后提前发布=%q", frame.Data)
+	case <-time.After(15 * time.Millisecond):
+	}
+	select {
+	case frame := <-frames:
+		if string(frame.Data) != "throttled" {
+			t.Fatalf("节流帧=%q", frame.Data)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("突发结束后没有恢复档位发布")
+	}
+}
+
 func TestLiveScreencastAppliesDefaultSourceCompression(t *testing.T) {
 	manager, _ := fakeManager(t, Config{AllowPrivateNetwork: true})
 	defer manager.Close(context.Background())
@@ -778,7 +1090,7 @@ func TestLiveScreencastAppliesDefaultSourceCompression(t *testing.T) {
 	}
 	select {
 	case options := <-streamer.options:
-		if options.Quality != 75 || options.EveryNthFrame != 1 {
+		if options.Quality != 90 || options.EveryNthFrame != 2 {
 			t.Fatalf("默认 screencast options=%+v", options)
 		}
 	case <-time.After(time.Second):
@@ -1057,7 +1369,7 @@ func TestBrowserSnapshotDefaultsToReconciledActiveTab(t *testing.T) {
 	}
 	current := manager.sessions[opened.SessionID]
 	current.mu.Lock()
-	second := manager.registerPage(current, &fakePage{info: PageInfo{URL: "https://other.example"}}, defaultBrowserViewport, "")
+	second := manager.registerPage(current, &fakePage{info: PageInfo{URL: "https://other.example"}}, defaultTiming().viewport, "")
 	current.mu.Unlock()
 	snapshot, err := manager.Snapshot(ctx, SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
 	if err != nil || len(snapshot.Elements) == 0 {
@@ -1068,11 +1380,75 @@ func TestBrowserSnapshotDefaultsToReconciledActiveTab(t *testing.T) {
 	}
 }
 
+func TestPreferredTargetOrderKeepsRemainingTabs(t *testing.T) {
+	listed := []TabInfo{
+		{TargetID: "old-1"},
+		{TargetID: "new-2"},
+		{TargetID: "old-3"},
+		{TargetID: "new-4"},
+	}
+	ordered := preferredTargetOrder(listed, []string{"new-2", "new-4"})
+	ids := make([]string, 0, len(ordered))
+	for _, tab := range ordered {
+		ids = append(ids, tab.TargetID)
+	}
+	want := []string{"new-2", "new-4", "old-1", "old-3"}
+	if !slices.Equal(ids, want) {
+		t.Fatalf("target 顺序 = %v，期望 %v", ids, want)
+	}
+}
+
+func TestExternalBrowserAdoptsWebsiteOpenedActiveTab(t *testing.T) {
+	session := &fakeExternalSession{
+		fakeViewportSession: &fakeViewportSession{fakeSession: &fakeSession{}},
+		activeTarget:        "target-2",
+	}
+	manager, err := newManager(Config{
+		AllowPrivateNetwork: true,
+		Session:             SessionConfig{RemoteAddress: "ws://127.0.0.1:9222"},
+		Factory: func(context.Context, SessionConfig) (Session, error) {
+			return session, nil
+		},
+	}, adjustedTiming(func(value *timing) { value.tabReconcileTimeout = 300 * time.Millisecond }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	first, err := manager.ListTabs(ctx, TabsRequest{SessionID: opened.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 网站自己新开 Tab 后，Chrome 已切到新页；外部浏览器不应被 Manager
+	// 反向 ActivateTab 抢焦点，但本地 active 投影必须跟随真实焦点。
+	session.tabs = []TabInfo{
+		{TargetID: "target-1", URL: "https://example.com", Title: "example", Type: "page"},
+		{TargetID: "target-2", URL: "https://popup.example", Title: "popup", Type: "page"},
+	}
+	tabs, err := manager.ListTabs(ctx, TabsRequest{SessionID: opened.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ActivePageID == tabs.ActivePageID || len(tabs.Tabs) != 2 {
+		t.Fatalf("外部浏览器没有跟随新活动 Tab: first=%+v tabs=%+v", first, tabs)
+	}
+	if len(session.activated) != 0 {
+		t.Fatalf("外部浏览器不应被主动激活: %v", session.activated)
+	}
+	if len(session.viewportCalls) != 0 {
+		t.Fatalf("外部浏览器不应被改写视口: %v", session.viewportCalls)
+	}
+}
+
 func TestBrowserSnapshotReportsStableTabRevisionAndNewActiveTab(t *testing.T) {
 	session := &fakeViewportSession{fakeSession: &fakeSession{}}
-	manager, err := NewManager(Config{AllowPrivateNetwork: true, Factory: func(context.Context, SessionConfig) (Session, error) {
+	manager, err := newManager(Config{AllowPrivateNetwork: true, Factory: func(context.Context, SessionConfig) (Session, error) {
 		return session, nil
-	}})
+	}}, adjustedTiming(func(value *timing) { value.tabReconcileTimeout = 300 * time.Millisecond }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1129,6 +1505,423 @@ func TestBrowserSnapshotReportsStableTabRevisionAndNewActiveTab(t *testing.T) {
 	}
 }
 
+func TestBrowserSnapshotRefreshesTabProjectionFromPage(t *testing.T) {
+	session := &fakeViewportSession{fakeSession: &fakeSession{}}
+	session.tabs = []TabInfo{{TargetID: "target-1", URL: "https://example.com/old", Title: "old", Type: "page"}}
+	manager, err := newManager(Config{AllowPrivateNetwork: true, Factory: func(context.Context, SessionConfig) (Session, error) {
+		return session, nil
+	}}, defaultTiming())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com/old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.page.snapshotData = &Snapshot{
+		Info:     PageInfo{URL: "https://example.com/new", Title: "new"},
+		Revision: 2,
+		Text:     "new page",
+		Elements: []Element{{Ref: "e1", Role: "button", Name: "Next"}},
+	}
+	response, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.URL != "https://example.com/new" || response.Title != "new" {
+		t.Fatalf("快照没有返回页面新地址: %+v", response)
+	}
+	var tab *TabView
+	for index := range response.Tabs {
+		if response.Tabs[index].PageID == response.PageID {
+			tab = &response.Tabs[index]
+			break
+		}
+	}
+	if tab == nil {
+		t.Fatalf("快照结果缺少当前 Tab: %+v", response.Tabs)
+	}
+	if tab.URL != response.URL || tab.Title != response.Title {
+		t.Fatalf("Tab 投影没有跟随页面快照更新: tab=%+v response.url=%q response.title=%q", tab, response.URL, response.Title)
+	}
+}
+
+func TestBrowserSnapshotNextOffsetRequiresMoreElements(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.page.snapshotData = &Snapshot{
+		Info:     PageInfo{URL: "https://example.com", Title: "example"},
+		Revision: 3,
+		Elements: []Element{{Ref: "e1", Role: "button", Name: "One"}, {Ref: "e2", Role: "button", Name: "Two"}},
+	}
+	response, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID, Offset: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.NextOffset != 0 {
+		t.Fatalf("最后一页不应返回 next_offset: %+v", response)
+	}
+	session.page.snapshotData.HasMore = true
+	session.page.snapshotData.Truncated = true
+	response, err = manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID, Offset: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.NextOffset != 12 || !response.Truncated {
+		t.Fatalf("还有元素时应返回下一页偏移: %+v", response)
+	}
+	// 自定义 Page 未声明 PaginationKnown 时，满页按旧契约继续分页。
+	session.page.snapshotData.HasMore = false
+	session.page.snapshotData.Truncated = false
+	response, err = manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID, Offset: 0, MaxElements: 2})
+	if err != nil || response.NextOffset != 2 {
+		t.Fatalf("未知分页状态的自定义 Page 应保留满页推断: %+v %v", response, err)
+	}
+	// 新 Page 明确返回 has_more=false 时，恰好满页也应停止。
+	session.page.snapshotData.PaginationKnown = true
+	response, err = manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID, Offset: 0, MaxElements: 2})
+	if err != nil || response.NextOffset != 0 {
+		t.Fatalf("明确无下一页时不应返回 next_offset: %+v %v", response, err)
+	}
+}
+
+func TestBrowserSnapshotDoesNotOverwriteNewerTabProjection(t *testing.T) {
+	session := &fakeViewportSession{fakeSession: &fakeSession{}}
+	manager, err := newManager(Config{AllowPrivateNetwork: true, Factory: func(context.Context, SessionConfig) (Session, error) {
+		return session, nil
+	}}, defaultTiming())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := manager.sessions[opened.SessionID]
+	current.mu.Lock()
+	currentPage := current.tabs[current.activeTab]
+	currentPage.info = PageInfo{URL: "https://example.com/new", Title: "new"}
+	current.mu.Unlock()
+	session.page.info = PageInfo{URL: "https://example.com/new", Title: "new"}
+	// Open 现在会附带一次快照并注册 refs；这里只关心后续旧快照，
+	// 先清空已有 refs 再模拟读取期间发生导航。
+	current.mu.Lock()
+	currentPage.refs = map[string]struct{}{}
+	current.mu.Unlock()
+	// 模拟快照读取期间发生导航：generation 递增后，旧快照不能覆盖投影。
+	session.page.snapshotHook = func() {
+		current.mu.Lock()
+		currentPage.generation++
+		current.mu.Unlock()
+	}
+	session.page.snapshotData = &Snapshot{
+		Info:     PageInfo{URL: "https://example.com/old", Title: "old"},
+		Revision: 1,
+		Text:     "old",
+		Elements: []Element{{Ref: "e1", Role: "button", Name: "Next"}},
+	}
+	response, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tab *TabView
+	for index := range response.Tabs {
+		if response.Tabs[index].PageID == response.PageID {
+			tab = &response.Tabs[index]
+			break
+		}
+	}
+	if tab == nil || tab.URL != "https://example.com/new" || tab.Title != "new" {
+		t.Fatalf("旧快照覆盖了较新的 Tab 投影: %+v", response.Tabs)
+	}
+	current.mu.Lock()
+	_, registered := currentPage.refs["e1"]
+	current.mu.Unlock()
+	if registered {
+		t.Fatal("旧快照不应把 ref 注册到新 generation 的页面")
+	}
+}
+
+func TestCompactInteractionSnapshotTruncatesTextAndStableTabs(t *testing.T) {
+	response := SnapshotResponse{
+		Text:        strings.Repeat("a", interactionTextLimit+10),
+		TabsChanged: false,
+		Tabs:        []TabView{{PageID: "page-1", URL: "https://example.com"}},
+	}
+	compactInteractionSnapshot(&response)
+	if !response.TextTruncated || len([]rune(response.Text)) != interactionTextLimit+1 {
+		t.Fatalf("动作快照正文没有截断: truncated=%v length=%d", response.TextTruncated, len([]rune(response.Text)))
+	}
+	if response.Tabs != nil {
+		t.Fatalf("Tab 未变化时不应重复返回: %+v", response.Tabs)
+	}
+	response.TabsChanged = true
+	response.Tabs = []TabView{{PageID: "page-1", URL: "https://example.com"}}
+	compactInteractionSnapshot(&response)
+	if len(response.Tabs) != 1 {
+		t.Fatalf("Tab 变化时应保留投影: %+v", response.Tabs)
+	}
+}
+
+func TestBrowserSnapshotKeepsFullTextWhileActionResultUsesPreview(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.page.snapshotData = &Snapshot{
+		Info:     PageInfo{URL: "https://example.com", Title: "example"},
+		Revision: 4,
+		Text:     strings.Repeat("x", interactionTextLimit+50),
+		Elements: []Element{{Ref: "e1", Role: "button", Name: "Save"}},
+	}
+	explicit, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicit.TextTruncated || len([]rune(explicit.Text)) != interactionTextLimit+50 {
+		t.Fatalf("显式 browserSnapshot 不应压缩正文: truncated=%v length=%d", explicit.TextTruncated, len([]rune(explicit.Text)))
+	}
+	action, err := manager.Click(context.Background(), ClickRequest{SessionID: opened.SessionID, PageID: opened.PageID, Ref: explicit.Elements[0].Ref, Revision: explicit.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action.Snapshot == nil || !action.Snapshot.TextTruncated || len([]rune(action.Snapshot.Text)) != interactionTextLimit+1 {
+		t.Fatalf("动作结果应使用正文预览: %+v", action.Snapshot)
+	}
+}
+
+func TestBrowserOpenRecoversAfterClosingLastTab(t *testing.T) {
+	session := &fakeViewportSession{fakeSession: &fakeSession{}}
+	manager, err := newManager(Config{AllowPrivateNetwork: true, Factory: func(context.Context, SessionConfig) (Session, error) {
+		return session, nil
+	}}, defaultTiming())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.CloseTab(context.Background(), TabRequest{SessionID: opened.SessionID, PageID: opened.PageID}); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := manager.Open(context.Background(), OpenRequest{SessionID: opened.SessionID, URL: "https://example.com/next"})
+	if err != nil {
+		t.Fatalf("关闭最后一个 Tab 后 browserOpen 应能恢复: %v", err)
+	}
+	if reopened.SessionID != opened.SessionID || reopened.PageID == "" || reopened.URL != "https://example.com/next" {
+		t.Fatalf("恢复结果=%+v", reopened)
+	}
+}
+
+func TestTabActionFunctionSupportsListNewAndReload(t *testing.T) {
+	manager, _ := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tabs := functionByName(t, manager, "browserTabs").Handler.(func(context.Context, TabActionRequest) (TabActionResponse, error))
+	listed, err := tabs(context.Background(), TabActionRequest{SessionID: opened.SessionID, Action: "list"})
+	if err != nil || len(listed.Tabs) != 1 || listed.Action != "list" {
+		t.Fatalf("list=%+v err=%v", listed, err)
+	}
+	created, err := tabs(context.Background(), TabActionRequest{SessionID: opened.SessionID, Action: "new", URL: "https://example.com/new"})
+	if err != nil || created.PageID == "" || created.Action != "new" || created.URL != "https://example.com/new" {
+		t.Fatalf("new=%+v err=%v", created, err)
+	}
+	reloaded, err := tabs(context.Background(), TabActionRequest{SessionID: opened.SessionID, Action: "reload", PageID: opened.PageID})
+	if err != nil || reloaded.Action != "reload" || reloaded.URL == "" {
+		t.Fatalf("reload=%+v err=%v", reloaded, err)
+	}
+}
+
+func TestBrowserActExecutesStepsAndStopsOnFailure(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true, AllowEvaluate: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := true
+	snapshot, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSnapshots := session.page.snapshotCalls
+	response, err := manager.Act(context.Background(), ActRequest{
+		SessionID: opened.SessionID,
+		PageID:    opened.PageID,
+		Revision:  snapshot.Revision,
+		Steps: []ActStep{
+			{Op: "type", Ref: "e1", Text: "Alice"},
+			{Op: "check", Ref: "e1", Checked: &checked},
+			{Op: "evaluate", Code: "document.title"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Completed != 3 || response.FailedStep != 0 || len(response.Steps) != 3 || response.Snapshot == nil {
+		t.Fatalf("批量动作结果=%+v", response)
+	}
+	if response.Steps[2].Type != "string" || string(response.Steps[2].Result) != `"ok"` {
+		t.Fatalf("evaluate 结果没有返回: %+v", response.Steps[2])
+	}
+	if delta := session.page.snapshotCalls - beforeSnapshots; delta != 1 {
+		t.Fatalf("批量动作应只在结束时快照一次，实际 %d 次", delta)
+	}
+	if session.page.lastText != "Alice" || !session.page.checked {
+		t.Fatalf("批量动作没有落到页面: text=%q checked=%v", session.page.lastText, session.page.checked)
+	}
+	failed, err := manager.Act(context.Background(), ActRequest{
+		SessionID: opened.SessionID,
+		PageID:    opened.PageID,
+		Revision:  1,
+		Steps: []ActStep{
+			{Op: "type", Ref: "e1", Text: "Bob"},
+			{Op: "click"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Completed != 0 || failed.FailedStep != 2 || len(failed.Steps) != 1 || failed.Steps[0].Success || failed.Steps[0].Error == "" {
+		t.Fatalf("预检失败没有阻止副作用并报告: %+v", failed)
+	}
+	if session.page.lastText != "Alice" {
+		t.Fatalf("预检失败前不应执行第一步: %q", session.page.lastText)
+	}
+	invalidRef, err := manager.Act(context.Background(), ActRequest{
+		SessionID: opened.SessionID,
+		PageID:    opened.PageID,
+		Revision:  snapshot.Revision,
+		Steps: []ActStep{
+			{Op: "type", Ref: "e1", Text: "Charlie"},
+			{Op: "click", Ref: "missing"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invalidRef.Completed != 0 || invalidRef.FailedStep != 2 || invalidRef.Steps[0].Index != 1 {
+		t.Fatalf("无效 ref 预检结果=%+v", invalidRef)
+	}
+	if session.page.lastText != "Alice" {
+		t.Fatalf("无效 ref 预检前不应执行第一步: %q", session.page.lastText)
+	}
+	legal, err := manager.Act(context.Background(), ActRequest{
+		SessionID: opened.SessionID,
+		PageID:    opened.PageID,
+		Revision:  snapshot.Revision,
+		Steps: []ActStep{
+			{Op: "type", Ref: "e1", Text: "Dave"},
+			{Op: "wait", Condition: "text_contains", RefOrSelector: "e1_2"},
+		},
+	})
+	if err != nil || legal.Completed != 2 {
+		t.Fatalf("text_contains 的自由文本不应被当成 ref: %+v err=%v", legal, err)
+	}
+}
+
+func TestBrowserOpenWaitsForInflightReconcileBeforeRecovery(t *testing.T) {
+	session := &blockingListViewportSession{
+		fakeViewportSession: &fakeViewportSession{fakeSession: &fakeSession{}},
+		listEntered:         make(chan struct{}),
+		releaseList:         make(chan struct{}),
+	}
+	manager, err := newManager(Config{AllowPrivateNetwork: true, Factory: func(context.Context, SessionConfig) (Session, error) {
+		return session, nil
+	}}, defaultTiming())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com/one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := manager.sessions[opened.SessionID]
+	current.mu.Lock()
+	current.tabs = map[string]*page{}
+	current.tabOrder = nil
+	current.activeTab = ""
+	current.mu.Unlock()
+	session.blockList = true
+	listDone := make(chan struct{})
+	go func() {
+		_, _ = manager.ListTabs(context.Background(), TabsRequest{SessionID: opened.SessionID})
+		close(listDone)
+	}()
+	select {
+	case <-session.listEntered:
+	case <-time.After(time.Second):
+		t.Fatal("ListTabs 没有进入 reconcile")
+	}
+	openDone := make(chan OpenResponse, 1)
+	go func() {
+		response, _ := manager.Open(context.Background(), OpenRequest{SessionID: opened.SessionID, URL: "https://example.com/two"})
+		openDone <- response
+	}()
+	select {
+	case <-openDone:
+		t.Fatal("并发 reconcile 未完成时 browserOpen 不应直接新建页面")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(session.releaseList)
+	select {
+	case response := <-openDone:
+		if response.PageID == "" {
+			t.Fatalf("恢复结果为空: %+v", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconcile 完成后 browserOpen 仍未返回")
+	}
+	<-listDone
+	current.mu.Lock()
+	count := len(current.tabs)
+	current.mu.Unlock()
+	if count > 1 {
+		t.Fatalf("恢复后出现重复 Tab: %d", count)
+	}
+}
+
+func TestBrowserSnapshotDoesNotRegressRefsToOlderRevision(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com/new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.page.snapshotData = &Snapshot{Info: PageInfo{URL: "https://example.com/new", Title: "new"}, Revision: 6, Elements: []Element{{Ref: "e6", Role: "button", Name: "New"}}}
+	if _, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID}); err != nil {
+		t.Fatal(err)
+	}
+	session.page.snapshotData = &Snapshot{Info: PageInfo{URL: "https://example.com/old", Title: "old"}, Revision: 4, Elements: []Element{{Ref: "e4", Role: "button", Name: "Old"}}}
+	if _, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID}); err != nil {
+		t.Fatal(err)
+	}
+	current := manager.sessions[opened.SessionID]
+	current.mu.Lock()
+	currentPage := current.tabs[opened.PageID]
+	_, hasOld := currentPage.refs["e4"]
+	_, hasNew := currentPage.refs["e6"]
+	info := currentPage.info
+	current.mu.Unlock()
+	if hasOld || !hasNew || currentPage.refRevision != 6 || info.URL != "https://example.com/new" {
+		t.Fatalf("旧快照回退了 refs/投影: refs=%v info=%+v", currentPage.refs, info)
+	}
+}
+
 func activeTabStatus(snapshot SnapshotResponse) string {
 	for _, tab := range snapshot.Tabs {
 		if tab.PageID == snapshot.ActivePageID {
@@ -1139,9 +1932,6 @@ func activeTabStatus(snapshot SnapshotResponse) string {
 }
 
 func TestBrowserInteractionReleasesLockBeforeTabReconcile(t *testing.T) {
-	previous := tabReconcileTimeout
-	tabReconcileTimeout = 300 * time.Millisecond
-	t.Cleanup(func() { tabReconcileTimeout = previous })
 	base := &fakeSession{page: &fakePage{info: PageInfo{URL: "about:blank"}}}
 	session := &blockingListViewportSession{
 		fakeViewportSession: &fakeViewportSession{fakeSession: base},
@@ -1233,7 +2023,7 @@ func TestBrowserScreenshotRestoresActiveTab(t *testing.T) {
 	background := manager.registerPage(current, &fakeTargetPage{
 		fakePage: &fakePage{info: PageInfo{URL: "https://example.com/background"}},
 		targetID: "target-2",
-	}, defaultBrowserViewport, opened.PageID)
+	}, defaultTiming().viewport, opened.PageID)
 	current.mu.Unlock()
 	ctx := context.Background()
 	if _, err := manager.Screenshot(ctx, ScreenshotRequest{SessionID: opened.SessionID, PageID: background.id}); err != nil {
@@ -1282,6 +2072,473 @@ func TestBrowserWaitAcceptsSnapshotRefAndCSSSelector(t *testing.T) {
 	}
 }
 
+func TestBrowserWaitTimeoutIsStructured(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.page.waitErr = context.DeadlineExceeded
+	_, err = manager.Wait(context.Background(), WaitRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID,
+		Condition: "url_contains", RefOrSelector: "/done", TimeoutMS: 1000,
+	})
+	var browserErr *Error
+	if !errors.As(err, &browserErr) || browserErr.Kind != "wait_timeout" {
+		t.Fatalf("等待超时应返回 wait_timeout 结构化错误: %v", err)
+	}
+	if !strings.Contains(browserErr.Message, "url_contains") || !strings.Contains(browserErr.Message, "/done") {
+		t.Fatalf("超时错误缺少条件或目标: %+v", browserErr)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := manager.Wait(ctx, WaitRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID,
+		Condition: "load_complete", TimeoutMS: 1000,
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("调用方取消应保持 context.Canceled: %v", err)
+	}
+}
+
+func TestBrowserDownloadReturnsSavedFile(t *testing.T) {
+	dir := t.TempDir()
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true, DownloadDir: dir})
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.page.downloadInfo = DownloadInfo{Filename: "report.txt", Path: dir + "/report.txt", Bytes: 12}
+	response, err := manager.Download(context.Background(), DownloadRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID,
+		Ref: snapshot.Elements[0].Ref, Revision: snapshot.Revision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.FileName != "report.txt" || response.Bytes != 12 || !session.page.downloadCalled || session.page.downloadDir != manager.config.DownloadDir {
+		t.Fatalf("下载响应=%+v page=%+v", response, session.page)
+	}
+
+	session.page.downloadErr = context.DeadlineExceeded
+	_, err = manager.Download(context.Background(), DownloadRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID,
+		Ref: snapshot.Elements[0].Ref, Revision: snapshot.Revision,
+	})
+	var browserErr *Error
+	if !errors.As(err, &browserErr) || browserErr.Kind != "download_timeout" {
+		t.Fatalf("下载超时应返回 download_timeout: %v", err)
+	}
+}
+
+func TestBrowserActClickWaitAfterTimeoutReportsWarning(t *testing.T) {
+	manager, _ := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := manager.Act(context.Background(), ActRequest{
+		SessionID: opened.SessionID,
+		PageID:    opened.PageID,
+		Revision:  snapshot.Revision,
+		Steps: []ActStep{
+			{Op: "click", Ref: "e1", WaitAfterMS: 200, TimeoutMS: 20},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.FailedStep != 0 || len(response.Steps) != 1 || !response.Steps[0].Success {
+		t.Fatalf("点击已执行，不应标记步骤失败: %+v", response)
+	}
+	if !strings.Contains(response.Steps[0].Warning, "不要重放") {
+		t.Fatalf("wait_after_ms 超时的 warning 不可操作: %+v", response.Steps[0])
+	}
+}
+
+func TestBrowserActIncludesScreenshot(t *testing.T) {
+	manager, _ := fakeManager(t, Config{AllowPrivateNetwork: true, ScreenshotDir: t.TempDir()})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := manager.Act(context.Background(), ActRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID, Revision: 1, IncludeScreenshot: true,
+		Steps: []ActStep{{Op: "wait", Condition: "load_complete"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Screenshot == nil || len(response.Screenshot.Data) == 0 || response.Screenshot.Bytes == 0 {
+		t.Fatalf("批次截图缺失: %+v", response)
+	}
+}
+
+func TestBrowserClickIncludesScreenshot(t *testing.T) {
+	manager, _ := fakeManager(t, Config{AllowPrivateNetwork: true, ScreenshotDir: t.TempDir()})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := manager.Click(context.Background(), ClickRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID,
+		Ref: snapshot.Elements[0].Ref, Revision: snapshot.Revision, IncludeScreenshot: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Screenshot == nil || len(response.Screenshot.Data) == 0 || response.Screenshot.Bytes == 0 {
+		t.Fatalf("点击截图缺失: %+v", response)
+	}
+}
+
+func TestBrowserActWaitTimeoutIsStructured(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.page.waitErr = context.DeadlineExceeded
+	response, err := manager.Act(context.Background(), ActRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID, Revision: 1,
+		Steps: []ActStep{{Op: "wait", Condition: "selector_hidden", RefOrSelector: "#loading", TimeoutMS: 1000}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.FailedStep != 1 || len(response.Steps) != 1 {
+		t.Fatalf("批量 wait 超时结果=%+v", response)
+	}
+	step := response.Steps[0]
+	if step.Kind != "wait_timeout" || !step.Recoverable || !strings.Contains(step.Error, "隐藏") {
+		t.Fatalf("批量 wait 超时缺少结构化字段或建议: %+v", step)
+	}
+}
+
+func TestBrowserNavigateHistoryDirections(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com/current"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.page.historyInfo = PageInfo{URL: "https://example.com/previous", Title: "Previous"}
+	response, err := manager.Navigate(context.Background(), NavigateRequest{SessionID: opened.SessionID, PageID: opened.PageID, Direction: "back"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.page.historyDirection != "back" || response.URL != "https://example.com/previous" || response.Title != "Previous" {
+		t.Fatalf("历史后退结果=%+v direction=%q", response, session.page.historyDirection)
+	}
+	if _, err := manager.Navigate(context.Background(), NavigateRequest{SessionID: opened.SessionID, PageID: opened.PageID, URL: "https://example.com", Direction: "back"}); err == nil {
+		t.Fatal("url 与 direction 同时提供时应拒绝")
+	}
+	session.page.historyErr = newError("history_unavailable", "没有可用的后退历史", "使用 browserNavigate 打开目标地址", true)
+	if _, err := manager.Navigate(context.Background(), NavigateRequest{SessionID: opened.SessionID, PageID: opened.PageID, Direction: "back"}); err == nil {
+		t.Fatal("history_unavailable 应返回错误")
+	}
+}
+
+func TestBrowserNavigateHistoryRespectsAddressPolicy(t *testing.T) {
+	manager, session := fakeManager(t, Config{})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.page.historyInfo = PageInfo{URL: "http://127.0.0.1/secret"}
+	_, err = manager.Navigate(context.Background(), NavigateRequest{SessionID: opened.SessionID, PageID: opened.PageID, Direction: "back"})
+	var browserErr *Error
+	if !errors.As(err, &browserErr) || browserErr.Kind != "navigation_blocked" {
+		t.Fatalf("历史目标策略错误=%v，期望 navigation_blocked", err)
+	}
+	if session.page.historyNavigated {
+		t.Fatal("策略校验失败后不应执行历史导航")
+	}
+}
+
+func TestBrowserWaitDetectsRemovedRefBeforeTimeout(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := false
+	session.page.refExists = &missing
+	session.page.waitCalled = false
+	started := time.Now()
+	_, err = manager.Wait(context.Background(), WaitRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID, Condition: "selector_visible",
+		RefOrSelector: "e1", Revision: snapshot.Revision, TimeoutMS: 5000,
+	})
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("失效 ref 不应等待超时，耗时 %s", elapsed)
+	}
+	var browserErr *Error
+	if !errors.As(err, &browserErr) || browserErr.Kind != "stale_reference" {
+		t.Fatalf("失效 ref 错误=%v，期望 stale_reference", err)
+	}
+	if session.page.waitCalled {
+		t.Fatal("失效 ref 不应进入 page.Wait")
+	}
+}
+
+func TestBrowserActPreflightRejectsAmbiguousSelect(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := manager.Act(context.Background(), ActRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID, Revision: snapshot.Revision,
+		Steps: []ActStep{
+			{Op: "type", Ref: "e1", Text: "MUTATED"},
+			{Op: "select", Ref: "e1", Value: "a", Label: "A"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.FailedStep != 2 || response.Completed != 0 || len(response.Steps) != 1 {
+		t.Fatalf("select 预检结果=%+v", response)
+	}
+	if session.page.lastText == "MUTATED" {
+		t.Fatal("预检失败前不应执行前面的 type")
+	}
+}
+
+func TestBrowserWaitPreservesCallerDeadline(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	defer close(block)
+	session.page.waitBlock = block
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = manager.Wait(ctx, WaitRequest{SessionID: opened.SessionID, PageID: opened.PageID, Condition: "selector_visible", RefOrSelector: "#later"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("调用方 deadline 错误=%v，期望 context.DeadlineExceeded", err)
+	}
+	var browserErr *Error
+	if errors.As(err, &browserErr) {
+		t.Fatalf("调用方 deadline 不应包装成 wait_timeout: %+v", browserErr)
+	}
+}
+
+func TestBrowserWaitRequestTimeoutIsStructured(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	defer close(block)
+	session.page.waitBlock = block
+	_, err = manager.Wait(context.Background(), WaitRequest{SessionID: opened.SessionID, PageID: opened.PageID, Condition: "selector_visible", RefOrSelector: "#later", TimeoutMS: 50})
+	var browserErr *Error
+	if !errors.As(err, &browserErr) || browserErr.Kind != "wait_timeout" || !browserErr.Recoverable {
+		t.Fatalf("请求超时错误=%v，期望 wait_timeout", err)
+	}
+}
+
+func TestRefCheckBudgetSkipsTightDeadlines(t *testing.T) {
+	tight, tightCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer tightCancel()
+	if _, ok := refCheckBudget(tight); ok {
+		t.Fatal("20ms 预算应跳过 HasRef 预检")
+	}
+	roomy, roomyCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer roomyCancel()
+	budget, ok := refCheckBudget(roomy)
+	if !ok || budget <= 0 || budget > 50*time.Millisecond {
+		t.Fatalf("200ms 预算=%s ok=%v", budget, ok)
+	}
+	for _, test := range []struct {
+		timeout time.Duration
+		want    bool
+	}{
+		{35 * time.Millisecond, false},
+		{45 * time.Millisecond, true},
+		{100 * time.Millisecond, true},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), test.timeout)
+		_, ok := refCheckBudget(ctx)
+		cancel()
+		if ok != test.want {
+			t.Fatalf("%s 预算 ok=%v，期望 %v", test.timeout, ok, test.want)
+		}
+	}
+}
+
+func TestBrowserWaitHasRefBudgetDoesNotConsumeWait(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	defer close(block)
+	session.page.hasRefBlock = block
+	started := time.Now()
+	if _, err := manager.Wait(context.Background(), WaitRequest{SessionID: opened.SessionID, PageID: opened.PageID, Condition: "selector_visible", RefOrSelector: "e1", Revision: snapshot.Revision, TimeoutMS: 20}); err != nil {
+		t.Fatalf("HasRef 预检不应吃掉全部等待预算: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("HasRef 预检耗时过长: %s", elapsed)
+	}
+	if session.page.hasRefCalls != 0 {
+		t.Fatalf("紧超时不应调用 HasRef: %d", session.page.hasRefCalls)
+	}
+}
+
+func TestBrowserActParentDeadlineIsNotStepTimeout(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	defer close(block)
+	session.page.waitBlock = block
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	response, err := manager.Act(ctx, ActRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID, Revision: 1,
+		Steps: []ActStep{{Op: "wait", Condition: "selector_visible", RefOrSelector: "#later", TimeoutMS: 5000}},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || !response.Cancelled {
+		t.Fatalf("父 deadline 结果=%+v err=%v", response, err)
+	}
+	if len(response.Steps) == 1 && response.Steps[0].Kind != "" {
+		t.Fatalf("父 deadline 不应标成步骤超时: %+v", response.Steps[0])
+	}
+}
+
+func TestBrowserActClickTimeoutAdvisesNotToReplay(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	defer close(block)
+	session.page.clickBlock = block
+	response, err := manager.Act(context.Background(), ActRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID, Revision: snapshot.Revision,
+		Steps: []ActStep{{Op: "click", Ref: "e1", TimeoutMS: 50}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.FailedStep != 1 || len(response.Steps) != 1 || response.Steps[0].Kind != "step_timeout" {
+		t.Fatalf("click 超时结果=%+v", response)
+	}
+	if !strings.Contains(response.Steps[0].RecommendedNextStep, "不要直接重放") {
+		t.Fatalf("click 超时建议不可操作: %+v", response.Steps[0])
+	}
+}
+
+func TestBrowserActStepTimeoutCoversAllActions(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.Snapshot(context.Background(), SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	defer close(block)
+	session.page.hoverBlock = block
+	started := time.Now()
+	response, err := manager.Act(context.Background(), ActRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID, Revision: snapshot.Revision,
+		Steps: []ActStep{{Op: "hover", Ref: "e1", TimeoutMS: 80}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("步骤超时没有生效，耗时 %s", elapsed)
+	}
+	if response.FailedStep != 1 || response.Completed != 0 || len(response.Steps) != 1 {
+		t.Fatalf("步骤超时结果=%+v", response)
+	}
+	if step := response.Steps[0]; step.Kind != "step_timeout" || !step.Recoverable {
+		t.Fatalf("步骤超时缺少结构化字段: %+v", step)
+	}
+}
+
+func TestBrowserActWaitStepDeadlineIsStructured(t *testing.T) {
+	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	defer close(block)
+	session.page.waitBlock = block
+	response, err := manager.Act(context.Background(), ActRequest{
+		SessionID: opened.SessionID, PageID: opened.PageID, Revision: 1,
+		Steps: []ActStep{{Op: "wait", Condition: "selector_visible", RefOrSelector: "#later", TimeoutMS: 80}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.FailedStep != 1 || response.Completed != 0 || len(response.Steps) != 1 {
+		t.Fatalf("wait 步骤超时结果=%+v", response)
+	}
+	step := response.Steps[0]
+	if step.Kind != "wait_timeout" || !step.Recoverable || step.RecommendedNextStep == "" {
+		t.Fatalf("wait 步骤超时没有保留结构化错误: %+v", step)
+	}
+}
+
 func TestBrowserTypeDefaultsToClearAndAllowsExplicitAppend(t *testing.T) {
 	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
 	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
@@ -1317,15 +2574,6 @@ func TestBrowserTypeDefaultsToClearAndAllowsExplicitAppend(t *testing.T) {
 	if session.page.lastClear {
 		t.Fatal("append=true 时不应清空原值")
 	}
-}
-
-func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }
 
 func TestBrowserOpenInjectsBeforeNavigationAndEvaluateIsGated(t *testing.T) {
@@ -1400,9 +2648,7 @@ func TestBrowserOpenValidatesURLBeforeInjectingIntoExistingPage(t *testing.T) {
 func TestBrowserOpenReportsIdleTimeoutWithoutDiscardingPage(t *testing.T) {
 	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true})
 	session.page = &fakePage{info: PageInfo{URL: "about:blank", Title: "blank"}, idleErr: context.DeadlineExceeded}
-	previous := openIdleTimeout
-	openIdleTimeout = time.Millisecond
-	t.Cleanup(func() { openIdleTimeout = previous })
+	manager.timing.openIdle = time.Millisecond
 
 	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
 	if err != nil {
@@ -1445,10 +2691,9 @@ func TestBrowserOpenReportsOtherErrorsAsOpenFailed(t *testing.T) {
 }
 
 func TestManagerReclaimsIdleSessionWithoutExternalClose(t *testing.T) {
-	previousInterval := sessionIdleCheckInterval
-	sessionIdleCheckInterval = time.Millisecond
-	t.Cleanup(func() { sessionIdleCheckInterval = previousInterval })
-	manager, _ := fakeManager(t, Config{AllowPrivateNetwork: true, IdleTimeout: 5 * time.Millisecond})
+	manager, _ := fakeManagerWithTiming(t, Config{AllowPrivateNetwork: true, IdleTimeout: 5 * time.Millisecond}, adjustedTiming(func(value *timing) {
+		value.sessionIdleCheck = time.Millisecond
+	}))
 	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
 	if err != nil {
 		t.Fatal(err)
@@ -1476,19 +2721,16 @@ func TestManagerReclaimsIdleSessionWithoutExternalClose(t *testing.T) {
 }
 
 func TestReconcileTabsUsesOneShortBudget(t *testing.T) {
-	previous := tabReconcileTimeout
-	tabReconcileTimeout = 20 * time.Millisecond
-	t.Cleanup(func() { tabReconcileTimeout = previous })
 	base := &fakeSession{page: &fakePage{info: PageInfo{URL: "about:blank"}}}
 	session := &blockingListViewportSession{
 		fakeViewportSession: &fakeViewportSession{fakeSession: base},
 		listEntered:         make(chan struct{}),
 		releaseList:         make(chan struct{}),
 	}
-	manager, err := NewManager(Config{
+	manager, err := newManager(Config{
 		AllowPrivateNetwork: true,
 		Factory:             func(context.Context, SessionConfig) (Session, error) { return session, nil },
-	})
+	}, adjustedTiming(func(value *timing) { value.tabReconcileTimeout = 20 * time.Millisecond }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1510,9 +2752,6 @@ func TestReconcileTabsUsesOneShortBudget(t *testing.T) {
 }
 
 func TestExplicitPageOperationDoesNotRunStateReconcile(t *testing.T) {
-	previous := tabReconcileTimeout
-	tabReconcileTimeout = 500 * time.Millisecond
-	t.Cleanup(func() { tabReconcileTimeout = previous })
 	base := &fakeSession{page: &fakePage{info: PageInfo{URL: "about:blank"}}}
 	session := &blockingListViewportSession{
 		fakeViewportSession: &fakeViewportSession{fakeSession: base},
@@ -1545,5 +2784,93 @@ func TestExplicitPageOperationDoesNotRunStateReconcile(t *testing.T) {
 	manager.mu.Unlock()
 	if activeSession != opened.SessionID {
 		t.Fatalf("显式 page 操作没有恢复 active browser session: %q", activeSession)
+	}
+}
+
+func TestConnectionLossDropsSessionAndNotifiesState(t *testing.T) {
+	browser := &fakeConnectionSession{
+		fakeViewportSession: &fakeViewportSession{fakeSession: &fakeSession{}},
+		done:                make(chan struct{}),
+		closes:              make(chan struct{}, 1),
+	}
+	manager, err := NewManager(Config{
+		AllowPrivateNetwork: true,
+		Factory: func(context.Context, SessionConfig) (Session, error) {
+			return browser, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscribeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	updates, err := manager.SubscribeState(subscribeCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(browser.done)
+	select {
+	case <-updates:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CDP 连接断开后没有清理缓存 Tab")
+	}
+	view, err := manager.View(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !view.Closed || len(view.Tabs) != 0 {
+		t.Fatalf("连接断开后的视图=%+v", view)
+	}
+	// 会话已从 Manager 摘除，底层 Close 仍要回收自建浏览器和临时 profile。
+	select {
+	case <-browser.closes:
+	case <-time.After(2 * time.Second):
+		t.Fatal("连接断开后底层浏览器没有关闭")
+	}
+	if _, err := manager.CloseTab(context.Background(), TabRequest{SessionID: opened.SessionID, PageID: opened.PageID}); err == nil {
+		t.Fatal("失效会话仍然可以关闭 Tab")
+	}
+	closed, err := manager.CloseSession(context.Background(), CloseRequest{SessionID: opened.SessionID})
+	if err != nil || !closed.Closed {
+		t.Fatalf("重复关闭失效会话=%+v, %v", closed, err)
+	}
+}
+
+func TestCloseTabPushesUpdatedTabs(t *testing.T) {
+	manager, _ := fakeManager(t, Config{AllowPrivateNetwork: true})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.NewTab(context.Background(), OpenRequest{SessionID: opened.SessionID, URL: "https://example.org"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscribeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	updates, err := manager.SubscribeState(subscribeCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.CloseTab(context.Background(), TabRequest{SessionID: opened.SessionID, PageID: opened.PageID}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-updates:
+	case <-time.After(2 * time.Second):
+		t.Fatal("关闭 Tab 后没有状态推送")
+	}
+	view, err := manager.View(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Tabs) != 1 || view.Tabs[0].PageID != second.PageID {
+		t.Fatalf("关闭后的 Tab 投影=%+v", view.Tabs)
 	}
 }

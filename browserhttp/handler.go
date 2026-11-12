@@ -228,7 +228,8 @@ func (h *Handler) closeBrowser(w http.ResponseWriter, r *http.Request) {
 
 // NavigationRequest 是地址栏提交的导航请求。
 type NavigationRequest struct {
-	URL string `json:"url"`
+	URL       string `json:"url"`
+	Direction string `json:"direction,omitempty"`
 }
 
 func (h *Handler) newTab(w http.ResponseWriter, r *http.Request) {
@@ -259,11 +260,11 @@ func (h *Handler) tab(w http.ResponseWriter, r *http.Request) {
 		if !decode(w, r, &body) {
 			return
 		}
-		if strings.TrimSpace(body.URL) == "" {
+		if strings.TrimSpace(body.URL) == "" && strings.TrimSpace(body.Direction) == "" {
 			fail(w, 400, errors.New("导航地址不能为空"))
 			return
 		}
-		_, err = h.manager.Navigate(ctx, browserkit.NavigateRequest{PageID: id, URL: body.URL})
+		_, err = h.manager.Navigate(ctx, browserkit.NavigateRequest{PageID: id, URL: body.URL, Direction: body.Direction})
 	case strings.HasSuffix(r.URL.Path, "/reload"):
 		_, err = h.manager.Reload(ctx, browserkit.TabRequest{PageID: id})
 	case strings.HasSuffix(r.URL.Path, "/viewport"):

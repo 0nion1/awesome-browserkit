@@ -8,7 +8,20 @@ import (
 	"time"
 
 	"github.com/go-rod/rod/lib/cdp"
+	"github.com/go-rod/rod/lib/proto"
 )
+
+// cdpSessionClient 在唯一 Call 入口绑定上下文与目标，
+// 跨解释器接口时不依赖原生库通过额外方法发现 session 和期限。
+type cdpSessionClient struct {
+	client    proto.Client
+	ctx       context.Context
+	sessionID proto.TargetSessionID
+}
+
+func (client cdpSessionClient) Call(_ context.Context, _ string, method string, params any) ([]byte, error) {
+	return client.client.Call(client.ctx, string(client.sessionID), method, params)
+}
 
 const maxCDPWriteTimeout = 500 * time.Millisecond
 
@@ -64,7 +77,7 @@ func (transport *boundedWebSocket) Send(data []byte) error {
 		return errors.New("CDP WebSocket 已关闭")
 	case transport.writes <- request:
 	case <-timer.C:
-		transport.close()
+		_ = transport.close()
 		return errors.New("CDP WebSocket 写入排队超时")
 	}
 	select {
@@ -78,7 +91,7 @@ func (transport *boundedWebSocket) Send(data []byte) error {
 	case err := <-request.done:
 		return err
 	case <-timer.C:
-		transport.close()
+		_ = transport.close()
 		return errors.New("CDP WebSocket 写入超时")
 	}
 }
@@ -86,9 +99,14 @@ func (transport *boundedWebSocket) Send(data []byte) error {
 func (transport *boundedWebSocket) Read() ([]byte, error) {
 	data, err := transport.socket.Read()
 	if err != nil {
-		transport.close()
+		_ = transport.close()
 	}
 	return data, err
+}
+
+// Done 在底层连接关闭、读失败或写失败时关闭，供上层回收失效的浏览器会话。
+func (transport *boundedWebSocket) Done() <-chan struct{} {
+	return transport.done
 }
 
 func (transport *boundedWebSocket) Close() error {
@@ -113,7 +131,7 @@ func (transport *boundedWebSocket) writeLoop() {
 			err := transport.socket.Send(request.data)
 			request.done <- err
 			if err != nil {
-				transport.close()
+				_ = transport.close()
 				return
 			}
 		}

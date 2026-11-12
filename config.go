@@ -30,13 +30,13 @@ type EventSink interface{ OnBrowserEvent(context.Context, Event) }
 type LiveQuality string
 
 const (
-	// LiveQualityLow 使用 12 FPS 和 50% JPEG 质量，适合弱网。
+	// LiveQualityLow 使用 24 FPS 和 50% JPEG 质量，适合弱网。
 	LiveQualityLow LiveQuality = "low"
-	// LiveQualityMedium 使用 12 FPS 和 75% JPEG 质量，兼顾流量和清晰度，是默认档位。
+	// LiveQualityMedium 使用 24 FPS 和 75% JPEG 质量，适合带宽有限的网络。
 	LiveQualityMedium LiveQuality = "medium"
-	// LiveQualityHigh 使用 20 FPS 和 100% JPEG 质量。
+	// LiveQualityHigh 使用 30 FPS 和 90% JPEG 质量，是默认档位。
 	LiveQualityHigh LiveQuality = "high"
-	// LiveQualityUltra 使用 30 FPS 和 100% JPEG 质量，适合本机或局域网。
+	// LiveQualityUltra 优先帧率，使用 60 FPS 和 90% JPEG 质量，适合本机或局域网。
 	LiveQualityUltra LiveQuality = "ultra"
 )
 
@@ -50,14 +50,20 @@ type Config struct {
 	DevtoolsAutoStart   bool
 	AllowPrivateNetwork bool
 	AllowedOrigins      []string
-	// LiveQuality 同时控制直播帧率和 JPEG 编码质量；零值为 LiveQualityMedium。
+	// LiveQuality 同时控制直播帧率和 JPEG 编码质量；零值为 LiveQualityHigh。
 	LiveQuality LiveQuality
-	MaxSessions int
+	// LiveFPS 覆盖直播帧率（24-60）；零值使用 LiveQuality 档位。
+	LiveFPS int
+	// LiveJPEGQuality 覆盖直播 JPEG 质量（1-100）；零值使用 LiveQuality 档位。
+	LiveJPEGQuality int
+	MaxSessions     int
 	// MaxTabsPerSession 限制单个浏览器 session 的网页 Tab 数量；零值为 16。
 	MaxTabsPerSession int
 	ScreenshotDir     string
 	// UploadDir 限制 browserUploadFile 可读取的本地文件目录；留空时不暴露该函数。
-	UploadDir      string
+	UploadDir string
+	// DownloadDir 是 browserDownload 保存文件的本地目录；留空时不暴露该函数。
+	DownloadDir    string
 	MaxScriptBytes int
 	MaxResultBytes int
 	// IdleTimeout 是浏览器 session 无操作后的自动回收时间；零值为 30 分钟。
@@ -73,6 +79,14 @@ type Config struct {
 func (config Config) Validate() error {
 	if strings.TrimSpace(config.Session.ExecPath) != "" && strings.TrimSpace(config.Session.RemoteAddress) != "" {
 		return errors.New("Browser ExecPath 和 RemoteAddress 不能同时设置")
+	}
+	downloadDir := strings.TrimSpace(config.DownloadDir)
+	if downloadDir == "" {
+		downloadDir = strings.TrimSpace(config.Session.DownloadDir)
+	}
+	if downloadDir != "" &&
+		(strings.TrimSpace(config.Session.RemoteAddress) != "" || isRemoteAddress(config.Session.ExecPath)) {
+		return errors.New("Browser DownloadDir 只支持本地浏览器；远程浏览器的下载目录位于远端主机")
 	}
 	if config.DevtoolsAutoStart && !config.AllowDevtools {
 		return errors.New("Browser DevtoolsAutoStart 需要先启用 AllowDevtools")
@@ -93,6 +107,12 @@ func (config Config) Validate() error {
 	case "", LiveQualityLow, LiveQualityMedium, LiveQualityHigh, LiveQualityUltra:
 	default:
 		return fmt.Errorf("Browser LiveQuality 无效: %q", config.LiveQuality)
+	}
+	if config.LiveFPS != 0 && (config.LiveFPS < 24 || config.LiveFPS > 60) {
+		return fmt.Errorf("Browser LiveFPS 必须在 24-60 之间: %d", config.LiveFPS)
+	}
+	if config.LiveJPEGQuality < 0 || config.LiveJPEGQuality > 100 {
+		return fmt.Errorf("Browser LiveJPEGQuality 必须在 0-100 之间: %d", config.LiveJPEGQuality)
 	}
 	if config.IdleTimeout < 0 {
 		return errors.New("Browser IdleTimeout 不能为负数")
@@ -158,10 +178,10 @@ func (config Config) normalized() (Config, error) {
 		config.MaxResultBytes = 256 << 10
 	}
 	if config.LiveQuality == "" {
-		config.LiveQuality = LiveQualityMedium
+		config.LiveQuality = LiveQualityHigh
 	}
 	if config.IdleTimeout == 0 {
-		config.IdleTimeout = defaultSessionIdleTimeout
+		config.IdleTimeout = defaultTiming().sessionIdle
 	}
 	if config.Factory == nil {
 		config.Factory = NewSession
@@ -181,22 +201,50 @@ func (config Config) normalized() (Config, error) {
 		}
 		config.UploadDir = resolved
 	}
+	if config.DownloadDir == "" {
+		config.DownloadDir = config.Session.DownloadDir
+	} else if config.Session.DownloadDir != "" && config.Session.DownloadDir != config.DownloadDir {
+		return Config{}, errors.New("Browser DownloadDir 与 Session.DownloadDir 不一致")
+	}
+	if config.DownloadDir != "" {
+		resolved, err := filepath.EvalSymlinks(config.DownloadDir)
+		if err != nil {
+			return Config{}, fmt.Errorf("Browser DownloadDir 无效: %w", err)
+		}
+		info, err := os.Stat(resolved)
+		if err != nil || !info.IsDir() {
+			return Config{}, errors.New("Browser DownloadDir 必须是目录")
+		}
+		absolute, err := filepath.Abs(resolved)
+		if err != nil {
+			return Config{}, fmt.Errorf("Browser DownloadDir 无效: %w", err)
+		}
+		config.DownloadDir = absolute
+	}
+	config.Session.DownloadDir = config.DownloadDir
 	return config, nil
 }
 
 func (config Config) liveOptions() (fps, quality, everyNthFrame int) {
 	switch config.LiveQuality {
 	case LiveQualityLow:
-		return 12, 50, 2
+		fps, quality, everyNthFrame = 24, 50, 2
 	case LiveQualityMedium:
-		return 12, 75, 1
+		fps, quality, everyNthFrame = 24, 75, 2
 	case LiveQualityUltra:
-		return 30, 100, 1
-	case LiveQualityHigh:
-		return 20, 100, 1
+		fps, quality, everyNthFrame = 60, 90, 2
+	case LiveQualityHigh, "":
+		fps, quality, everyNthFrame = 30, 90, 2
 	default:
-		return 12, 75, 1
+		fps, quality, everyNthFrame = 24, 75, 2
 	}
+	if config.LiveFPS > 0 {
+		fps = config.LiveFPS
+	}
+	if config.LiveJPEGQuality > 0 {
+		quality = config.LiveJPEGQuality
+	}
+	return
 }
 
 func screenshotPath(directory, sessionID, pageID string, sequence uint64) (string, error) {

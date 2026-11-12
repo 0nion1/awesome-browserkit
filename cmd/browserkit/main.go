@@ -48,6 +48,8 @@ func mainRun() error {
 		remote        = flag.String("remote", "", "已有 CDP 浏览器地址，例如 http://127.0.0.1:9222")
 		allowEvaluate = flag.Bool("allow-evaluate", false, "启用 browserEvaluate")
 		devtools      = flag.Bool("devtools", false, "启用开发诊断函数")
+		uploadDir     = flag.String("upload-dir", "", "允许 browserUploadFile 读取的目录")
+		downloadDir   = flag.String("download-dir", "", "启用 browserDownload 并保存到本地目录；不支持 attach 模式")
 		screenshotDir = flag.String("screenshot-dir", "", "截图输出目录")
 	)
 	flag.Parse()
@@ -71,6 +73,8 @@ func mainRun() error {
 		MaxSessions:         2,
 		AllowDevtools:       *devtools,
 		ScreenshotDir:       *screenshotDir,
+		UploadDir:           *uploadDir,
+		DownloadDir:         *downloadDir,
 		Session:             sessionConfig,
 	})
 	if err != nil {

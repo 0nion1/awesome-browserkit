@@ -283,7 +283,7 @@ func (manager *controlManager) messageLocked(session *browserControlSession, vie
 	return ControlState{
 		Type: "browser_control", Controller: controller,
 		CanTakeover:  writable && !controller && retry <= 0,
-		RetryAfterMS: max(int64((retry+time.Millisecond-1)/time.Millisecond), 0),
+		RetryAfterMS: int64((retry + time.Millisecond - 1) / time.Millisecond),
 		Revision:     session.revision,
 	}
 }
@@ -292,7 +292,11 @@ func (manager *controlManager) retryAfterLocked(session *browserControlSession, 
 	if session.lastTakeover.IsZero() || manager.takeoverCooldown <= 0 {
 		return 0
 	}
-	return max(session.lastTakeover.Add(manager.takeoverCooldown).Sub(now), 0)
+	retry := session.lastTakeover.Add(manager.takeoverCooldown).Sub(now)
+	if retry < 0 {
+		return 0
+	}
+	return retry
 }
 
 func (manager *controlManager) sessionLocked(sessionID string) *browserControlSession {

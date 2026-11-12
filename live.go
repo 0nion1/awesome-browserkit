@@ -101,9 +101,131 @@ func (manager *Manager) DispatchViewerInput(ctx context.Context, viewerID, pageI
 	if viewerID == "" || pageID == "" {
 		return errors.New("viewer_id 和 page_id 不能为空")
 	}
-	return manager.dispatchInput(ctx, viewerID, pageID, event)
+	return manager.dispatchInputs(ctx, viewerID, pageID, []InputEvent{event}, false, 0)
 }
+
+// DispatchViewerInputs 按顺序投递同一页面的多条输入，并保留全部采样点。
+// 批量轨迹不会与相邻采样合并，span 是这批采样覆盖的时间跨度，用于稳定回放。
+func (manager *Manager) DispatchViewerInputs(ctx context.Context, viewerID, pageID string, events []InputEvent, span time.Duration) error {
+	if viewerID == "" || pageID == "" {
+		return errors.New("viewer_id 和 page_id 不能为空")
+	}
+	if len(events) == 0 {
+		return nil
+	}
+	return manager.dispatchInputs(ctx, viewerID, pageID, events, true, span)
+}
+
+// WaitViewerInput 等待此前投递的输入真正应用到页面。
+// 它只用于需要读取输入后状态的检查；普通输入只要求入队顺序，不必等待。
+func (manager *Manager) WaitViewerInput(ctx context.Context, pageID string) error {
+	if manager == nil {
+		return browserError("browser_unavailable", "Browser Manager 不存在", "调用 NewManager 创建浏览器运行时", true)
+	}
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	current, activePage, err := manager.get(ctx, "", pageID)
+	if err != nil {
+		return err
+	}
+	if pageID == "" {
+		pageID = activePage.id
+	}
+	current.mu.Lock()
+	if current.activeTab != pageID {
+		current.mu.Unlock()
+		return nil
+	}
+	epoch := current.inputEpoch
+	current.mu.Unlock()
+	done := make(chan struct{})
+	barrier := liveInput{page: activePage, epoch: epoch, done: done}
+	select {
+	case current.inputQueue <- barrier:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (manager *Manager) dispatchInput(ctx context.Context, viewerID, pageID string, event InputEvent) error {
+	return manager.dispatchInputs(ctx, viewerID, pageID, []InputEvent{event}, false, 0)
+}
+
+// maxInputReplaySpan 限制一批采样的回放跨度；积压时压缩回放，避免延迟持续放大。
+const maxInputReplaySpan = 100 * time.Millisecond
+
+// liveInteractiveWindow 是用户输入后优先发布的持续时间。连续移动会不断续期，
+// 因此交互期间可以按源帧率发布，停顿后回到档位帧率。
+const liveInteractiveWindow = 300 * time.Millisecond
+
+const (
+	livePointerStep             = 16 * time.Millisecond
+	livePointerCoalesceGap      = 4 * time.Millisecond
+	livePointerImmediateGap     = 24 * time.Millisecond
+	livePointerMaxInterpolation = 100 * time.Millisecond
+)
+
+type livePointerState struct {
+	viewerID string
+	page     *page
+	epoch    uint64
+	event    InputEvent
+	at       time.Time
+}
+
+type livePointerTrajectory struct {
+	target liveInput
+	startX float64
+	startY float64
+	step   int
+	steps  int
+}
+
+func (manager *Manager) markInteractive() {
+	if manager == nil {
+		return
+	}
+	manager.interactiveUntil.Store(time.Now().Add(liveInteractiveWindow).UnixNano())
+	select {
+	case manager.interactiveWake <- struct{}{}:
+	default:
+	}
+}
+
+func (manager *Manager) interactive() bool {
+	return manager != nil && time.Now().UnixNano() < manager.interactiveUntil.Load()
+}
+
+// inputReplayOffsets 把一批采样均匀铺开到 span 内，最后一个点不晚于 span。
+func inputReplayOffsets(span time.Duration, count int) []time.Duration {
+	offsets := make([]time.Duration, count)
+	if count <= 1 || span <= 0 {
+		return offsets
+	}
+	if span > maxInputReplaySpan {
+		span = maxInputReplaySpan
+	}
+	step := span / time.Duration(count)
+	for index := 1; index < count; index++ {
+		offsets[index] = step * time.Duration(index)
+	}
+	return offsets
+}
+
+func (manager *Manager) dispatchInputs(
+	ctx context.Context,
+	viewerID, pageID string,
+	events []InputEvent,
+	lossless bool,
+	span time.Duration,
+) error {
 	if manager == nil {
 		return browserError("browser_unavailable", "Browser Manager 不存在", "调用 NewManager 创建浏览器运行时", true)
 	}
@@ -130,103 +252,298 @@ func (manager *Manager) dispatchInput(ctx context.Context, viewerID, pageID stri
 	viewport := activePage.viewport
 	epoch := current.inputEpoch
 	current.mu.Unlock()
-	if err := validateLiveInput(event, viewport); err != nil {
-		return err
-	}
-	_, ok := activePage.page.(InputPage)
-	if !ok {
+	if _, ok := activePage.page.(InputPage); !ok {
 		return browserError("input_unsupported", "当前浏览器页面不支持直播交互", "使用支持 CDP Input 域的 Browser Factory", true)
 	}
-	queued := liveInput{viewerID: viewerID, page: activePage, event: event, epoch: epoch}
-	if coalescibleLiveInput(event) {
-		// 连续采样由后续位置覆盖；队列满时不能为了保留它而淘汰快捷键、
-		// key up 或触摸边界等不可重建的离散输入。
+	// 先完成整批校验，避免后半段非法导致前半段已投递的部分轨迹。
+	for _, event := range events {
+		if err := validateLiveInput(event, viewport); err != nil {
+			return err
+		}
+	}
+	manager.markInteractive()
+	offsets := inputReplayOffsets(span, len(events))
+	var pace *inputBatchPace
+	if lossless && len(offsets) > 1 && offsets[len(offsets)-1] > 0 {
+		pace = &inputBatchPace{}
+	}
+	for index, event := range events {
+		queued := liveInput{
+			viewerID: viewerID, page: activePage, event: event, epoch: epoch,
+			lossless: lossless, received: time.Now(),
+		}
+		if pace != nil {
+			queued.pace = pace
+			queued.offset = offsets[index]
+		}
+		if lossless {
+			// 批量轨迹必须完整入队；队列满时等待消费者腾出空间，
+			// 不能用覆盖或丢弃把真实轨迹变成不完整的历史。
+			select {
+			case current.inputQueue <- queued:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			continue
+		}
+		if droppableLiveInput(event) {
+			// 连续采样由后续位置覆盖；队列满时不能为了保留它而淘汰快捷键、
+			// key up 或触摸边界等不可重建的离散输入。
+			select {
+			case current.inputQueue <- queued:
+			default:
+			}
+			continue
+		}
+		// WebSocket 接收循环不能在这里等待队列空位，否则 renderer 变慢时会
+		// 停止读取整条连接，并把积压扩散到客户端发送缓冲。离散输入不能静默
+		// 伪装成已接收；队列满时立即返回可恢复错误，由外围决定如何提示或重试。
 		select {
 		case current.inputQueue <- queued:
 		default:
+			return browserError("input_overloaded", "浏览器输入队列已满", "等待输入恢复后重试", true)
 		}
-		return nil
 	}
-	// WebSocket 接收循环不能在这里等待队列空位，否则 renderer 变慢时会
-	// 停止读取整条连接，并把积压扩散到客户端发送缓冲。离散输入不能静默
-	// 伪装成已接收；队列满时立即返回可恢复错误，由外围决定如何提示或重试。
-	select {
-	case current.inputQueue <- queued:
-		return nil
-	default:
-		return browserError("input_overloaded", "浏览器输入队列已满", "等待输入恢复后重试", true)
+	return nil
+}
+
+func sameLivePointerScope(pointer *livePointerState, input liveInput) bool {
+	return pointer != nil && pointer.viewerID == input.viewerID && pointer.page == input.page && pointer.epoch == input.epoch
+}
+
+func livePointerSteps(span time.Duration) int {
+	// 与原前端插值规则保持一致：超密采样等到下一本地帧收敛，
+	// 典型 60Hz 采样直接提交，较稀疏且未形成停顿的采样才补点。
+	if span <= 0 || (span >= livePointerCoalesceGap && span <= livePointerImmediateGap) ||
+		span > livePointerMaxInterpolation {
+		return 0
 	}
+	steps := int(math.Ceil(float64(span) / float64(livePointerStep)))
+	if steps < 1 {
+		steps = 1
+	}
+	maximum := int(livePointerMaxInterpolation / livePointerStep)
+	if steps > maximum {
+		steps = maximum
+	}
+	return steps
+}
+
+// applyLiveInput 在再次校验页面、epoch 和操作权后向 Chrome 提交一项输入。
+// 返回值只在事件已经成功交给页面时为 true，供本地指针轨迹更新当前位置。
+func (manager *Manager) applyLiveInput(current *session, input liveInput) bool {
+	if input.viewerID != "" && !manager.CanControl(input.viewerID) {
+		return false
+	}
+	current.mu.Lock()
+	valid := !current.closed && input.page != nil && current.activeTab == input.page.id &&
+		current.tabs[input.page.id] == input.page && current.inputEpoch == input.epoch
+	current.mu.Unlock()
+	if !valid {
+		return false
+	}
+	inputPage, ok := input.page.page.(InputPage)
+	if !ok {
+		return false
+	}
+	operationCtx, cancel := context.WithTimeout(current.ctx, liveInputDispatchTimeout)
+	current.mu.Lock()
+	valid = !current.closed && current.activeTab == input.page.id &&
+		current.tabs[input.page.id] == input.page && current.inputEpoch == input.epoch
+	if valid {
+		current.inputCancel = cancel
+	}
+	current.mu.Unlock()
+	if !valid {
+		cancel()
+		return false
+	}
+	succeeded := false
+	if lockInteraction(operationCtx, &current.interactionMu) == nil {
+		current.mu.Lock()
+		valid = !current.closed && current.activeTab == input.page.id &&
+			current.tabs[input.page.id] == input.page && current.inputEpoch == input.epoch
+		current.mu.Unlock()
+		if input.viewerID != "" {
+			valid = valid && manager.CanControl(input.viewerID)
+		}
+		if valid {
+			current.mu.Lock()
+			recording := current.sequenceDraft != nil && current.sequenceDraft.manual
+			current.mu.Unlock()
+			var clicked Element
+			if recording && input.event.Kind == "mouse" && input.event.Action == "up" && input.event.Button == "left" {
+				clicked, _ = manager.manualSequenceElementAt(operationCtx, current, input.page, input.event.X, input.event.Y)
+			}
+			succeeded = inputPage.DispatchInput(operationCtx, input.event) == nil
+			if succeeded && recording {
+				manager.recordManualSequenceInput(operationCtx, current, input.page, input.event, clicked)
+			}
+		}
+		current.interactionMu.Unlock()
+	}
+	cancel()
+	current.mu.Lock()
+	current.inputCancel = nil
+	current.mu.Unlock()
+	return succeeded
 }
 
 func (manager *Manager) dispatchLiveInputs(current *session) {
 	var pending *liveInput
-	for {
-		var input liveInput
-		if pending != nil {
-			input = *pending
-			pending = nil
+	var pointer *livePointerState
+	var trajectory *livePointerTrajectory
+	var pointerTimer *time.Timer
+	var pointerTick <-chan time.Time
+	stopPointerTimer := func() {
+		if pointerTimer != nil && !pointerTimer.Stop() {
+			select {
+			case <-pointerTimer.C:
+			default:
+			}
+		}
+		pointerTick = nil
+	}
+	schedulePointer := func() {
+		if pointerTick != nil {
+			return
+		}
+		if pointerTimer == nil {
+			pointerTimer = time.NewTimer(livePointerStep)
 		} else {
+			pointerTimer.Reset(livePointerStep)
+		}
+		pointerTick = pointerTimer.C
+	}
+	clearTrajectory := func() {
+		stopPointerTimer()
+		trajectory = nil
+	}
+	defer stopPointerTimer()
+	flushTrajectory := func() {
+		if trajectory == nil {
+			return
+		}
+		target := trajectory.target
+		clearTrajectory()
+		if manager.applyLiveInput(current, target) {
+			pointer = &livePointerState{
+				viewerID: target.viewerID, page: target.page, epoch: target.epoch,
+				event: target.event, at: time.Now(),
+			}
+		} else {
+			pointer = nil
+		}
+	}
+	for {
+		if pending == nil {
 			select {
 			case <-current.ctx.Done():
 				return
-			case input = <-current.inputQueue:
+			case input := <-current.inputQueue:
+				pending = &input
+			case <-pointerTick:
+				pointerTick = nil
+				// 输入与定时器同时就绪时优先采用新目标，避免在已经收到
+				// 最新位置后仍向 Chrome 补播旧轨迹中的一个点。
+				select {
+				case input := <-current.inputQueue:
+					pending = &input
+					continue
+				default:
+				}
+				if trajectory == nil {
+					continue
+				}
+				trajectory.step++
+				ratio := float64(trajectory.step) / float64(trajectory.steps)
+				stepInput := trajectory.target
+				stepInput.event.X = trajectory.startX + (trajectory.target.event.X-trajectory.startX)*ratio
+				stepInput.event.Y = trajectory.startY + (trajectory.target.event.Y-trajectory.startY)*ratio
+				if !manager.applyLiveInput(current, stepInput) {
+					clearTrajectory()
+					pointer = nil
+					continue
+				}
+				pointer = &livePointerState{
+					viewerID: stepInput.viewerID, page: stepInput.page, epoch: stepInput.epoch,
+					event: stepInput.event, at: time.Now(),
+				}
+				if trajectory.step >= trajectory.steps {
+					clearTrajectory()
+				} else {
+					schedulePointer()
+				}
+				continue
 			}
 		}
-		if input.barrier != nil {
-			close(input.barrier)
-			continue
-		}
+		input := *pending
 		input, pending = coalesceLiveInputs(input, current.inputQueue)
-		if input.viewerID != "" && !manager.CanControl(input.viewerID) {
+		// 顺序屏障必须等待此前最新目标真正到达页面。
+		if input.done != nil {
+			flushTrajectory()
+			close(input.done)
 			continue
 		}
-		current.mu.Lock()
-		valid := !current.closed && current.activeTab == input.page.id &&
-			current.tabs[input.page.id] == input.page && current.inputEpoch == input.epoch
-		current.mu.Unlock()
-		if !valid {
-			continue
+		if pointer != nil && !sameLivePointerScope(pointer, input) {
+			clearTrajectory()
+			pointer = nil
 		}
-		inputPage, ok := input.page.page.(InputPage)
-		if !ok {
-			continue
-		}
-		operationCtx, cancel := context.WithTimeout(current.ctx, liveInputDispatchTimeout)
-		current.mu.Lock()
-		valid = !current.closed && current.activeTab == input.page.id &&
-			current.tabs[input.page.id] == input.page && current.inputEpoch == input.epoch
-		if valid {
-			current.inputCancel = cancel
-		}
-		current.mu.Unlock()
-		if !valid {
-			cancel()
-			continue
-		}
-		if lockInteraction(operationCtx, &current.interactionMu) == nil {
-			current.mu.Lock()
-			valid = !current.closed && current.activeTab == input.page.id &&
-				current.tabs[input.page.id] == input.page && current.inputEpoch == input.epoch
-			recording := valid && current.sequenceDraft != nil && current.sequenceDraft.manual
-			current.mu.Unlock()
-			if input.viewerID != "" {
-				valid = valid && manager.CanControl(input.viewerID)
-			}
-			if valid {
-				var clicked Element
-				if recording && input.event.Kind == "mouse" && input.event.Action == "up" && input.event.Button == "left" {
-					clicked, _ = manager.manualSequenceElementAt(operationCtx, current, input.page, input.event.X, input.event.Y)
-				}
-				if err := inputPage.DispatchInput(operationCtx, input.event); err == nil && recording {
-					manager.recordManualSequenceInput(operationCtx, current, input.page, input.event, clicked)
+		// 批量轨迹沿用调用方节奏；直播 mouse move 则由本地状态机平滑。
+		if input.pace != nil {
+			input.pace.once.Do(func() { input.pace.start = time.Now() })
+			if wait := time.Until(input.pace.start.Add(input.offset)); wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-timer.C:
+				case <-current.ctx.Done():
+					timer.Stop()
+					return
 				}
 			}
-			current.interactionMu.Unlock()
 		}
-		cancel()
-		current.mu.Lock()
-		current.inputCancel = nil
-		current.mu.Unlock()
+		if input.event.Kind == "mouse" && input.event.Action == "move" && !input.lossless {
+			targetAt := input.received
+			if targetAt.IsZero() {
+				targetAt = time.Now()
+			}
+			if pointer == nil {
+				if manager.applyLiveInput(current, input) {
+					pointer = &livePointerState{
+						viewerID: input.viewerID, page: input.page, epoch: input.epoch,
+						event: input.event, at: time.Now(),
+					}
+				}
+				continue
+			}
+			steps := livePointerSteps(targetAt.Sub(pointer.at))
+			if steps == 0 {
+				clearTrajectory()
+				if manager.applyLiveInput(current, input) {
+					pointer = &livePointerState{
+						viewerID: input.viewerID, page: input.page, epoch: input.epoch,
+						event: input.event, at: time.Now(),
+					}
+				} else {
+					pointer = nil
+				}
+				continue
+			}
+			trajectory = &livePointerTrajectory{
+				target: input, startX: pointer.event.X, startY: pointer.event.Y,
+				steps: steps,
+			}
+			schedulePointer()
+			continue
+		}
+		// 离散事件是顺序屏障：先精确落到最新 move，再提交 down/up/wheel 等事件。
+		flushTrajectory()
+		if manager.applyLiveInput(current, input) && input.event.Kind == "mouse" {
+			pointer = &livePointerState{
+				viewerID: input.viewerID, page: input.page, epoch: input.epoch,
+				event: input.event, at: time.Now(),
+			}
+		}
 	}
 }
 
@@ -236,7 +553,7 @@ func (manager *Manager) waitLiveInputBarrier(ctx context.Context, current *sessi
 	epoch := current.inputEpoch
 	current.mu.Unlock()
 	select {
-	case current.inputQueue <- liveInput{epoch: epoch, barrier: barrier}:
+	case current.inputQueue <- liveInput{epoch: epoch, done: barrier}:
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-current.ctx.Done():
@@ -252,24 +569,20 @@ func (manager *Manager) waitLiveInputBarrier(ctx context.Context, current *sessi
 	}
 }
 
-// coalesceLiveInputs 丢弃尚未投递的过时连续采样。鼠标和触摸移动是绝对状态，
-// 因此保留最新一条；滚动是相对位移，因此合并位移并采用最新指针状态。
-// 遇到按下、抬起、键盘等离散事件立即停止，保证其前后顺序不变。
+// coalesceLiveInputs 丢弃尚未投递的过时鼠标移动，只保留最新目标。
+// 触摸、滚轮和其他离散事件都是顺序屏障，不允许被覆盖或跨越。
 func coalesceLiveInputs(first liveInput, queue <-chan liveInput) (liveInput, *liveInput) {
-	if !coalescibleLiveInput(first.event) {
+	if first.done != nil || first.lossless || !droppableLiveInput(first.event) {
 		return first, nil
 	}
 	result := first
 	for {
 		select {
 		case next := <-queue:
-			if next.viewerID != result.viewerID || next.page != result.page || next.epoch != result.epoch ||
+			if next.done != nil || next.lossless ||
+				next.viewerID != result.viewerID || next.page != result.page || next.epoch != result.epoch ||
 				next.event.Kind != result.event.Kind || next.event.Action != result.event.Action {
 				return result, &next
-			}
-			if result.event.Action == "wheel" {
-				next.event.DeltaX += result.event.DeltaX
-				next.event.DeltaY += result.event.DeltaY
 			}
 			result = next
 		default:
@@ -278,9 +591,8 @@ func coalesceLiveInputs(first liveInput, queue <-chan liveInput) (liveInput, *li
 	}
 }
 
-func coalescibleLiveInput(event InputEvent) bool {
-	return event.Action == "move" && (event.Kind == "mouse" || event.Kind == "touch") ||
-		event.Kind == "mouse" && event.Action == "wheel"
+func droppableLiveInput(event InputEvent) bool {
+	return event.Kind == "mouse" && event.Action == "move"
 }
 
 func validateLiveInput(event InputEvent, viewport Viewport) error {

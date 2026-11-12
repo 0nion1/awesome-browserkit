@@ -38,13 +38,6 @@ func cloneLiveFrame(frame LiveFrame) LiveFrame {
 	return copyFrame
 }
 
-func cachePageFrame(value *page, screenshot Screenshot) {
-	if value == nil || len(screenshot.Data) == 0 {
-		return
-	}
-	cachePageLiveFrame(value, LiveFrame{Data: screenshot.Data, MIME: "image/" + screenshot.Format})
-}
-
 func cachePageLiveFrame(value *page, frame LiveFrame) {
 	if value == nil || len(frame.Data) == 0 {
 		return
@@ -223,6 +216,8 @@ func (hub *liveHub) closeSubscribers() {
 }
 
 func (hub *liveHub) run() {
+	// 直播协程由插件创建；单次 panic 不能让整个 Executor 退出。
+	defer func() { _ = recover() }()
 	defer func() {
 		hub.closeSubscribers()
 		close(hub.done)
@@ -271,18 +266,64 @@ func (hub *liveHub) run() {
 				Quality: quality, EveryNthFrame: everyNthFrame,
 			})
 			if err == nil {
-				interval := time.NewTicker(frameInterval) // 帧锁。
-				reconcileTicker := time.NewTicker(tabReconcileInterval)
-				firstFrameTimer := time.NewTimer(liveFirstFrameTimeout)
+				reconcileTicker := time.NewTicker(manager.timing.tabReconcileInterval)
+				// 发布不再依赖固定 tick，但仍按帧间隔检查页面/viewport 绑定，
+				// 保证静态页面调整视口后能及时重启 screencast。
+				bindingTicker := time.NewTicker(frameInterval)
+				firstFrameTimer := time.NewTimer(manager.timing.liveFirstFrame)
 				firstFrameC := firstFrameTimer.C
 				var pending *Screenshot
+				pendingMIME := "image/jpeg"
+				var frameTimer *time.Timer
+				var frameTimerC <-chan time.Time
+				var lastPublish time.Time
+				stopFrameTimer := func() {
+					if frameTimer != nil {
+						frameTimer.Stop()
+						frameTimer = nil
+						frameTimerC = nil
+					}
+				}
+				publish := func() {
+					if pending == nil {
+						return
+					}
+					screenshot := pending
+					pending = nil
+					current.mu.Lock()
+					info := page.info
+					current.mu.Unlock()
+					hub.publish(page, LiveFrame{Generation: generation, Data: screenshot.Data, MIME: pendingMIME, URL: info.URL, Title: info.Title})
+					pendingMIME = "image/jpeg"
+					lastPublish = time.Now()
+					stopFrameTimer()
+				}
+				// 新帧到达时立即发布；距离上次发布不足一个帧间隔时，只保留
+				// 最新一帧到间隔结束，既限制带宽又不把画面固定等到 tick 边界。
+				schedule := func() {
+					if pending == nil || frameTimer != nil {
+						return
+					}
+					if lastPublish.IsZero() || manager.interactive() {
+						publish()
+						return
+					}
+					wait := frameInterval - time.Since(lastPublish)
+					if wait <= 0 {
+						publish()
+						return
+					}
+					frameTimer = time.NewTimer(wait)
+					frameTimerC = frameTimer.C
+				}
 				for {
 					select {
 					case <-hub.ctx.Done():
 						stop()
-						interval.Stop()
 						reconcileTicker.Stop()
+						bindingTicker.Stop()
 						firstFrameTimer.Stop()
+						stopFrameTimer()
 						return
 					case screenshot, ok := <-frames:
 						if !ok {
@@ -293,33 +334,40 @@ func (hub *liveHub) run() {
 							firstFrameTimer.Stop()
 							firstFrameC = nil
 						}
+						if manager.liveBindingChanged(current, page, viewport) {
+							changed = true
+							break
+						}
 						pending = &screenshot
+						pendingMIME = "image/jpeg"
+						schedule()
+					case <-bindingTicker.C:
+						if manager.liveBindingChanged(current, page, viewport) {
+							changed = true
+						}
 					case <-firstFrameC:
 						firstFrameC = nil
 						// Chrome 偶尔接受 startScreencast 却不产生首帧，特别是
 						// device metrics 刚变化时。补一张有界截图，既恢复画面，
 						// 也让前端确认新尺寸后重新开放坐标输入；screencast 本身
 						// 保持订阅，后续事件仍可继续接管。
-						screenshotCtx, screenshotCancel := context.WithTimeout(hub.ctx, liveFirstFrameTimeout)
+						if manager.liveBindingChanged(current, page, viewport) {
+							changed = true
+							break
+						}
+						screenshotCtx, screenshotCancel := context.WithTimeout(hub.ctx, manager.timing.liveFirstFrame)
 						screenshot, screenshotErr := page.page.Screenshot(screenshotCtx, ScreenshotOptions{})
 						screenshotCancel()
 						if screenshotErr == nil {
-							current.mu.Lock()
-							info := page.info
-							current.mu.Unlock()
-							hub.publish(page, LiveFrame{Generation: generation, Data: screenshot.Data, MIME: "image/" + screenshot.Format, URL: info.URL, Title: info.Title})
+							pending = &screenshot
+							pendingMIME = "image/" + screenshot.Format
+							publish()
 						}
-					case <-interval.C:
-						if pending != nil {
-							current.mu.Lock()
-							info := page.info
-							current.mu.Unlock()
-							hub.publish(page, LiveFrame{Generation: generation, Data: pending.Data, MIME: "image/jpeg", URL: info.URL, Title: info.Title})
-							pending = nil
-						}
-						if manager.liveBindingChanged(current, page, viewport) {
-							changed = true
-						}
+					case <-frameTimerC:
+						publish()
+					case <-manager.interactiveWake:
+						// 用户刚输入时立刻提交已经到达的最新帧，不再等最小间隔。
+						publish()
 					case <-reconcileTicker.C:
 						_ = manager.reconcileTabs(hub.ctx, current)
 						if manager.liveBindingChanged(current, page, viewport) {
@@ -330,10 +378,14 @@ func (hub *liveHub) run() {
 						break
 					}
 				}
+				if !changed && pending != nil {
+					publish()
+				}
 				stop()
-				interval.Stop()
 				reconcileTicker.Stop()
+				bindingTicker.Stop()
 				firstFrameTimer.Stop()
+				stopFrameTimer()
 				if !changed {
 					return
 				}
@@ -342,7 +394,7 @@ func (hub *liveHub) run() {
 		}
 		// 自定义 Browser Factory 可以只实现稳定 Page 接口。此时按同一直播档位定时截图。
 		interval := time.NewTicker(frameInterval)
-		reconcileTicker := time.NewTicker(tabReconcileInterval)
+		reconcileTicker := time.NewTicker(manager.timing.tabReconcileInterval)
 		for {
 			select {
 			case <-hub.ctx.Done():
@@ -357,7 +409,6 @@ func (hub *liveHub) run() {
 				if changed {
 					interval.Stop()
 					reconcileTicker.Stop()
-					break
 				}
 			case <-interval.C:
 				if manager.liveBindingChanged(current, page, viewport) {

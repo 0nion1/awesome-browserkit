@@ -9,8 +9,10 @@ The embedded target covers a same-origin iframe, an open Shadow DOM, and a
 native file input. The upload tool reads only regular files from the configured
 `UploadDir` and rejects files larger than 10 MiB.
 The lab also loads a second local origin into an iframe. Its frame title and URL
-are visible in the parent snapshot; its controls are intentionally outside the
-parent document's element references.
+are visible in the parent snapshot; its text and controls are collected through
+CDP with independent frame references. The test clicks a cross-origin button and
+checks the child document result. It also checks batch actions, explicit dialogs,
+checked state, and real HTML5 drag and drop through JSON function calls.
 
 Run `make smoke` from the repository root with Chrome or Chromium installed. The
 test invokes every enabled `Manager.Functions()` handler using JSON requests and

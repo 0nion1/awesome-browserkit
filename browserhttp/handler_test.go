@@ -39,6 +39,16 @@ func (p *testPage) Navigate(_ context.Context, address string) (browserkit.PageI
 	p.info = browserkit.PageInfo{URL: address, Title: "Fixture"}
 	return p.info, nil
 }
+func (p *testPage) Snapshot(ctx context.Context, _ browserkit.SnapshotOptions) (browserkit.Snapshot, error) {
+	info, err := p.Info(ctx)
+	return browserkit.Snapshot{Info: info, Revision: 1}, err
+}
+func (p *testPage) HistoryTarget(_ context.Context, direction string) (browserkit.HistoryEntry, error) {
+	return browserkit.HistoryEntry{URL: "https://example.com/" + direction}, nil
+}
+func (p *testPage) NavigateHistory(ctx context.Context, entry browserkit.HistoryEntry) (browserkit.PageInfo, error) {
+	return p.Navigate(ctx, entry.URL)
+}
 func (p *testPage) Close(context.Context) error                        { return nil }
 func (p *testPage) WaitIdle(context.Context, time.Duration) error      { return nil }
 func (p *testPage) Wait(context.Context, browserkit.WaitOptions) error { return nil }
@@ -635,5 +645,31 @@ func TestStreamReportsInputErrorAndKeepsReceiving(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("输入错误使接收循环停止")
+	}
+}
+
+func TestHTTPHistoryNavigationAndValidation(t *testing.T) {
+	manager, session, opened := fixture(t)
+	_, leave, err := manager.JoinViewer("controller", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leave()
+	handler := NewHandler(manager, Options{})
+	path := "/tabs/" + opened.PageID + "/navigate"
+	for _, direction := range []string{"back", "forward"} {
+		response := call(t, handler, http.MethodPost, path, `{"direction":"`+direction+`"}`, "controller")
+		info, _ := session.pages[0].Info(context.Background())
+		if response.Code != http.StatusNoContent || info.URL != "https://example.com/"+direction {
+			t.Fatalf("history %s: status=%d URL=%s body=%s", direction, response.Code, info.URL, response.Body.String())
+		}
+	}
+	before, _ := session.pages[0].Info(context.Background())
+	for _, body := range []string{`{"url":"https://example.com","direction":"back"}`, `{"direction":"sideways"}`} {
+		response := call(t, handler, http.MethodPost, path, body, "controller")
+		after, _ := session.pages[0].Info(context.Background())
+		if response.Code != http.StatusBadRequest || after.URL != before.URL {
+			t.Fatalf("invalid history changed page: status=%d URL=%s body=%s", response.Code, after.URL, response.Body.String())
+		}
 	}
 }

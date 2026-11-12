@@ -133,15 +133,6 @@ func publicNetworkAddress(address netip.Addr) bool {
 	return true
 }
 
-type networkPolicyClient struct {
-	proto.Client
-	ctx       context.Context
-	sessionID proto.TargetSessionID
-}
-
-func (client networkPolicyClient) GetContext() context.Context         { return client.ctx }
-func (client networkPolicyClient) GetSessionID() proto.TargetSessionID { return client.sessionID }
-
 type networkPolicyJob struct {
 	event     *proto.FetchRequestPaused
 	sessionID proto.TargetSessionID
@@ -160,7 +151,7 @@ func startBrowserNetworkPolicy(ctx context.Context, browser *rod.Browser, policy
 		return nil, err
 	}
 	jobs := make(chan networkPolicyJob, networkPolicyQueueSize)
-	for range networkPolicyWorkers {
+	for index := 0; index < networkPolicyWorkers; index++ {
 		go func() {
 			for {
 				select {
@@ -198,7 +189,7 @@ func startBrowserNetworkPolicy(ctx context.Context, browser *rod.Browser, policy
 func enforceBrowserNetworkPolicy(ctx context.Context, browser proto.Client, policy *browserNetworkPolicy, event *proto.FetchRequestPaused, sessionID proto.TargetSessionID) {
 	requestCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	client := networkPolicyClient{Client: browser, ctx: requestCtx, sessionID: sessionID}
+	client := cdpSessionClient{client: browser, ctx: requestCtx, sessionID: sessionID}
 	if err := policy.check(requestCtx, event.Request.URL, event.ResourceType); err != nil {
 		_ = (proto.FetchFailRequest{RequestID: event.RequestID, ErrorReason: proto.NetworkErrorReasonBlockedByClient}).Call(client)
 		return

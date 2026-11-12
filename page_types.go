@@ -9,8 +9,8 @@ import (
 
 // Viewport 描述页面视口尺寸。
 type Viewport struct {
-	Width  int `json:"width" jsonschema_description:"视口宽度，单位 CSS 像素；有效尺寸必须大于 0 且不超过 16384，宽度与高度之积不超过 67108864。"`
-	Height int `json:"height" jsonschema_description:"视口高度，单位 CSS 像素；有效尺寸必须大于 0 且不超过 16384，宽度与高度之积不超过 67108864。"`
+	Width  int `json:"width" jsonschema_description:"视口宽度（CSS px），1-16384，宽高乘积不超过 67108864。"`
+	Height int `json:"height" jsonschema_description:"视口高度（CSS px），1-16384，宽高乘积不超过 67108864。"`
 }
 
 const maxViewportDimension = 16_384
@@ -39,6 +39,36 @@ type PageOptions struct {
 type PageInfo struct {
 	URL   string `json:"url"`
 	Title string `json:"title"`
+}
+
+// Dialog 是页面当前弹窗或一次显式处理结果。
+type Dialog struct {
+	// ID 在同一页面内单调递增，browserHandleDialog 用它避免处理错弹窗。
+	ID      uint64 `json:"id"`
+	Type    string `json:"type"`
+	Message string `json:"message,omitempty"`
+	URL     string `json:"url,omitempty"`
+	// Options 是当前弹窗允许的显式动作。
+	Options  []string `json:"options"`
+	Accepted bool     `json:"accepted"`
+	// Handled 表示 browserHandleDialog 已成功处理该弹窗。
+	Handled    bool   `json:"handled"`
+	PromptText string `json:"prompt_text,omitempty"`
+}
+
+// DialogHandleOptions 描述一次明确的原生 JavaScript 弹窗处理。
+type DialogHandleOptions struct {
+	ID         uint64
+	Action     string
+	PromptText string
+}
+
+// DialogPage 暴露页面当前弹窗以及显式处理入口。
+type DialogPage interface {
+	Page
+	PendingDialog() *Dialog
+	DialogChanges() <-chan struct{}
+	HandleDialog(context.Context, DialogHandleOptions) (Dialog, error)
 }
 
 // Asset 描述当前页面已经观测到的一项网络资源。
@@ -82,13 +112,42 @@ type ElementRef struct {
 	Revision uint64 `json:"revision"`
 }
 
-// Element 描述一个可交互元素，不包含字段值。
+// Element 描述一个可交互元素及用于核对写入的表单状态。
 type Element struct {
-	Ref              string          `json:"ref"`
-	Role             string          `json:"role"`
-	Name             string          `json:"name,omitempty"`
-	Type             string          `json:"type,omitempty"`
-	FrameURL         string          `json:"frame_url,omitempty"`
+	Ref      string `json:"ref"`
+	Role     string `json:"role"`
+	Name     string `json:"name,omitempty"`
+	Type     string `json:"type,omitempty"`
+	FrameURL string `json:"frame_url,omitempty"`
+	// ID 是元素自身的 id；用于区分无障碍名称相同的元素。
+	ID string `json:"id,omitempty"`
+	// Placeholder 是输入框占位文本；有 label 时仍保留，便于定位未标注控件。
+	Placeholder string `json:"placeholder,omitempty"`
+	// Value 是表单控件或 contenteditable 的当前值（密码、掩码、文件等控件除外），
+	// 按码点截断到 120 字符并受快照总量预算限制；用于确认输入是否生效。
+	Value string `json:"value,omitempty"`
+	// ValueTruncated 表示 Value 被截断或受总量预算限制。
+	ValueTruncated bool `json:"value_truncated,omitempty"`
+	// Checked 是可勾选控件的当前状态；其他元素省略。
+	Checked *bool `json:"checked,omitempty"`
+	// Indeterminate 表示原生或 ARIA 控件处于混合状态。
+	Indeterminate bool `json:"indeterminate,omitempty"`
+	// Disabled 表示控件当前禁用，不能交互。
+	Disabled bool `json:"disabled,omitempty"`
+	// ReadOnly 表示输入控件只读；browserType 不应把它报告为成功。
+	ReadOnly bool `json:"readonly,omitempty"`
+	// ContentEditable 表示元素是顶层 contenteditable 编辑区。
+	ContentEditable bool `json:"contenteditable,omitempty"`
+	// Multiline 表示文本编辑控件支持多行输入。
+	Multiline bool `json:"multiline,omitempty"`
+	// Pressed 是 ARIA pressed 状态；普通按钮省略。
+	Pressed *bool `json:"pressed,omitempty"`
+	// PressedMixed 表示 ARIA pressed 处于 mixed 状态。
+	PressedMixed bool `json:"pressed_mixed,omitempty"`
+	// Expanded 是可展开控件的当前展开状态。
+	Expanded *bool `json:"expanded,omitempty"`
+	// Draggable 表示元素支持原生 HTML5 拖放。
+	Draggable        bool            `json:"draggable,omitempty"`
 	Locator          ElementLocator  `json:"locator,omitempty"`
 	Options          []ElementOption `json:"options,omitempty"`
 	OptionsTruncated bool            `json:"options_truncated,omitempty"`
@@ -97,13 +156,13 @@ type Element struct {
 // ElementLocator 描述可跨页面重载重新解析的元素定位信息。
 // Ref 仍用于当前 document 内的安全操作；Locator 只用于操作序列回放。
 type ElementLocator struct {
-	Selector      string `json:"selector,omitempty"`
-	XPath         string `json:"xpath,omitempty"`
-	AbsoluteXPath string `json:"absolute_xpath,omitempty"`
-	Role          string `json:"role,omitempty"`
-	Name          string `json:"name,omitempty"`
-	Type          string `json:"type,omitempty"`
-	FrameURL      string `json:"frame_url,omitempty"`
+	Selector      string `json:"selector,omitempty" jsonschema_description:"跨页面重新定位使用的 CSS selector。"`
+	XPath         string `json:"xpath,omitempty" jsonschema_description:"优先使用的 XPath。"`
+	AbsoluteXPath string `json:"absolute_xpath,omitempty" jsonschema_description:"CSS 与 XPath 失效时回退使用的绝对 XPath。"`
+	Role          string `json:"role,omitempty" jsonschema_description:"元素的无障碍角色。"`
+	Name          string `json:"name,omitempty" jsonschema_description:"用于核对目标元素的无障碍名称。"`
+	Type          string `json:"type,omitempty" jsonschema_description:"用于核对目标元素的输入控件类型。"`
+	FrameURL      string `json:"frame_url,omitempty" jsonschema_description:"元素所在 iframe 的 URL。"`
 }
 
 // ElementOption 是原生下拉框中可供选择的选项。
@@ -142,6 +201,12 @@ type Snapshot struct {
 	// 不进入 Snapshot 的公开 JSON，避免把页面字段值暴露给普通快照调用方。
 	ActiveElementRef   string `json:"-"`
 	ActiveElementValue string `json:"-"`
+	// HasMore 表示当前元素分页之后仍有可交互元素；仅用于计算 next_offset。
+	HasMore bool `json:"has_more,omitempty"`
+	// TextTruncated 表示正文因 max_chars 被截断，无法通过元素分页继续。
+	TextTruncated bool `json:"-"`
+	// PaginationKnown 表示 Page 实现已经显式给出 HasMore；自定义 Page 可省略以使用兼容推断。
+	PaginationKnown bool `json:"-"`
 	// ActiveRefs 是当前 DOM 中仍存在的内部 ref，供宿主回收已删除节点引用。
 	ActiveRefs []string `json:"-"`
 }
@@ -232,14 +297,41 @@ type EvaluateResult struct {
 	Type  string          `json:"type"`
 }
 
+// ClickOptions 描述元素点击的鼠标按键和次数。
+type ClickOptions struct {
+	// Button 允许 left、right、middle；空值使用 left。
+	Button string
+	// ClickCount 允许 1 或 2；零值使用 1。
+	ClickCount int
+}
+
+// PointClickPage 支持按视口 CSS 坐标点击没有快照 ref 的视觉目标。
+type PointClickPage interface {
+	ClickPoint(context.Context, float64, float64, ClickOptions) error
+}
+
+// PressOptions 描述一次完整按键或组合键。
+type PressOptions struct {
+	// Key 是字母、数字或编辑导航键。
+	Key string
+	// Modifiers 允许 Control、Meta、Alt、Shift，不允许重复。
+	Modifiers []string
+	// Ref 非空时先聚焦目标元素，否则使用当前焦点。
+	Ref *ElementRef
+}
+
 // Page 是浏览器页面的最小稳定操作接口。
 type Page interface {
 	Info(context.Context) (PageInfo, error)
 	Navigate(context.Context, string) (PageInfo, error)
 	Snapshot(context.Context, SnapshotOptions) (Snapshot, error)
-	Click(context.Context, ElementRef) error
+	Click(context.Context, ElementRef, ClickOptions) error
 	Type(context.Context, ElementRef, string, bool) error
-	Press(context.Context, string) error
+	Press(context.Context, PressOptions) error
+	// SetChecked 确认目标勾选状态，返回是否发生点击。
+	SetChecked(context.Context, ElementRef, bool) (bool, error)
+	// Drag 在同一页面内完成元素到元素的拖放。
+	Drag(context.Context, ElementRef, ElementRef) error
 	Wait(context.Context, WaitOptions) error
 	// WaitIdle 等待页面下一次 requestIdleCallback，超时由调用方控制。
 	WaitIdle(context.Context, time.Duration) error
@@ -254,6 +346,64 @@ type Page interface {
 type TargetPage interface {
 	Page
 	TargetID() string
+}
+
+// DownloadPage 是可点击元素并等待文件下载完成的 Page 扩展能力。
+// 未实现该接口的 Page 仍会看到 browserDownload，但调用时返回 download_unsupported。
+type DownloadPage interface {
+	Page
+	Download(context.Context, ElementRef, string) (DownloadInfo, error)
+}
+
+// DragTargetPage 允许拖放目标使用 CSS selector；源元素仍使用快照 ref。
+type DragTargetPage interface {
+	Page
+	DragTo(context.Context, ElementRef, string) error
+}
+
+// DragByPage 允许从快照元素按视口 CSS 位移拖拽。
+type DragByPage interface {
+	Page
+	DragBy(context.Context, ElementRef, float64, float64) error
+}
+
+// DragPointPage 允许从视口 CSS 坐标按位移拖拽。
+type DragPointPage interface {
+	Page
+	DragPoint(context.Context, float64, float64, float64, float64) error
+}
+
+// RefAwarePage 能判断快照 ref 是否仍存在于当前 DOM。
+// wait 在 selector_visible 前用它区分“元素尚未出现”和“ref 已失效”。
+type RefAwarePage interface {
+	Page
+	HasRef(context.Context, string) (bool, error)
+}
+
+// HistoryEntry 描述一个可供导航的浏览器历史项。
+type HistoryEntry struct {
+	ID  int
+	URL string
+
+	// fromIndex/fromURL 仅供内置 Page 判断导航是否真正提交；外部实现可忽略。
+	fromIndex int
+	fromURL   string
+}
+
+// HistoryPage 支持浏览器历史前进和后退。
+type HistoryPage interface {
+	Page
+	// HistoryTarget 返回 back 或 forward 对应的历史项，供宿主做地址策略校验。
+	HistoryTarget(context.Context, string) (HistoryEntry, error)
+	// NavigateHistory 导航到指定历史项，返回导航后的页面信息。
+	NavigateHistory(context.Context, HistoryEntry) (PageInfo, error)
+}
+
+// DownloadInfo 描述一次已完成下载的文件事实。
+type DownloadInfo struct {
+	Filename string
+	Path     string
+	Bytes    int64
 }
 
 // WaitOptions 描述浏览器页面的有限等待条件。

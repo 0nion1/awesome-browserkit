@@ -58,7 +58,8 @@ export function Workspace() {
 | `controls` | 区域及按钮配置；默认全部显示，`false` 隐藏外层内置控制区 |
 | `input` | 页面输入配置；默认全部允许，`false` 停止所有页面输入 |
 | `devtools` | 默认 false；也可传诊断配置对象，服务端必须授权 |
-| `liveView` | 默认 true；可以只显示诊断 |
+| `liveView` | 默认 true；false 时暂停画面和输入连接，保留状态订阅及最后一帧 |
+| `followActivePage` | 默认 true；设为 false 时，固定展示宿主 `pageID`，不跟随服务端活动页 |
 | `viewport` | 默认 `"container"`；也可传 `{ width, height }` 固定远端尺寸 |
 | `viewerID` | 默认每实例生成；同一实例重连保持身份 |
 | `onStateChange` | 浏览器完整状态更新回调 |
@@ -76,6 +77,8 @@ export function Workspace() {
 ## 自定义接入
 
 宿主已有浏览器后端或自己的传输层时，实现从包根导出的 `BrowserSource` 并传入 `source`。组件会将 `endpoint` 原样传给数据源方法，因此自定义场景可使用会话 ID。接口包含状态读取和订阅、缓存帧、实时帧与输入连接、Tab 操作、操作权、视口、关闭浏览器及 `diagnostics`；元素选择还需实现可选的 `inspectPoint` 方法，接收 `viewerID` 以验证操作权。完整方法签名以导出的 TypeScript 类型为准。`BrowserInputConnection` 需提供 `readyState`、`bufferedAmount`、`send` 和 `close`。
+可选 `discardPendingInputs()` 在操作权、页面或直播状态变化时丢弃未发送的连续采样。
+可选 `BrowserSource.history()` 提供前进/后退；未实现时隐藏这两个按钮，默认 HTTP 数据源已支持。
 
 ```tsx
 import { BrowserView, type BrowserSource } from '@browserkit/react'
@@ -94,6 +97,8 @@ declare const source: BrowserSource // 由宿主实现并复用同一对象
 ## 布局与样式
 
 默认样式单独导出，作用域限制在 `.browserkit` 内。
+工具栏的前进、后退按钮可通过 `controls.back`、`controls.forward` 配置。
+移动端触摸按有限频率发送，在拥塞时保留最后位置，并在操作权切换时清理旧手势；连接中断后自动退避重连。
 不使用 Shadow DOM 或全局 portal，可选择不导入默认 CSS，完全自行编写。
 
 ```css

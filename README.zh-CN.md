@@ -252,11 +252,26 @@ handler := browserhttp.NewHandler(manager, browserhttp.Options{
 请求和响应使用导出的命名结构体，宿主负责 Schema 校验和工具调用协议。
 全部工具输入字段（含嵌套字段）通过 `jsonschema_description` 提供中文参数说明，涵盖用途、默认值和约束。
 `browserNavigate` 不再接受未使用的 `timeout_ms` 字段。
-打开或导航页面时，加载完成与页面空闲共用最多 2 秒的等待窗口；浏览器启动和导航请求仍受 `Session.OperationTimeout` 与宿主 context 限制。
+打开或导航页面时，加载完成与页面空闲共用最多 3 秒的等待窗口；浏览器启动和导航请求仍受 `Session.OperationTimeout` 与宿主 context 限制。
 超过等待窗口后页面继续加载，调用成功返回 `load_status: "timeout"`、当前页面 `snapshot` 和未完全加载提醒 `warning`。
 模型可直接使用快照中的元素引用继续操作，或调用 `browserWait`、`browserSnapshot` 检查后续状态；无需重新打开或导航。
 若当前内容暂时无法读取，`warning` 会包含读取失败原因，页面仍保留。
 适配示例见 [examples/functions](examples/functions/main.go)。
+
+### 批量动作与增强观测
+
+`browserAct` 按顺序执行最多 20 个动作，只在最后返回一次快照；单独动作也会附带最新快照。
+`snapshot_error` 表示动作已经完成，但附加读取或等待失败，应先检查页面，避免重复副作用。
+`browserSetChecked` 设置勾选状态，`browserDrag` 支持指针和 HTML5 拖放，
+`browserNavigate` 的 `direction=back/forward` 支持历史导航。
+`browserTabs` 支持 `action=list/activate/close/new/reload`，并保留原有的 `browserActivateTab` 和 `browserCloseTab` 工具。
+原生 JavaScript 弹窗通过 `snapshot.dialogs` 暴露，用 `browserHandleDialog` 和返回的 ID 明确接受或取消。
+
+快照补充表单值与控件状态，对敏感值做屏蔽并限制正文和字段值预算。
+快照和部分动作支持 `include_screenshot`，快照的 `screenshot_grid` 与截图的 `grid` 可附带 CSS 坐标网格。
+配置 `Config.DownloadDir` 或 CLI 的 `--download-dir` 后启用本地下载；远程 CDP 会话不支持该下载目录。
+CLI 还支持 `--upload-dir` 开启上传。
+自定义 `Page` 实现需适配扩展动作接口，详见[迁移与兼容说明](docs/keycode-browser-port.md)。
 
 ### 操作序列生成与回放
 
@@ -341,7 +356,7 @@ go run ./examples/demo --addr 127.0.0.1:8878 --chrome /path/to/chrome
 页面包含表单、悬停菜单、异步数据、嵌套和长页滚动、DOM 替换、资源加载及弹出 Tab。
 快照包含原生表单标签、复选框角色和下拉选项。`browserSelectOption` 可按 value 或 label 选择原生单选下拉项；`browserScroll` 在视口中心或指定 CSS 坐标发送滚轮事件。
 快照还会发现同源 iframe 和 open Shadow DOM 内的控件。配置 `Config.UploadDir` 后才会暴露 `browserUploadFile`，仅接受该目录内不超过 10 MiB 的普通文件，响应只包含文件名和大小。
-跨源 iframe 会以 `frame` 角色及 `frame_url` 出现在快照中，其内部控件目前不属于主页面 ref 命名空间。
+跨源 iframe 以 `frame` 角色及 `frame_url` 出现在快照中；另外会聚合最多 3 个可见跨域 frame 的正文和控件，支持跨站 OOPIF，其控件使用独立的 `f` 前缀 ref。
 可以用 `browserkit --allow-private-network --url http://127.0.0.1:8879/` 手动调用函数。
 `make smoke` 会在临时浏览器中使用同一靶场，通过 JSON 工具调用验证全部已启用的浏览器函数。
 

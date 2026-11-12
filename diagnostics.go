@@ -19,8 +19,8 @@ const (
 
 // DevtoolsOpenRequest 是 browserDevtoolsOpen 的输入。
 type DevtoolsOpenRequest struct {
-	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
-	PageID    string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	SessionID string `json:"session_id" jsonschema_description:"browserOpen 返回的 session_id。"`
+	PageID    string `json:"page_id" jsonschema_description:"目标 Tab 的 page_id；省略时用活动页。"`
 }
 
 // DevtoolsOpenResponse 是 browserDevtoolsOpen 的输出。
@@ -34,8 +34,8 @@ type DevtoolsOpenResponse struct {
 
 // DevtoolsReadRequest 是 browserDevtoolsRead 的输入。
 type DevtoolsReadRequest struct {
-	SessionID     string   `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
-	PageID        string   `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	SessionID     string   `json:"session_id" jsonschema_description:"browserOpen 返回的 session_id。"`
+	PageID        string   `json:"page_id" jsonschema_description:"目标 Tab 的 page_id；省略时用活动页。"`
 	Generation    uint64   `json:"generation,omitempty" jsonschema_description:"可选的诊断采集代次，使用最近一次打开或读取返回的 generation；省略或为 0 时读取当前代次；不匹配时重新获取 generation，并从 after_sequence=0 开始。"`
 	AfterSequence uint64   `json:"after_sequence,omitempty" jsonschema_description:"只返回 sequence 大于此值的记录；省略或为 0 时从现有最早记录开始，继续读取使用上次响应的 next_sequence；旧记录可能已被回收。"`
 	Kinds         []string `json:"kinds,omitempty" jsonschema_description:"可选的记录类型列表，仅支持 console、exception、network；省略或为空时读取全部类型。"`

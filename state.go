@@ -51,3 +51,16 @@ func (manager *Manager) hasStateSubscribers() bool {
 	defer manager.stateMu.Unlock()
 	return len(manager.stateSubs) != 0
 }
+
+// notifyState 通知订阅者重新读取状态。通道只有一个缓冲槽，连续变化会合并，
+// 不会因为订阅者读取较慢而阻塞事件源。
+func (manager *Manager) notifyState() {
+	manager.stateMu.Lock()
+	for subscriber := range manager.stateSubs {
+		select {
+		case subscriber <- struct{}{}:
+		default:
+		}
+	}
+	manager.stateMu.Unlock()
+}

@@ -52,7 +52,7 @@ func (manager *Manager) Attach(ctx context.Context, request AttachRequest) (Open
 	}
 	manager.stopLive()
 	manager.emit(ctx, Event{Kind: "session_opened", SessionID: created.id, PageID: page.id, URL: info.URL})
-	return OpenResponse{SessionID: created.id, PageID: page.id, URL: info.URL, Title: info.Title, LoadStatus: status}, nil
+	return OpenResponse{SessionID: created.id, PageID: page.id, URL: info.URL, Title: info.Title, LoadStatus: status, Dialogs: pendingPageDialogs(page.page)}, nil
 }
 
 func (manager *Manager) externalBrowser() bool {

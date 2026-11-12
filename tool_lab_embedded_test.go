@@ -151,9 +151,13 @@ func TestRealBrowserEmbeddedTargets(t *testing.T) {
 	if frame := toolLabElement(t, crossSnapshot, "frame", "External checkout"); frame.FrameURL != crossURL {
 		t.Fatalf("cross-origin iframe URL missing: %+v", frame)
 	}
-	for _, element := range crossSnapshot.Elements {
-		if element.Name == "External action" {
-			t.Fatalf("cross-origin iframe unexpectedly entered page ref namespace: %+v", element)
-		}
+	external := toolLabElement(t, crossSnapshot, "button", "External action")
+	if !strings.HasPrefix(external.Ref, "f") || external.FrameURL != crossURL {
+		t.Fatalf("跨域控件缺少独立 frame 引用: %+v", external)
+	}
+	toolLabClick(lab, opened.SessionID, opened.PageID, crossSnapshot, "button", "External action")
+	result := toolLabCall[SnapshotResponse](lab, "browserSnapshot", map[string]any{"session_id": opened.SessionID, "page_id": opened.PageID})
+	if !strings.Contains(result.Text, "External clicked") {
+		t.Fatalf("跨域点击未改变子文档: %s", result.Text)
 	}
 }

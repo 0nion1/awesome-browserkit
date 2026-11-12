@@ -3,6 +3,7 @@ package browserkit
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -19,7 +20,7 @@ type Function struct {
 }
 
 // Functions 返回绑定当前 Manager 的浏览器函数清单。
-// 默认提供 22 个函数；AllowEvaluate 增加普通与序列脚本执行，AllowDevtools 增加三个诊断函数，UploadDir 增加文件上传。
+// 默认提供 26 个函数；AllowEvaluate 增加普通与序列脚本执行，AllowDevtools 增加三个诊断函数，UploadDir 增加文件上传。
 // 每次返回独立切片，宿主可以筛选；同一 Manager 的操作与 HTTP/React 共用 session 和 Tab。
 // 请求解码、输入/输出 schema 校验、审批、进度和模型协议由宿主工具框架处理。
 func (manager *Manager) Functions() []Function {
@@ -27,22 +28,26 @@ func (manager *Manager) Functions() []Function {
 		return nil
 	}
 	functions := []Function{
-		{Name: "browserOpen", Description: "启动可复用浏览器 session 并打开一个 HTTP/HTTPS 页面；最多等待 2 秒加载完成并进入空闲，load_status 报告 loaded 或 timeout。超时仍成功返回页面身份、当前内容 snapshot 和未完全加载提醒 warning，由模型判断继续操作或再次检查；不要因 timeout 重复打开页面。需要图片时再调用 browserScreenshot。完成操作后用 browserClose 释放 session。", Handler: manager.openFunction},
-		{Name: "browserTabs", Description: "列出浏览器 session 中的网页 Tab，并返回当前激活的 page_id。", Handler: manager.tabsFunction},
+		{Name: "browserOpen", Description: "启动浏览器 session 并打开 HTTP/HTTPS 页面；默认总计等待最多 3 秒加载并进入空闲，随后返回 session_id、page_id、当前 snapshot 和 load_status（loaded 或 timeout）；超时不要重复打开。需要图片时再调用 browserScreenshot。", Handler: manager.openFunction},
+		{Name: "browserTabs", Description: "管理 Tab：action=list/activate/close/new/reload，省略为 list；activate/close/reload 需要 page_id。", Handler: manager.tabActionFunction},
+		{Name: "browserNavigate", Description: "在已有页面打开 url，或用 direction=back/forward/reload 导航；url 与 direction 二选一。默认总计等待最多 3 秒加载并进入空闲，随后返回当前 snapshot 和 load_status；超时不要重复导航。需要图片时再调用 browserScreenshot。", Handler: manager.Navigate},
+		{Name: "browserSnapshot", Description: "返回页面文本、控件状态和绑定 revision 的 ref；含 disabled/checked/value/readonly/id/placeholder 等，敏感值除外并按码点截断；跨域 iframe 的正文以 [frame URL] 标注，其控件会给出 f 前缀 ref；同站点与跨站 OOPIF 都支持。省略 page_id 用当前 Tab；max_chars/max_elements/offset 分页，下一页用 next_offset。视觉任务建议同时设置 include_screenshot=true 和 screenshot_grid=true，一次取得页面结构和带坐标的截图；截图已随结果返回，不要紧接着重复 browserScreenshot。ref 只在同一 page_id 和 revision 内有效。", Handler: manager.Snapshot},
+		{Name: "browserHandleDialog", Description: "处理 browserSnapshot 返回的当前 JavaScript 弹窗；使用 dialogs[0] 的 id，并按 options 选择 accept 或 dismiss。prompt 接受时可填写 prompt_text。处理成功后页面才会继续执行。", Handler: manager.HandleDialog},
+		{Name: "browserAct", Description: "按顺序执行一组页面动作：click/hover/type/select/check 用 ref，click 也可用 x/y，press 的 ref 可选，scroll/evaluate 不需要 ref，wait 用 ref_or_selector，drag 可用 source_ref/from_x+from_y 和 target_ref/delta_x+delta_y（各自二选一，坐标起点只能配位移）。只返回最终 snapshot，适合表单和动态等待。任一步失败即停止并返回 failed_step；附加等待超时会 warning，后续步骤可能运行在未稳定页面上，不要因此重放。整批非原子，跨页导航后重新 browserSnapshot。", Handler: manager.Act},
+		{Name: "browserClick", Description: "点击快照元素或视口坐标：ref+revision 或 x/y 二选一；button 支持 left/right/middle，click_count 为 1 或 2。返回最新 snapshot；snapshot_error 表示附加读取失败或 wait_after_ms 被 timeout_ms 截断，操作已完成，不要重放。需要视觉结果设 include_screenshot=true，截图已随结果返回，不要重复截图；异步加载用 browserWait。", Handler: manager.Click},
+		{Name: "browserHover", Description: "把真实指针移到快照元素，可展开悬停菜单；需要 ref 和 revision。返回最新 snapshot；snapshot_error 仅指附加读取失败，不要重放。", Handler: manager.Hover},
+		{Name: "browserType", Description: "向快照元素输入文本，默认覆盖；append 追加，submit 发送 Enter。支持文本、number 和 date/month/week/time/datetime-local/color/range；非法或越界返回 invalid_value 并恢复原值。需要 ref 和 revision；返回最新 snapshot，snapshot_error 仅指附加读取失败，不要重放。", Handler: manager.Type},
+		{Name: "browserSelectOption", Description: "按 value 或 label 选择原生单选下拉框；需要 ref 和 revision。返回最新 snapshot；snapshot_error 仅指附加读取失败，不要重放。", Handler: manager.SelectOption},
+		{Name: "browserSetChecked", Description: "设置原生 checkbox/radio 或 ARIA checkbox/radio/switch 的 checked；radio 只能为 true，已是目标状态时不重复点击。需要 ref 和 revision；返回最新 snapshot，snapshot_error 仅指附加读取失败，不要重放。", Handler: manager.SetChecked},
+		{Name: "browserDrag", Description: "拖拽：source_ref 或 from_x/from_y 指定起点，target_ref（ref 或唯一 CSS selector）或 delta_x/delta_y 指定目标，两组都只能二选一；from_x/from_y 只能配 delta_x/delta_y。没有 ref 的滑块先用 browserScreenshot 的 grid=true 读取起点和缺口坐标；include_screenshot=true 已含拖拽后截图，确认时不要重复截图。支持指针与 HTML5 拖放；include_screenshot=true 时附带截图。返回最新 snapshot；snapshot_error 仅指附加读取失败，不要重放。", Handler: manager.Drag},
+		{Name: "browserPress", Description: "发送按键或组合键（modifiers：Control/Meta/Alt/Shift）；提供 ref 和 revision 时先聚焦，省略时用当前焦点。返回最新 snapshot；snapshot_error 仅指附加读取失败，不要重放。", Handler: manager.Press},
+		{Name: "browserScroll", Description: "发送真实滚轮事件，delta_x/delta_y 为 CSS 像素；默认从视口中心开始，可用 x/y 指定嵌套区域。返回最新 snapshot；snapshot_error 仅指附加读取失败，不要重放。", Handler: manager.Scroll},
+		{Name: "browserWait", Description: "等待页面状态：selector_visible/selector_hidden（ref 或 CSS selector）、url_contains、title_contains、text_contains、load_complete。", Handler: manager.Wait},
+		{Name: "browserScreenshot", Description: "截取页面并保存为宿主可读取的 PNG；可指定 full_page、region 或 grid。grid 叠加 50px 网格和 100px 页面 CSS 坐标标签。", Handler: manager.Screenshot},
+		{Name: "browserAssets", Description: "列出当前页已观测的资源（脚本、样式、图片、字体、XHR/Fetch）及状态、大小、耗时，可按 host 过滤；不会主动爬取。", Handler: manager.ListAssets},
+		{Name: "browserClose", Description: "关闭 session 并释放页面；仅在用户要求或 session 无法继续时调用，任务完成后不要关闭用户正在观看的页面。", Handler: manager.CloseSession},
 		{Name: "browserActivateTab", Description: "激活指定浏览器 Tab，让后续直播画面和输入切换到该 Tab。", Handler: manager.activateTabFunction},
 		{Name: "browserCloseTab", Description: "关闭浏览器 session 中指定的网页 Tab。", Handler: manager.closeTabFunction},
-		{Name: "browserNavigate", Description: "在已有浏览器 page 中导航到 HTTP/HTTPS 地址；最多等待 2 秒加载完成并进入空闲，load_status 报告 loaded 或 timeout。超时仍成功返回当前内容 snapshot 和未完全加载提醒 warning，由模型判断继续操作或再次检查；不要因 timeout 重复导航。", Handler: manager.Navigate},
-		{Name: "browserSnapshot", Description: "获取页面文本摘要和绑定 revision 的可交互元素引用；先同步 Tab 状态。省略 page_id 时使用最新 active page，并返回 active_page_id、tabs_revision、tabs_changed 和 Tab 摘要；支持 max_elements 限量和 offset 分页，下一页使用 next_offset。交互后页面内容或控件状态可能变化，即使 revision 未变也可能需要重新获取快照；元素列表中缺少某个控件时，它也可能尚未启用。", Handler: manager.Snapshot},
-		{Name: "browserClick", Description: "点击指定 page_id 页面快照中的元素引用。ref 只能用于生成它的 page_id。点击后页面内容或控件状态可能变化，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.Click},
-		{Name: "browserHover", Description: "将指针移动到指定 page_id 的快照元素。ref 只能用于生成它的页面。悬停可能展开菜单或显示新控件，操作这些控件前可能需要重新调用 browserSnapshot。", Handler: manager.Hover},
-		{Name: "browserType", Description: "向指定 page_id 页面元素输入文本。ref 只能用于生成它的 page_id。默认覆盖原值，append=true 时追加。响应不会回显输入内容。输入可能启用按钮或显示新控件；完成一组输入后，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.Type},
-		{Name: "browserSelectOption", Description: "按 browserSnapshot 返回的 value 或可见 label，选择指定 page_id 中原生单选下拉框的选项；需要同一快照的 ref 和 revision。选择后页面内容或控件状态可能变化，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.SelectOption},
-		{Name: "browserPress", Description: "向指定 page_id 页面发送白名单按键。按键后页面内容或控件状态可能变化，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.Press},
-		{Name: "browserScroll", Description: "在指定 page_id 发送滚轮事件，delta_x/delta_y 为 CSS 像素；省略 x/y 时以视口中心为起点，也可指定坐标滚动嵌套区域。滚动可能触发懒加载或显示新控件，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.Scroll},
-		{Name: "browserWait", Description: "等待指定 page_id 页面的状态。selector_visible/selector_hidden 可直接使用 browserSnapshot 返回的 ref 或 CSS selector；也支持 url_contains、title_contains、text_contains 和 load_complete。", Handler: manager.Wait},
-		{Name: "browserScreenshot", Description: "把指定 page_id 页面截图保存为宿主可读取的 PNG 文件。", Handler: manager.Screenshot},
-		{Name: "browserAssets", Description: "读取指定 page_id 当前页面已经观测到的资源列表；返回脚本、样式、图片、字体和 XHR/Fetch 等资源的名称、实际地址、发起类型、状态、大小与耗时；可用 host 过滤域名。不会主动爬取未访问页面。", Handler: manager.ListAssets},
-		{Name: "browserClose", Description: "显式关闭指定浏览器 session。", Handler: manager.CloseSession},
 		{Name: "sequenceStart", Description: "开始记录当前 session 中由宿主 AI 探索产生的操作候选；保存用户目标和变量默认值，并以当前页面生成首个导航候选。", Handler: manager.StartSequence},
 		{Name: "sequenceRead", Description: "读取当前操作序列草稿的候选步骤、执行结果、页面别名和变量；模型应据此删除试错步骤并保持原执行顺序。", Handler: manager.ReadSequence},
 		{Name: "sequenceProviderCall", Description: "使用宿主已取得的外部能力结果填写目标元素，并记录可在回放时暂停求值的 provider-call 候选。", Handler: manager.ExecuteSequenceProviderCall},
@@ -50,14 +55,22 @@ func (manager *Manager) Functions() []Function {
 		{Name: "sequenceReplay", Description: "在全新本地临时 Chrome profile 中回放版本化操作序列；遇到 provider-call 时返回暂停状态和续播 token。", Handler: manager.ReplaySequence},
 		{Name: "sequenceResume", Description: "向暂停的 provider-call 提交外部结果并从断点继续操作序列回放。", Handler: manager.ResumeSequence},
 	}
+	if !manager.config.AllowEvaluate {
+		for index := range functions {
+			if functions[index].Name == "browserAct" {
+				functions[index].Description = strings.Replace(functions[index].Description, "scroll/evaluate 不需要 ref", "scroll 不需要 ref", 1)
+			}
+		}
+	}
 	if manager.config.AllowEvaluate {
-		functions = append(functions,
-			Function{Name: "browserEvaluate", Description: "在指定页面的 console 域执行一段 JavaScript，并返回有限 JSON 值。", Handler: manager.Evaluate},
-			Function{Name: "sequenceScript", Description: "显式执行并记录一个脚本候选；支持 action 和必须返回 true 的 assertion，只在启用 JavaScript 能力时提供。", Handler: manager.ExecuteSequenceScript},
-		)
+		functions = append(functions, Function{Name: "browserEvaluate", Description: "在页面 console 执行 JavaScript 并返回有限 JSON；用表达式或 IIFE，不要写顶层 return 或顶层 await（await 需放进 async 函数），返回 Promise 会自动等待。", Handler: manager.Evaluate})
+		functions = append(functions, Function{Name: "sequenceScript", Description: "显式执行并记录一个脚本候选；支持 action 和必须返回 true 的 assertion，只在启用 JavaScript 能力时提供。", Handler: manager.ExecuteSequenceScript})
 	}
 	if manager.config.UploadDir != "" {
-		functions = append(functions, Function{Name: "browserUploadFile", Description: "将宿主 UploadDir 目录内一个普通文件设置到指定 page_id 的原生 file input；需要快照 ref、revision 和绝对路径，响应只返回文件名及字节数。设置文件后页面内容或控件状态可能变化，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.UploadFile})
+		functions = append(functions, Function{Name: "browserUploadFile", Description: "把 UploadDir 内文件设置到 file input；需要 ref、revision 和绝对路径。返回最新 snapshot，snapshot_error 仅指附加读取失败，不要重放。", Handler: manager.UploadFile})
+	}
+	if manager.config.DownloadDir != "" {
+		functions = append(functions, Function{Name: "browserDownload", Description: "点击链接/按钮并等待下载到 DownloadDir；返回文件名、路径和字节数。不要用它打开普通网页。", Handler: manager.Download})
 	}
 	if manager.config.AllowDevtools {
 		functions = append(functions,
@@ -84,14 +97,56 @@ func (manager *Manager) openFunction(ctx context.Context, request OpenRequest) (
 }
 
 // 宿主 UI 可以省略目标；模型函数必须明确 session，避免误操作另一个会话。
-func (manager *Manager) tabsFunction(ctx context.Context, request TabsRequest) (TabsResponse, error) {
+func (manager *Manager) tabActionFunction(ctx context.Context, request TabActionRequest) (TabActionResponse, error) {
 	if err := contextErr(ctx); err != nil {
-		return TabsResponse{}, err
+		return TabActionResponse{}, err
 	}
 	if request.SessionID == "" {
-		return TabsResponse{}, errors.New("browserTabs 需要 session_id")
+		return TabActionResponse{}, errors.New("browserTabs 需要 session_id")
 	}
-	return manager.ListTabs(ctx, request)
+	action := strings.TrimSpace(request.Action)
+	if action == "" {
+		action = "list"
+	}
+	switch action {
+	case "list":
+		response, err := manager.ListTabs(ctx, TabsRequest{SessionID: request.SessionID})
+		tabs := response.Tabs
+		if tabs == nil {
+			tabs = []TabView{}
+		}
+		return TabActionResponse{SessionID: response.SessionID, Action: action, ActivePageID: response.ActivePageID, TabsRevision: response.TabsRevision, Tabs: tabs}, err
+	case "activate":
+		if err := requirePage(request.SessionID, request.PageID, "browserTabs activate"); err != nil {
+			return TabActionResponse{}, err
+		}
+		response, err := manager.ActivateTab(ctx, TabRequest{SessionID: request.SessionID, PageID: request.PageID})
+		return TabActionResponse{SessionID: response.SessionID, Action: action, ActivePageID: response.ActivePageID, TabsRevision: response.TabsRevision, TabsChanged: response.TabsChanged, PageID: response.PageID, URL: response.URL, Title: response.Title, Tabs: []TabView{}}, err
+	case "close":
+		if err := requirePage(request.SessionID, request.PageID, "browserTabs close"); err != nil {
+			return TabActionResponse{}, err
+		}
+		response, err := manager.CloseTab(ctx, TabRequest{SessionID: request.SessionID, PageID: request.PageID})
+		return TabActionResponse{SessionID: response.SessionID, Action: action, ActivePageID: response.ActivePageID, TabsRevision: response.TabsRevision, TabsChanged: response.TabsChanged, PageID: response.PageID, Closed: response.Closed, Tabs: []TabView{}}, err
+	case "new":
+		response, err := manager.NewTab(ctx, OpenRequest{SessionID: request.SessionID, URL: request.URL})
+		result := TabActionResponse{SessionID: response.SessionID, Action: action, PageID: response.PageID, URL: response.URL, Title: response.Title, LoadStatus: string(response.LoadStatus), Snapshot: response.Snapshot, Warning: response.Warning}
+		if tabs, tabsErr := manager.ListTabs(ctx, TabsRequest{SessionID: request.SessionID}); tabsErr == nil {
+			result.ActivePageID = tabs.ActivePageID
+			result.TabsRevision = tabs.TabsRevision
+			result.TabsChanged = true
+			result.Tabs = tabs.Tabs
+		}
+		return result, err
+	case "reload":
+		if err := requirePage(request.SessionID, request.PageID, "browserTabs reload"); err != nil {
+			return TabActionResponse{}, err
+		}
+		response, err := manager.Reload(ctx, TabRequest{SessionID: request.SessionID, PageID: request.PageID})
+		return TabActionResponse{SessionID: response.SessionID, Action: action, ActivePageID: response.ActivePageID, TabsRevision: response.TabsRevision, TabsChanged: response.TabsChanged, PageID: response.PageID, URL: response.URL, Title: response.Title, LoadStatus: string(response.LoadStatus), Snapshot: response.Snapshot, Warning: response.Warning, Tabs: []TabView{}}, err
+	default:
+		return TabActionResponse{}, newError("invalid_action", "不支持的 Tab 动作", "使用 list、activate、close、new 或 reload", true)
+	}
 }
 
 func (manager *Manager) activateTabFunction(ctx context.Context, request TabRequest) (TabResponse, error) {

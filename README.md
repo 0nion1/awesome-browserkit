@@ -256,11 +256,32 @@ Requests and responses are exported named structs.
 The host provides schema validation and the tool invocation protocol.
 All tool input fields, including nested fields, provide Chinese parameter descriptions through `jsonschema_description`, covering purpose, defaults, and constraints.
 `browserNavigate` no longer accepts the unused `timeout_ms` field.
-Opening or navigating a page shares a two-second budget for load completion and page idleness; browser startup and the navigation request remain subject to `Session.OperationTimeout` and the host context.
+Opening or navigating a page shares a three-second budget for load completion and page idleness; browser startup and the navigation request remain subject to `Session.OperationTimeout` and the host context.
 When that budget expires, the page keeps loading and the call succeeds with `load_status: "timeout"`, a current-page `snapshot`, and an incomplete-load `warning`.
 The model can use the snapshot's element references immediately or call `browserWait` or `browserSnapshot` to check progress, without reopening or repeating navigation.
 If the current content cannot be read, `warning` includes the reason and the page remains available.
 See [examples/functions](examples/functions/main.go) for an adapter example.
+
+### Batch actions and richer observations
+
+`browserAct` executes up to 20 ordered actions and returns a final snapshot.
+Individual actions also return snapshots; `snapshot_error` means the action completed
+but its extra observation or wait failed, so callers should inspect the page before retrying.
+Use `browserSetChecked` for checked state, `browserDrag` for pointer or HTML5 drag and drop,
+and `browserNavigate` with `direction: "back"` or `"forward"` for history.
+`browserTabs` accepts `action: "list" | "activate" | "close" | "new" | "reload"`;
+the existing `browserActivateTab` and `browserCloseTab` tools remain available.
+Native JavaScript dialogs appear in `snapshot.dialogs`; call `browserHandleDialog`
+with the returned ID to explicitly accept or dismiss them.
+
+Snapshots report form values and state while masking sensitive values and applying text budgets.
+`include_screenshot` can attach an image to snapshots or actions; `screenshot_grid`
+on snapshots and `grid` on screenshots add CSS coordinate labels.
+Set `Config.DownloadDir` (or the CLI's `--download-dir`) to enable local downloads;
+remote CDP sessions do not support this download directory.
+The CLI also accepts `--upload-dir` for uploads.
+Custom `Page` implementations must adopt the extended action interface;
+see the [migration and compatibility notes](docs/keycode-browser-port.md).
 
 ### Generate and replay operation sequences
 
@@ -347,8 +368,9 @@ Snapshot results include native form labels, checkbox roles, and select options.
 `browserSelectOption` chooses a native select option by value or label;
 `browserScroll` sends a wheel event at the viewport center or supplied CSS coordinates.
 Snapshots also find controls in same-origin iframes and open shadow roots.
-Cross-origin iframe elements appear with role `frame` and `frame_url`; their
-contents remain outside the current page ref namespace.
+Cross-origin iframe elements appear with role `frame` and `frame_url`. Snapshots also
+include text and actionable controls from up to three visible cross-origin frames,
+including cross-site OOPIFs; frame controls use independent `f`-prefixed references.
 Set `Config.UploadDir` to expose `browserUploadFile` for regular files up to 10 MiB
 inside that directory; the tool returns the file name and size.
 Use `browserkit --allow-private-network --url http://127.0.0.1:8879/` to try

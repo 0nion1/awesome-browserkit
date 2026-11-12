@@ -44,6 +44,8 @@ browserkit --url 'https://example.com'
 - `--url`：所有模式均在所用浏览器中新建 Tab 并打开地址，不匹配或替换已有页面。
 - `--chrome`：new 模式的 Chrome 可执行文件路径。
 - `--devtools`：启用诊断函数。
+- `--upload-dir`：允许上传的本地目录。
+- `--download-dir`：开启本地下载并指定保存目录，不支持 attach 模式。
 - `--allow-evaluate`：启用 JavaScript 执行。
 - `--allow-private-network`：允许访问用户任务涉及的本机或私网页面。
 
@@ -59,12 +61,16 @@ attach 模式以及带 `--url` 的 new 模式会先输出一行 browserOpen 结�
 {"function":"browserSnapshot","arguments":{"session_id":"从启动结果获取","page_id":"从启动结果获取"}}
 ```
 
-先读取 Snapshot，再用返回的 ref 和 revision 操作元素。
+打开、导航和动作结果通常已经附带 snapshot，可直接使用其中的 ref 和 revision；缺少快照或需要完整正文时再调用 browserSnapshot。
+一组表单动作可用 browserAct 顺序执行，只返回最终快照；任一步失败立即停止，已执行步骤不会回滚。
+需要处理原生弹窗时，用 snapshot.dialogs 的 id 调用 browserHandleDialog 明确接受或取消。
+截图可通过 include_screenshot 随快照或动作一起返回，视觉任务可开启坐标网格，避免重复截图。
 ref 属于对应 page_id；引用失效时重新读取快照。
 `ok=false` 时先检查错误；可能已产生副作用的操作不得自动重试。
 截图返回文件路径，由宿主读取并展示。
 
-`browserkit --list-functions` 列出函数名称和说明，browserTabs 列出 Tab。
+`browserkit --list-functions` 列出函数名称和说明，browserTabs 默认列出 Tab，也支持 action=activate/close/new/reload；原有 browserActivateTab、browserCloseTab 仍可用。
+动作结果的 snapshot_error 只表示附加观测或等待失败，动作可能已完成，不得直接重放。
 每个进程最多两个 session，以便保留探索页面并在全新临时 profile 中执行序列回放；不用的 session 应及时调用 browserClose。旧 session_id、page_id 和 ref 不跨进程复用。
 
 ## 操作序列

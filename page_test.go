@@ -32,6 +32,17 @@ func TestContextWithTimeoutUsesConfiguredLimit(t *testing.T) {
 	}
 }
 
+func TestContextWithTimeoutCanceledContextReturnsCallableCancel(t *testing.T) {
+	parent, parentCancel := context.WithCancel(context.Background())
+	parentCancel()
+	_, cancel, err := contextWithTimeout(parent, time.Second)
+	if err == nil {
+		t.Fatal("已取消的 context 不应继续创建操作 context")
+	}
+	// Yaegi 无法把 CancelFunc 的裸 nil 结果包装成函数值；调用方仍需无条件调用。
+	cancel()
+}
+
 func TestViewportValidateBoundsRenderingResources(t *testing.T) {
 	for _, viewport := range []Viewport{{Width: 1, Height: 1}, {Width: 8_192, Height: 8_192}, {Width: 16_384, Height: 4_096}} {
 		if err := viewport.Validate(); err != nil {
@@ -101,7 +112,7 @@ func TestBrowserShortcutKeys(t *testing.T) {
 
 func TestAtomicClickUsesExplicitMouseSequence(t *testing.T) {
 	client := &recordingCDPClient{}
-	if err := dispatchAtomicClick(client, 120, 80); err != nil {
+	if err := dispatchAtomicClick(context.Background(), client, 120, 80, ClickOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	want := []proto.InputDispatchMouseEventType{
@@ -184,6 +195,38 @@ func TestMouseButtonMaskMatchesCDPButtons(t *testing.T) {
 	} {
 		if got := mouseButtonMask(button); got != want {
 			t.Fatalf("mouseButtonMask(%q)=%d want=%d", button, got, want)
+		}
+	}
+}
+
+func TestAxisAlignedQuadRejectsTransforms(t *testing.T) {
+	if !axisAlignedQuad([]float64{10, 20, 110, 20, 110, 60, 10, 60}) {
+		t.Fatal("轴对齐 quad 应被接受")
+	}
+	cases := map[string][]float64{
+		"旋转":   {10, 20, 110, 40, 90, 60, 10, 40},
+		"skew": {10, 20, 110, 45, 110, 60, 10, 35},
+		"镜像":   {110, 20, 10, 20, 10, 60, 110, 60},
+		"180度": {110, 60, 10, 60, 10, 20, 110, 20},
+		"长度不足": {10, 20, 30},
+	}
+	for name, quad := range cases {
+		if axisAlignedQuad(quad) {
+			t.Fatalf("%s quad 应被拒绝: %v", name, quad)
+		}
+	}
+}
+
+func TestPointInQuadBounds(t *testing.T) {
+	quad := []float64{10, 20, 110, 20, 110, 60, 10, 60}
+	for _, point := range [][2]float64{{10, 20}, {110, 60}, {60, 40}} {
+		if !pointInQuad(quad, point[0], point[1]) {
+			t.Fatalf("边界内点 %v 应命中", point)
+		}
+	}
+	for _, point := range [][2]float64{{9, 40}, {111, 40}, {60, 19}, {60, 61}} {
+		if pointInQuad(quad, point[0], point[1]) {
+			t.Fatalf("边界外点 %v 不应命中", point)
 		}
 	}
 }

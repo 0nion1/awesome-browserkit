@@ -10,6 +10,10 @@ export interface BrowserControls {
   newTab?: boolean
   /** 各 Tab 的关闭按钮。 */
   closeTab?: boolean
+  /** 浏览器历史后退按钮。 */
+  back?: boolean
+  /** 浏览器历史前进按钮。 */
+  forward?: boolean
   /** 刷新按钮。 */
   reload?: boolean
   /** 地址栏的前往按钮；地址栏回车仍可导航。 */

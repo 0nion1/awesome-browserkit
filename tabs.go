@@ -10,7 +10,7 @@ import (
 )
 
 func (manager *Manager) registerPage(current *session, value Page, viewport Viewport, opener string) *page {
-	entry := &page{id: manager.newID("page"), page: value, viewport: viewport, openerTabID: opener, status: "ready", refs: make(map[string]struct{}), injectedScripts: make(map[string]struct{})}
+	entry := &page{id: manager.newID("page"), page: value, viewport: viewport, openerTabID: opener, status: "ready", generation: 1, refs: make(map[string]struct{}), injectedScripts: make(map[string]struct{})}
 	if target, ok := value.(TargetPage); ok {
 		entry.targetID = target.TargetID()
 	}
@@ -68,9 +68,27 @@ func (manager *Manager) reconcileTabs(ctx context.Context, current *session) err
 		return nil
 	}
 	defer current.reconcileMu.Unlock()
+	return manager.reconcileTabsLocked(ctx, current)
+}
+
+// reconcileTabsWait 等待正在进行的 reconcile 完成后再同步一次。
+// 恢复已关闭的最后一个 Tab 时必须拿到最新 target 列表，不能因为
+// 另一次并发 reconcile 而误判为需要新建页面。
+func (manager *Manager) reconcileTabsWait(ctx context.Context, current *session) error {
+	if current == nil || current.browser == nil {
+		return nil
+	}
+	if err := lockInteraction(ctx, &current.reconcileMu); err != nil {
+		return err
+	}
+	defer current.reconcileMu.Unlock()
+	return manager.reconcileTabsLocked(ctx, current)
+}
+
+func (manager *Manager) reconcileTabsLocked(ctx context.Context, current *session) error {
 	// Tab 列表只是可重建的观察投影，整轮同步共用一个短预算；不能让每个
 	// CDP 子请求各自重新获得默认 30 秒并把一次状态刷新拖到数分钟。
-	reconcileCtx, cancel := context.WithTimeout(ctx, tabReconcileTimeout)
+	reconcileCtx, cancel := context.WithTimeout(ctx, manager.timing.tabReconcileTimeout)
 	defer cancel()
 	ctx = reconcileCtx
 	current.mu.Lock()
@@ -96,6 +114,8 @@ func (manager *Manager) reconcileTabs(ctx context.Context, current *session) err
 	}
 	current.mu.Unlock()
 	seen := make(map[string]bool, len(listed))
+	newTabFound := false
+	var newTargets []string
 	for _, info := range listed {
 		if err := contextErr(ctx); err != nil {
 			return err
@@ -138,7 +158,7 @@ func (manager *Manager) reconcileTabs(ctx context.Context, current *session) err
 			if bindErr != nil {
 				continue
 			}
-			viewport := defaultBrowserViewport
+			viewport := manager.timing.viewport
 			current.mu.Lock()
 			if current.closed {
 				current.mu.Unlock()
@@ -160,6 +180,8 @@ func (manager *Manager) reconcileTabs(ctx context.Context, current *session) err
 			current.mu.Unlock()
 			known[info.TargetID] = value
 			newTab = true
+			newTabFound = true
+			newTargets = append(newTargets, info.TargetID)
 			// 远端 target 激活和本地 activeTab 提交必须共用一个串行边界。
 			// 否则并发的用户切换可能先提交本地 page_id，随后又被这个较早的
 			// popup 激活请求覆盖，造成状态与真实 CDP target 分叉。
@@ -188,9 +210,13 @@ func (manager *Manager) reconcileTabs(ctx context.Context, current *session) err
 		}
 		current.mu.Lock()
 		previousURL := value.info.URL
+		previousTitle := value.info.Title
 		value.info = PageInfo{URL: info.URL, Title: info.Title}
 		if !newTab && value.status == "" {
 			value.status = "ready"
+		}
+		if previousURL != info.URL || previousTitle != info.Title {
+			value.generation++
 		}
 		if previousURL != "" && previousURL != info.URL {
 			// 外部导航同样会让该 Tab 的 ref 失效，不能只依赖
@@ -200,12 +226,25 @@ func (manager *Manager) reconcileTabs(ctx context.Context, current *session) err
 		current.mu.Unlock()
 		if previousURL != "" && previousURL != info.URL {
 			manager.emit(ctx, Event{Kind: "tab_updated", SessionID: current.id, PageID: value.id, URL: info.URL})
+			// CDP binding 不跨文档保留；外部导航后异步重新注册，
+			// 避免在 Tab 枚举的关键路径上增加一次 CDP 往返。
+			if binder, ok := browser.(TitleBindingSession); ok {
+				targetID := info.TargetID
+				go func() {
+					bindCtx, cancel := context.WithTimeout(current.ctx, time.Second)
+					defer cancel()
+					_ = binder.EnsureTitleBinding(bindCtx, targetID)
+				}()
+			}
 		}
 		if newTab {
 			if err := manager.autoStartPageDevtools(current, value); err != nil {
 				return err
 			}
 		}
+	}
+	if newTabFound && manager.externalBrowser() {
+		manager.adoptExternalActiveTab(ctx, current, browser, listed, newTargets)
 	}
 	current.mu.Lock()
 	stale := make([]*page, 0)
@@ -267,9 +306,9 @@ func (manager *Manager) awaitTabReady(current *session, value *page) {
 	if current != nil && current.ctx != nil {
 		base = current.ctx
 	}
-	ctx, cancel := context.WithTimeout(base, openIdleTimeout)
+	ctx, cancel := context.WithTimeout(base, manager.timing.openIdle)
 	defer cancel()
-	_, _ = waitPageIdle(ctx, value.page)
+	_, _ = waitPageIdle(ctx, value.page, manager.timing.openIdle)
 	current.mu.Lock()
 	if current.tabs[value.id] != value || current.closed {
 		current.mu.Unlock()
@@ -455,7 +494,7 @@ func (manager *Manager) SetViewport(ctx context.Context, request ViewportRequest
 	targetID := value.targetID
 	browser := current.browser
 	current.mu.Unlock()
-	if oldViewport == request.Viewport {
+	if !request.Force && oldViewport == request.Viewport {
 		return nil
 	}
 	viewportSession, ok := browser.(ViewportTabSession)
@@ -472,6 +511,8 @@ func (manager *Manager) SetViewport(ctx context.Context, request ViewportRequest
 		return browserError("page_not_found", "浏览器 page 不存在", "使用 browserTabs 返回的 page_id", true)
 	}
 	value.viewport = request.Viewport
+	// 旧视口坐标不能在尺寸切换后继续插值或投递。
+	invalidateInputsLocked(current)
 	current.lastUsed = time.Now()
 	current.mu.Unlock()
 	value.frameMu.Lock()
@@ -496,13 +537,11 @@ func (manager *Manager) ActivateTab(ctx context.Context, request TabRequest) (Ta
 	defer current.tabMu.Unlock()
 	current.mu.Lock()
 	beforeTabsRevision := tabsRevisionLocked(current)
-	wasActive := current.activeTab == request.PageID
 	targetID := value.targetID
 	viewport := value.viewport
 	browser := current.browser
 	info := value.info
 	current.mu.Unlock()
-	changed := !wasActive
 	if tabSession, ok := browser.(TabSession); ok && targetID != "" {
 		if err := tabSession.ActivateTab(ctx, targetID); err != nil {
 			return TabResponse{}, browserError("tab_activate_failed", "浏览器 Tab 激活失败: "+err.Error(), "重新获取 tablist 后重试", true)
@@ -513,7 +552,7 @@ func (manager *Manager) ActivateTab(ctx context.Context, request TabRequest) (Ta
 		current.mu.Unlock()
 		return TabResponse{}, browserError("page_not_found", "浏览器 page 不存在", "使用 browserTabs 返回的 page_id", true)
 	}
-	changed = current.activeTab != request.PageID
+	changed := current.activeTab != request.PageID
 	current.activeTab = request.PageID
 	if changed {
 		invalidateInputsLocked(current)
@@ -545,7 +584,7 @@ func (manager *Manager) ActivateTab(ctx context.Context, request TabRequest) (Ta
 	return TabResponse{SessionID: current.id, PageID: request.PageID, URL: info.URL, Title: info.Title, Active: true, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}, nil
 }
 
-// Navigate 在指定网页 Tab 中导航到地址。
+// Navigate 在指定网页 Tab 中导航到地址，或执行浏览器历史前进/后退/刷新。
 func (manager *Manager) Navigate(ctx context.Context, request NavigateRequest) (NavigateResponse, error) {
 	if manager == nil {
 		return NavigateResponse{}, browserError("browser_unavailable", "Browser Manager 不存在", "调用 NewManager 创建浏览器运行时", true)
@@ -553,12 +592,24 @@ func (manager *Manager) Navigate(ctx context.Context, request NavigateRequest) (
 	if err := contextErr(ctx); err != nil {
 		return NavigateResponse{}, err
 	}
-	if request.PageID == "" || strings.TrimSpace(request.URL) == "" {
-		return NavigateResponse{}, errors.New("browserNavigate 需要 page_id 和 url")
+	hasURL := strings.TrimSpace(request.URL) != ""
+	if request.PageID == "" || (!hasURL && request.Direction == "") {
+		return NavigateResponse{}, browserError("invalid_navigation", "browserNavigate 需要 page_id 和 url 或 direction", "提供 url，或使用 direction=back/forward/reload", true)
+	}
+	if hasURL && request.Direction != "" {
+		return NavigateResponse{}, browserError("invalid_navigation", "browserNavigate 的 url 和 direction 只能二选一", "只保留 url 或 direction 其中一个", true)
+	}
+	switch request.Direction {
+	case "", "back", "forward", "reload":
+	default:
+		return NavigateResponse{}, browserError("invalid_navigation", "browserNavigate 的 direction 只能是 back、forward 或 reload", "使用 back、forward 或 reload", true)
 	}
 	current, currentPage, err := manager.get(ctx, request.SessionID, request.PageID)
 	if err != nil {
 		return NavigateResponse{}, err
+	}
+	if pendingPageDialog(currentPage.page) != nil {
+		return NavigateResponse{}, newError("dialog_open", "页面存在待处理弹窗", "调用 browserSnapshot 获取 dialog id，再使用 browserHandleDialog", true)
 	}
 	current.mu.Lock()
 	beforeTabsRevision := tabsRevisionLocked(current)
@@ -567,39 +618,93 @@ func (manager *Manager) Navigate(ctx context.Context, request NavigateRequest) (
 	if err != nil {
 		return NavigateResponse{}, err
 	}
-	if err := manager.validateAddress(request.URL, info.URL); err != nil {
-		return NavigateResponse{}, err
+	historyURL := ""
+	if request.Direction == "back" || request.Direction == "forward" {
+		historyPage, ok := currentPage.page.(HistoryPage)
+		if !ok {
+			return NavigateResponse{}, browserError("history_unsupported", "当前 Page 不支持浏览器历史导航", "使用 browserNavigate 打开目标地址", true)
+		}
+		// 历史目标读取和导航与点击/输入共享交互锁，避免两者之间被并发操作
+		// 改变历史索引。
+		unlockHistory, lockErr := lockSessionInteraction(ctx, current)
+		if lockErr != nil {
+			return NavigateResponse{}, lockErr
+		}
+		entry, historyErr := historyPage.HistoryTarget(ctx, request.Direction)
+		if historyErr != nil {
+			unlockHistory()
+			return NavigateResponse{}, historyErr
+		}
+		historyURL = entry.URL
+		if err := manager.validateAddress(entry.URL, info.URL); err != nil {
+			unlockHistory()
+			return NavigateResponse{}, err
+		}
+		manager.emit(ctx, Event{Kind: "navigation_started", SessionID: current.id, PageID: currentPage.id, URL: entry.URL})
+		info, err = historyPage.NavigateHistory(ctx, entry)
+		unlockHistory()
+		if err != nil {
+			return NavigateResponse{}, err
+		}
+	} else {
+		target := request.URL
+		if request.Direction == "reload" {
+			target = info.URL
+		}
+		if err := manager.validateAddress(target, info.URL); err != nil {
+			return NavigateResponse{}, err
+		}
+		if parsed, parseErr := url.Parse(target); parseErr == nil && !parsed.IsAbs() {
+			base, _ := url.Parse(info.URL)
+			target = base.ResolveReference(parsed).String()
+		}
+		manager.emit(ctx, Event{Kind: "navigation_started", SessionID: current.id, PageID: currentPage.id, URL: target})
+		info, err = currentPage.page.Navigate(ctx, target)
+		if err != nil {
+			return NavigateResponse{}, err
+		}
 	}
-	target := request.URL
-	if parsed, parseErr := url.Parse(request.URL); parseErr == nil && !parsed.IsAbs() {
-		base, _ := url.Parse(info.URL)
-		target = base.ResolveReference(parsed).String()
-	}
-	manager.emit(ctx, Event{Kind: "navigation_started", SessionID: current.id, PageID: currentPage.id, URL: target})
-	info, err = currentPage.page.Navigate(ctx, target)
+	loadStatus, err := manager.pageLoadStatus(ctx, currentPage.page)
 	if err != nil {
 		return NavigateResponse{}, err
 	}
-	loadStatus, err := pageLoadStatus(ctx, currentPage.page)
-	if err != nil {
-		return NavigateResponse{}, err
+	if pendingPageDialog(currentPage.page) == nil {
+		info, err = currentPage.page.Info(ctx)
+		if err != nil {
+			return NavigateResponse{}, err
+		}
 	}
-	info, err = currentPage.page.Info(ctx)
-	if err != nil {
-		return NavigateResponse{}, err
+	if historyURL != "" && loadStatus == OpenLoadTimeout && info.URL != historyURL {
+		// 慢页面可能在历史项已切换但文档尚未提交时仍返回旧 URL；
+		// 此时保留目标 URL 和 timeout 警告，避免把旧页当成导航结果。
+		info = PageInfo{URL: historyURL}
 	}
 	current.mu.Lock()
 	clearPageRefs(currentPage)
+	currentPage.generation++
 	currentPage.info = info
 	currentPage.status = "ready"
 	current.mu.Unlock()
 	candidateID := recordSequenceStep(current, currentPage, SequenceStep{Type: "navigate", URL: info.URL}, "succeeded")
 	manager.emit(ctx, Event{Kind: "navigation_finished", SessionID: current.id, PageID: currentPage.id, URL: info.URL})
-	activePageID, tabsRevision, tabsChanged := manager.tabChange(ctx, current, beforeTabsRevision)
+	var activePageID string
+	var tabsRevision uint64
+	var tabsChanged bool
+	if pendingPageDialog(currentPage.page) != nil {
+		// 原生弹窗暂停 renderer；Tab 枚举是辅助投影，必须让路给
+		// browserSnapshot/browserHandleDialog，不能占用普通操作超时。
+		current.mu.Lock()
+		activePageID, tabsRevision, tabsChanged = tabChangeLocked(current, beforeTabsRevision)
+		current.mu.Unlock()
+	} else {
+		activePageID, tabsRevision, tabsChanged = manager.tabChange(ctx, current, beforeTabsRevision)
+	}
 	snapshot, warning := manager.loadSnapshot(ctx, current, currentPage, loadStatus)
-	response := NavigateResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
-	response.CandidateID = candidateID
-	return response, nil
+	title := info.Title
+	if title == "" && snapshot != nil {
+		title = snapshot.Title
+	}
+	return NavigateResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: title, LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged, Dialogs: pendingPageDialogs(currentPage.page), CandidateID: candidateID}, nil
 }
 
 // Reload 刷新指定网页 Tab 的当前地址。
@@ -639,7 +744,7 @@ func (manager *Manager) CloseTab(ctx context.Context, request TabRequest) (Close
 	if err := contextErr(ctx); err != nil {
 		return CloseTabResponse{}, err
 	}
-	current, value, err := manager.get(ctx, request.SessionID, request.PageID)
+	current, _, err := manager.get(ctx, request.SessionID, request.PageID)
 	if err != nil {
 		return CloseTabResponse{}, err
 	}
@@ -649,7 +754,7 @@ func (manager *Manager) CloseTab(ctx context.Context, request TabRequest) (Close
 	current.tabMu.Lock()
 	defer current.tabMu.Unlock()
 	current.mu.Lock()
-	value = current.tabs[request.PageID]
+	value := current.tabs[request.PageID]
 	if value == nil {
 		active := current.activeTab
 		revision := tabsRevisionLocked(current)
@@ -761,7 +866,7 @@ func (manager *Manager) NewTab(ctx context.Context, request OpenRequest) (OpenRe
 	}
 	viewport := request.Viewport
 	if viewport.Width <= 0 || viewport.Height <= 0 {
-		viewport = defaultBrowserViewport
+		viewport = manager.timing.viewport
 		if active := manager.activePageLocked(current); active != nil {
 			viewport = active.viewport
 		}
@@ -791,7 +896,86 @@ func (manager *Manager) NewTab(ctx context.Context, request OpenRequest) (OpenRe
 	manager.emit(ctx, Event{Kind: "tab_opened", SessionID: current.id, PageID: entry.id})
 	if request.URL != "" {
 		nav, err := manager.Navigate(ctx, NavigateRequest{SessionID: current.id, PageID: entry.id, URL: request.URL})
-		return OpenResponse{SessionID: current.id, PageID: entry.id, URL: nav.URL, Title: nav.Title, LoadStatus: nav.LoadStatus, Snapshot: nav.Snapshot, Warning: nav.Warning}, err
+		return OpenResponse{SessionID: current.id, PageID: entry.id, URL: nav.URL, Title: nav.Title, LoadStatus: nav.LoadStatus, Snapshot: nav.Snapshot, Warning: nav.Warning, Dialogs: nav.Dialogs}, err
 	}
-	return OpenResponse{SessionID: current.id, PageID: entry.id, LoadStatus: OpenLoadLoaded}, nil
+	return OpenResponse{SessionID: current.id, PageID: entry.id, LoadStatus: OpenLoadLoaded, Dialogs: pendingPageDialogs(entry.page)}, nil
+}
+
+// adoptExternalActiveTab 让 Manager 跟随外部浏览器真实激活的 target。
+// 外部浏览器由用户直接操作，Manager 不能主动 ActivateTab 抢焦点；网站新开
+// 的弹窗已经由 Chrome 激活，只有把该 target 同步为本地活动页，直播和状态
+// 投影才会立即跟随，而不是等用户手动切换或重新取控制权。
+func (manager *Manager) adoptExternalActiveTab(ctx context.Context, current *session, browser Session, listed []TabInfo, preferred []string) {
+	detector, ok := browser.(ActiveTabSession)
+	if !ok {
+		return
+	}
+	// 新弹窗通常就是当前焦点。先探测新 target，命中后可立即返回，
+	// 避免逐个检查旧 Tab 把活动页同步拖到数秒。
+	listed = preferredTargetOrder(listed, preferred)
+	targetID, err := detector.ActiveTab(ctx, listed)
+	if err != nil || targetID == "" {
+		return
+	}
+	current.mu.Lock()
+	var selected *page
+	for _, value := range current.tabs {
+		if value.targetID == targetID {
+			selected = value
+			break
+		}
+	}
+	current.mu.Unlock()
+	if selected == nil {
+		return
+	}
+	current.tabMu.Lock()
+	current.mu.Lock()
+	if current.closed || current.tabs[selected.id] != selected {
+		current.mu.Unlock()
+		current.tabMu.Unlock()
+		return
+	}
+	changed := current.activeTab != selected.id
+	if changed {
+		current.activeTab = selected.id
+		invalidateInputsLocked(current)
+	}
+	info := selected.info
+	current.mu.Unlock()
+	current.tabMu.Unlock()
+	if !changed {
+		return
+	}
+	manager.mu.Lock()
+	manager.active = current.id
+	manager.mu.Unlock()
+	manager.emit(ctx, Event{Kind: "tab_activated", SessionID: current.id, PageID: selected.id, URL: info.URL})
+}
+
+// preferredTargetOrder 把刚发现的 target 排到最前，保持其余顺序不变。
+func preferredTargetOrder(listed []TabInfo, preferred []string) []TabInfo {
+	if len(preferred) == 0 {
+		return listed
+	}
+	wanted := make(map[string]bool, len(preferred))
+	for _, targetID := range preferred {
+		wanted[targetID] = true
+	}
+	ordered := make([]TabInfo, 0, len(listed))
+	seen := make(map[string]bool, len(preferred))
+	for _, tab := range listed {
+		if !wanted[tab.TargetID] {
+			continue
+		}
+		ordered = append(ordered, tab)
+		seen[tab.TargetID] = true
+	}
+	// 新 target 之后保留其余 Tab 的原顺序，探测焦点时不能只看新页面。
+	for _, tab := range listed {
+		if !seen[tab.TargetID] {
+			ordered = append(ordered, tab)
+		}
+	}
+	return ordered
 }

@@ -25,7 +25,7 @@ func functionByName(t *testing.T, manager *Manager, name string) Function {
 }
 
 func TestFunctionsContract(t *testing.T) {
-	manager, _ := fakeManager(t, Config{AllowEvaluate: true, AllowDevtools: true})
+	manager, _ := fakeManager(t, Config{AllowEvaluate: true, AllowDevtools: true, UploadDir: t.TempDir(), DownloadDir: t.TempDir()})
 	defer manager.Close(context.Background())
 	var contract strings.Builder
 	names := map[string]bool{}
@@ -65,7 +65,7 @@ func TestFunctionsFollowCapabilitiesAndDoNotShareCatalog(t *testing.T) {
 	for _, config := range []Config{{}, {AllowEvaluate: true}, {AllowDevtools: true}, {AllowEvaluate: true, AllowDevtools: true}} {
 		manager, _ := fakeManager(t, config)
 		functions := manager.Functions()
-		expected := 22
+		expected := 26
 		if config.AllowEvaluate {
 			expected += 2
 		}
@@ -93,7 +93,7 @@ func TestFunctionsFollowCapabilitiesAndDoNotShareCatalog(t *testing.T) {
 }
 
 func TestFunctionParametersHaveDescriptions(t *testing.T) {
-	manager, _ := fakeManager(t, Config{AllowEvaluate: true, AllowDevtools: true, UploadDir: t.TempDir()})
+	manager, _ := fakeManager(t, Config{AllowEvaluate: true, AllowDevtools: true, UploadDir: t.TempDir(), DownloadDir: t.TempDir()})
 	defer manager.Close(context.Background())
 	var check func(reflect.Type, string)
 	check = func(typ reflect.Type, path string) {
@@ -126,12 +126,24 @@ func TestFunctionParametersHaveDescriptions(t *testing.T) {
 func TestUploadFunctionRequiresConfiguredDirectory(t *testing.T) {
 	manager, _ := fakeManager(t, Config{UploadDir: t.TempDir()})
 	defer manager.Close(context.Background())
-	if len(manager.Functions()) != 23 {
+	if len(manager.Functions()) != 27 {
 		t.Fatalf("配置上传目录后的函数数量=%d", len(manager.Functions()))
 	}
 	function := functionByName(t, manager, "browserUploadFile")
 	if reflect.TypeOf(function.Handler).In(1) != reflect.TypeFor[UploadFileRequest]() {
 		t.Fatalf("上传函数签名无效: %T", function.Handler)
+	}
+}
+
+func TestDownloadFunctionRequiresConfiguredDirectory(t *testing.T) {
+	manager, _ := fakeManager(t, Config{DownloadDir: t.TempDir()})
+	defer manager.Close(context.Background())
+	if len(manager.Functions()) != 27 {
+		t.Fatalf("配置下载目录后的函数数量=%d", len(manager.Functions()))
+	}
+	function := functionByName(t, manager, "browserDownload")
+	if reflect.TypeOf(function.Handler).In(1) != reflect.TypeFor[DownloadRequest]() {
+		t.Fatalf("下载函数签名无效: %T", function.Handler)
 	}
 }
 
@@ -147,20 +159,18 @@ func TestFunctionsShareManagerAndRequireExplicitTargets(t *testing.T) {
 	if err != nil || view.ActivePageID != opened.PageID {
 		t.Fatalf("函数与宿主视图没有共用状态：%+v %v", view, err)
 	}
-	tabs := functionByName(t, manager, "browserTabs").Handler.(func(context.Context, TabsRequest) (TabsResponse, error))
-	if _, err := tabs(context.Background(), TabsRequest{}); err == nil {
+	tabs := functionByName(t, manager, "browserTabs").Handler.(func(context.Context, TabActionRequest) (TabActionResponse, error))
+	if _, err := tabs(context.Background(), TabActionRequest{}); err == nil {
 		t.Fatal("模型函数接受了空 session_id")
 	}
-	for _, name := range []string{"browserActivateTab", "browserCloseTab"} {
-		handler := reflect.ValueOf(functionByName(t, manager, name).Handler)
-		for _, request := range []TabRequest{{}, {SessionID: opened.SessionID}, {PageID: opened.PageID}} {
-			results := handler.Call([]reflect.Value{reflect.ValueOf(context.Background()), reflect.ValueOf(request)})
-			if results[1].IsNil() {
-				t.Fatalf("%s 接受了缺少目标的请求", name)
+	for _, action := range []string{"activate", "close", "reload"} {
+		for _, request := range []TabActionRequest{{SessionID: opened.SessionID, Action: action}, {SessionID: opened.SessionID, Action: action, PageID: "missing"}} {
+			if _, err := tabs(context.Background(), request); err == nil {
+				t.Fatalf("browserTabs %s 接受了缺少或无效的目标", action)
 			}
 		}
 	}
-	listed, err := tabs(context.Background(), TabsRequest{SessionID: opened.SessionID})
+	listed, err := tabs(context.Background(), TabActionRequest{SessionID: opened.SessionID, Action: "list"})
 	if err != nil || len(listed.Tabs) != 1 {
 		t.Fatalf("无效工具调用改变了会话：%+v %v", listed, err)
 	}

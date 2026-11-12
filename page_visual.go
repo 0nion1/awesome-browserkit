@@ -25,6 +25,27 @@ func (page *rodPage) Screenshot(ctx context.Context, options ScreenshotOptions) 
 	if err := page.activate(operationCtx); err != nil {
 		return Screenshot{}, err
 	}
+	// FullPage 截图在 Chromium 中可能把窗口滚动位置重置到顶部。先把
+	// 可见滚动位置记下来，截图后恢复；区域截图没有这个副作用。
+	var scroll struct {
+		X float64 `json:"x"`
+		Y float64 `json:"y"`
+	}
+	var haveScroll bool
+	if options.FullPage {
+		if result, evalErr := page.page.Context(operationCtx).Eval(`() => ({x: window.scrollX || 0, y: window.scrollY || 0})`); evalErr == nil {
+			haveScroll = result.Value.Unmarshal(&scroll) == nil
+		}
+	}
+	// 无论截图成功、失败还是超时，都尝试恢复原滚动位置；恢复使用独立
+	// 的短 context，避免 operationCtx 已经耗尽时静默丢失位置。
+	if options.FullPage && haveScroll {
+		defer func() {
+			restoreCtx, cancel := context.WithTimeout(page.page.GetContext(), time.Second)
+			defer cancel()
+			_, _ = page.page.Context(restoreCtx).Eval(`(point) => { window.scrollTo({left: point.x, top: point.y, behavior: 'instant'}) }`, scroll)
+		}()
+	}
 	data, err := page.page.Context(operationCtx).Screenshot(options.FullPage, &proto.PageCaptureScreenshot{Format: proto.PageCaptureScreenshotFormatPng})
 	if err != nil {
 		return Screenshot{}, err
@@ -77,6 +98,12 @@ func (page *rodPage) StartScreencast(ctx context.Context, options ScreencastOpti
 	wait := streamPage.EachEvent(func(event *proto.PageScreencastFrame) {
 		callbackMu.Lock()
 		defer callbackMu.Unlock()
+		// 帧回调由 CDP 事件循环调用，不能让插件 panic 终止 Executor。
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				cancel()
+			}
+		}()
 		frame := Screenshot{Data: event.Data, Format: "jpeg"}
 		// 只保留最新一帧，避免 CDP 生产速度超过消费速度时积压旧画面。
 		select {
@@ -110,10 +137,13 @@ func (page *rodPage) StartScreencast(ctx context.Context, options ScreencastOpti
 	}
 	setupCancel()
 	go func() {
+		defer func() {
+			_ = recover()
+			callbackMu.Lock()
+			close(frames)
+			callbackMu.Unlock()
+		}()
 		wait()
-		callbackMu.Lock()
-		close(frames)
-		callbackMu.Unlock()
 	}()
 	return frames, stop, nil
 }

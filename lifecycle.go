@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+// Busy 报告尚未关闭的浏览器资源；断开观看不会销毁页面，也不能视为升级空闲。
+func (manager *Manager) Busy() bool {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	return manager.opening > 0 || len(manager.sessions) > 0
+}
+
 func (manager *Manager) sessionLocked(sessionID string) *session {
 	if sessionID != "" {
 		return manager.sessions[sessionID]
@@ -117,6 +124,64 @@ func (manager *Manager) reclaimIdleSessions() {
 			_ = manager.closeSession(context.Background(), current)
 		}
 	}
+}
+
+// watchConnection 在底层 CDP 连接失效时摘除会话。
+// 不能把会话 context 放进 select：连接失效会同时取消它，可能让真正的
+// 回收分支被跳过。正常关闭时 Manager 已先摘除会话，这里会安全返回。
+func (manager *Manager) watchConnection(current *session) {
+	if manager == nil || current == nil {
+		return
+	}
+	source, ok := current.browser.(ConnectionSession)
+	if !ok {
+		return
+	}
+	done := source.Done()
+	if done == nil {
+		return
+	}
+	go func() {
+		select {
+		case <-manager.lifecycleCtx.Done():
+			return
+		case <-done:
+		}
+		manager.sessionLost(current)
+	}()
+}
+
+// sessionLost 把断开的浏览器会话从活动表摘除，并通知状态观察者清空 Tab。
+func (manager *Manager) sessionLost(current *session) {
+	if manager == nil || current == nil {
+		return
+	}
+	manager.mu.Lock()
+	if manager.stopped || manager.sessions[current.id] != current {
+		manager.mu.Unlock()
+		return
+	}
+	delete(manager.sessions, current.id)
+	manager.closed[current.id] = struct{}{}
+	if manager.active == current.id {
+		manager.active = ""
+	}
+	manager.mu.Unlock()
+
+	manager.forgetSequenceReplays(current.id)
+	current.mu.Lock()
+	current.closed = true
+	cancel := current.cancel
+	current.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	// 会话已经从 Manager 摘除，不会再由 Close 回收；这里必须关闭底层连接，
+	// 让自建浏览器进程和临时 profile 也能释放。
+	go func() { _ = current.browser.Close() }()
+	manager.stopLive()
+	manager.emit(context.Background(), Event{Kind: "session_closed", SessionID: current.id})
+	manager.notifyDevtools()
 }
 
 func (manager *Manager) closeSession(ctx context.Context, current *session) error {

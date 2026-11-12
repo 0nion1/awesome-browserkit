@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +30,8 @@ type SessionConfig struct {
 	UserDataDir        string
 	CleanupUserDataDir bool
 	InsecureDomains    []string
+	// DownloadDir 是本地浏览器允许下载的目录；留空时禁用下载。
+	DownloadDir string
 	// OperationTimeout 限制每次 BrowserKit 操作的最长执行时间；省略时使用 30 秒。
 	OperationTimeout time.Duration
 	requestPolicy    *browserNetworkPolicy
@@ -75,6 +79,24 @@ type ActiveTabSession interface {
 	ActiveTab(context.Context, []TabInfo) (string, error)
 }
 
+// TabChangeSession 是可选能力：浏览器 target 创建、销毁或元数据变化时发出通知。
+// 通知不携带 target 详情，消费方应重新枚举 Tab；通道容量为一，连续变化会合并。
+type TabChangeSession interface {
+	TabChanges() <-chan struct{}
+}
+
+// TitleBindingSession 是可选能力：target 导航后重新注册标题变化上报。
+// CDP binding 不跨文档保留，导航会产生新的执行上下文。
+type TitleBindingSession interface {
+	EnsureTitleBinding(context.Context, string) error
+}
+
+// ConnectionSession 是可选能力：底层 CDP 连接失效时关闭 Done。
+// Manager 据此摘除会话，避免继续返回已经失效的缓存 Tab。
+type ConnectionSession interface {
+	Done() <-chan struct{}
+}
+
 // ViewportTabSession 是可为已有 Tab 设置页面视口的可选能力。
 type ViewportTabSession interface {
 	TabSession
@@ -101,6 +123,15 @@ type rodSession struct {
 	closed            atomic.Bool
 	closeOnce         sync.Once
 	stopNetworkPolicy func()
+	downloadMu        sync.Mutex
+	downloadCallMu    sync.Mutex
+	downloadFrames    map[string]*downloadWaiter
+	downloadGuids     map[string]*downloadWaiter
+	downloadActive    map[*downloadWaiter]bool
+	tabEventsOnce     sync.Once
+	tabChanges        chan struct{}
+	connectionDone    chan struct{}
+	connectionOnce    sync.Once
 }
 
 const defaultOperationTimeout = 30 * time.Second
@@ -139,6 +170,24 @@ func NewSession(ctx context.Context, config SessionConfig) (result Session, err 
 	address := strings.TrimSpace(config.RemoteAddress)
 	if address == "" {
 		address = strings.TrimSpace(config.ExecPath)
+	}
+	if config.DownloadDir != "" && (config.RemoteAddress != "" || isRemoteAddress(address)) {
+		return nil, errors.New("Browser DownloadDir 只支持本地浏览器")
+	}
+	if config.DownloadDir != "" {
+		resolved, resolveErr := filepath.EvalSymlinks(config.DownloadDir)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("Browser DownloadDir 无效: %w", resolveErr)
+		}
+		absolute, absErr := filepath.Abs(resolved)
+		if absErr != nil {
+			return nil, fmt.Errorf("Browser DownloadDir 无效: %w", absErr)
+		}
+		info, statErr := os.Stat(absolute)
+		if statErr != nil || !info.IsDir() {
+			return nil, errors.New("Browser DownloadDir 必须是目录")
+		}
+		config.DownloadDir = absolute
 	}
 	var client *cdp.Client
 	var transport *boundedWebSocket
@@ -185,7 +234,10 @@ func NewSession(ctx context.Context, config SessionConfig) (result Session, err 
 		} else {
 			launch.Set("no-sandbox")
 		}
-		launch.Set("disable-downloads").Set("disable-background-networking").Set("disable-extensions")
+		if config.DownloadDir == "" {
+			launch.Set("disable-downloads")
+		}
+		launch.Set("disable-background-networking").Set("disable-extensions")
 		launch.Set("no-first-run").Set("no-default-browser-check").Set("disable-popup-blocking")
 		if len(config.InsecureDomains) > 0 {
 			launch.Set("unsafely-treat-insecure-origin-as-secure", strings.Join(config.InsecureDomains, ","))
@@ -244,7 +296,8 @@ func NewSession(ctx context.Context, config SessionConfig) (result Session, err 
 	}
 	// Rod 当前没有下载策略的高层包装，只能使用 CDP Browser 域；调用使用
 	// startupCtx，避免初始化阶段无限等待（此处是初始化期唯一的 Browser
-	// 域 proto 调用）。
+	// 域 proto 调用）。本地浏览器默认禁用下载；browserDownload 只在单次
+	// 调用期间临时允许并绑定下载事件。
 	if ownsLauncher {
 		if err := (proto.BrowserSetDownloadBehavior{Behavior: proto.BrowserSetDownloadBehaviorBehaviorDeny}).Call(browser.Context(startupCtx)); err != nil {
 			cancel()
@@ -257,12 +310,28 @@ func NewSession(ctx context.Context, config SessionConfig) (result Session, err 
 			if launch != nil && ownsLauncher {
 				launch.Kill()
 			}
-			return nil, fmt.Errorf("禁用浏览器下载: %w", err)
+			return nil, fmt.Errorf("设置浏览器下载策略: %w", err)
 		}
 	}
-	return &rodSession{browser: browser, launcher: launch, ownsLauncher: ownsLauncher,
+	session := &rodSession{browser: browser, launcher: launch, ownsLauncher: ownsLauncher,
 		cleanup: profile.cleanup, operationTimeout: config.OperationTimeout,
-		cancel: cancel, transport: transport, pages: make(map[proto.TargetTargetID]*rodPage), stopNetworkPolicy: stopNetworkPolicy}, nil
+		cancel: cancel, transport: transport, pages: make(map[proto.TargetTargetID]*rodPage), stopNetworkPolicy: stopNetworkPolicy,
+		connectionDone: make(chan struct{})}
+	if transport != nil {
+		// CDP WebSocket 断开后 Rod 仍可能保留缓存的 target 映射；先标记会话
+		// 失效并通知 Manager，避免状态接口继续返回已经无法操作的 Tab。
+		go func() {
+			<-transport.Done()
+			session.markClosed()
+		}()
+	}
+	if config.DownloadDir != "" {
+		session.downloadFrames = make(map[string]*downloadWaiter)
+		session.downloadGuids = make(map[string]*downloadWaiter)
+		session.downloadActive = make(map[*downloadWaiter]bool)
+		session.startDownloadWatcher()
+	}
+	return session, nil
 }
 
 func isRemoteAddress(address string) bool {
@@ -303,6 +372,8 @@ func (session *rodSession) NewPage(ctx context.Context, options PageOptions) (Pa
 		return nil, fmt.Errorf("绑定浏览器页面: %w", err)
 	}
 	result := &rodPage{page: page, refs: make(map[string]struct{}), operationTimeout: session.operationTimeout, cancel: pageCancel, owner: session}
+	result.startDialogWatcher()
+	result.registerTitleBindingAsync()
 	if options.Viewport.Width != 0 || options.Viewport.Height != 0 {
 		if err := options.Viewport.Validate(); err != nil {
 			_ = result.Close(operationCtx)
@@ -393,9 +464,23 @@ func (session *rodSession) forgetPage(page *rodPage) {
 	session.pagesMu.Unlock()
 }
 
+// connectionUsable 检查 CDP 传输是否仍然可用；断开时立即标记会话关闭。
+func (session *rodSession) connectionUsable() bool {
+	if session == nil || session.transport == nil {
+		return true
+	}
+	select {
+	case <-session.transport.Done():
+		session.markClosed()
+		return false
+	default:
+		return true
+	}
+}
+
 // ListTabs 返回当前浏览器中的网页 target。非 page target（扩展、iframe、worker 等）会被过滤。
 func (session *rodSession) ListTabs(ctx context.Context) ([]TabInfo, error) {
-	if session == nil || session.closed.Load() || session.browser == nil {
+	if session == nil || session.closed.Load() || session.browser == nil || !session.connectionUsable() {
 		return nil, newError("session_closed", "浏览器 session 已关闭", "重新调用 browserOpen 创建 session", true)
 	}
 	if err := contextErr(ctx); err != nil {
@@ -420,6 +505,64 @@ func (session *rodSession) ListTabs(ctx context.Context) ([]TabInfo, error) {
 		tabs = append(tabs, TabInfo{TargetID: string(target.TargetID), URL: target.URL, Title: target.Title, Type: string(target.Type), OpenerID: string(target.OpenerID)})
 	}
 	return tabs, nil
+}
+
+// TabChanges 启动一次浏览器级 target 事件监听，并返回合并后的变化通知。
+// 监听覆盖新开、关闭和标题/URL 变化；调用方只需在收到通知后重新枚举 Tab。
+func (session *rodSession) TabChanges() <-chan struct{} {
+	if session == nil {
+		return nil
+	}
+	session.tabEventsOnce.Do(func() {
+		session.tabChanges = make(chan struct{}, 1)
+		if session.browser == nil {
+			return
+		}
+		notify := func() {
+			select {
+			case session.tabChanges <- struct{}{}:
+			default:
+			}
+		}
+		wait := session.browser.EachEvent(
+			func(*proto.TargetTargetCreated) { notify() },
+			func(*proto.TargetTargetDestroyed) { notify() },
+			func(*proto.TargetTargetInfoChanged) { notify() },
+			func(event *proto.RuntimeBindingCalled) {
+				if event.Name == titleBindingName {
+					notify()
+				}
+			},
+		)
+		go wait()
+	})
+	return session.tabChanges
+}
+
+// registerTitleBinding 在页面 session 中注册标题变化上报入口。
+// 失败只影响标题推送的及时性，不能阻塞页面创建。
+func registerTitleBinding(ctx context.Context, page *rod.Page) {
+	if page == nil {
+		return
+	}
+	_ = (proto.RuntimeAddBinding{Name: titleBindingName}).Call(page.Context(ctx))
+}
+
+// EnsureTitleBinding 在 target 导航后重新注册标题变化上报。
+func (session *rodSession) EnsureTitleBinding(ctx context.Context, targetID string) error {
+	if session == nil || session.closed.Load() || session.browser == nil {
+		return nil
+	}
+	operationCtx, operationCancel, err := session.ctx(ctx)
+	if err != nil {
+		return err
+	}
+	defer operationCancel()
+	page := session.knownPage(proto.TargetTargetID(targetID))
+	if page == nil || page.page == nil {
+		return nil
+	}
+	return (proto.RuntimeAddBinding{Name: titleBindingName}).Call(page.page.Context(operationCtx))
 }
 
 // ActiveTab 使用短生命周期 CDP session 探测页面焦点；探测完成后立即 detach，
@@ -470,18 +613,6 @@ type tabFocusState struct {
 	Visible bool `json:"visible"`
 }
 
-type targetSessionClient struct {
-	ctx       context.Context
-	browser   *rod.Browser
-	sessionID proto.TargetSessionID
-}
-
-func (client targetSessionClient) GetContext() context.Context         { return client.ctx }
-func (client targetSessionClient) GetSessionID() proto.TargetSessionID { return client.sessionID }
-func (client targetSessionClient) Call(ctx context.Context, sessionID, method string, params any) ([]byte, error) {
-	return client.browser.Call(ctx, sessionID, method, params)
-}
-
 func (session *rodSession) probeTabState(ctx context.Context, targetID proto.TargetTargetID) (state tabFocusState, err error) {
 	attached, err := (proto.TargetAttachToTarget{TargetID: targetID, Flatten: true}).Call(session.browser.Context(ctx))
 	if err != nil {
@@ -497,7 +628,7 @@ func (session *rodSession) probeTabState(ctx context.Context, targetID proto.Tar
 			err = fmt.Errorf("释放 Tab 探测 session: %w", cleanupErr)
 		}
 	}()
-	probe := targetSessionClient{ctx: ctx, browser: session.browser, sessionID: attached.SessionID}
+	probe := cdpSessionClient{ctx: ctx, client: session.browser, sessionID: attached.SessionID}
 	result, err := (proto.RuntimeEvaluate{
 		Expression:    `({focused: document.hasFocus(), visible: document.visibilityState === "visible"})`,
 		ReturnByValue: true,
@@ -540,6 +671,8 @@ func (session *rodSession) PageForTab(ctx context.Context, targetID string) (Pag
 		return nil, err
 	}
 	result := &rodPage{page: page, refs: make(map[string]struct{}), operationTimeout: session.operationTimeout, cancel: pageCancel, owner: session}
+	result.startDialogWatcher()
+	result.registerTitleBindingAsync()
 	if err := result.AddScriptToEvaluateOnNewDocument(ctx, pageStateObserverScript); err != nil {
 		result.release()
 		return nil, fmt.Errorf("注册页面状态观察器: %w", err)
@@ -614,7 +747,7 @@ func viewportParams(viewport Viewport) *proto.EmulationSetDeviceMetricsOverride 
 
 // CloseTab 关闭指定网页 target，不影响同一浏览器 session 的其他 Tab。
 func (session *rodSession) CloseTab(ctx context.Context, targetID string) error {
-	if session == nil || session.closed.Load() || session.browser == nil {
+	if session == nil || session.closed.Load() || session.browser == nil || !session.connectionUsable() {
 		return newError("session_closed", "浏览器 session 已关闭", "重新调用 browserOpen 创建 session", true)
 	}
 	if err := contextErr(ctx); err != nil {
@@ -673,12 +806,32 @@ func (session *rodSession) Cookies() ([]Cookie, error) {
 	return result, nil
 }
 
+// Done 在 CDP 连接失效或会话关闭时关闭。
+func (session *rodSession) Done() <-chan struct{} {
+	if session == nil {
+		return nil
+	}
+	return session.connectionDone
+}
+
+// markClosed 标记连接已经不可用，并唤醒 Manager 的失效回收。
+func (session *rodSession) markClosed() {
+	if session == nil {
+		return
+	}
+	session.closed.Store(true)
+	session.connectionOnce.Do(func() { close(session.connectionDone) })
+	if session.cancel != nil {
+		session.cancel()
+	}
+}
+
 func (session *rodSession) Close() error {
 	if session == nil {
 		return nil
 	}
 	session.closeOnce.Do(func() {
-		session.closed.Store(true)
+		session.markClosed()
 		if session.stopNetworkPolicy != nil {
 			session.stopNetworkPolicy()
 		}

@@ -24,14 +24,20 @@ func (manager *Manager) Snapshot(ctx context.Context, request SnapshotRequest) (
 	}
 	// Snapshot 是 调用方读取 Tab 的同步点：先从浏览器枚举 target，再选择
 	// active page。这样省略 page_id 时不会沿用上一次工具调用的页面。
-	current, _, err := manager.get(ctx, request.SessionID, "")
+	current, currentPage, err := manager.get(ctx, request.SessionID, request.PageID)
 	if err != nil {
 		return SnapshotResponse{}, err
 	}
+	if response, ok := manager.pendingDialogSnapshot(current, currentPage); ok {
+		return response, nil
+	}
 	if err := manager.reconcileTabs(ctx, current); err != nil {
+		if response, ok := manager.pendingDialogSnapshot(current, currentPage); ok {
+			return response, nil
+		}
 		return SnapshotResponse{}, err
 	}
-	current, currentPage, err := manager.get(ctx, request.SessionID, request.PageID)
+	current, currentPage, err = manager.get(ctx, request.SessionID, request.PageID)
 	if err != nil {
 		return SnapshotResponse{}, err
 	}
@@ -39,16 +45,84 @@ func (manager *Manager) Snapshot(ctx context.Context, request SnapshotRequest) (
 		return SnapshotResponse{}, errors.New("browserSnapshot 的 max_chars、max_elements 和 offset 无效")
 	}
 
-	return manager.snapshotPage(ctx, current, currentPage, SnapshotOptions{MaxChars: request.MaxChars, MaxElements: request.MaxElements, Offset: request.Offset})
-}
-
-func (manager *Manager) snapshotPage(ctx context.Context, current *session, currentPage *page, options SnapshotOptions) (SnapshotResponse, error) {
-	snapshot, err := currentPage.page.Snapshot(ctx, options)
+	response, err := manager.snapshotPage(ctx, current, currentPage, SnapshotOptions{MaxChars: request.MaxChars, MaxElements: request.MaxElements, Offset: request.Offset})
 	if err != nil {
 		return SnapshotResponse{}, err
 	}
+	if request.IncludeScreenshot {
+		if len(response.Dialogs) > 0 {
+			response.ScreenshotError = "页面存在待处理弹窗；先调用 browserHandleDialog，再请求截图"
+			return response, nil
+		}
+		shot, shotErr := manager.Screenshot(ctx, ScreenshotRequest{SessionID: request.SessionID, PageID: response.PageID, Grid: request.ScreenshotGrid})
+		if shotErr != nil {
+			response.ScreenshotError = shotErr.Error()
+		} else {
+			response.Screenshot = &shot
+		}
+	}
+	return response, nil
+}
+
+func (manager *Manager) snapshotPage(ctx context.Context, current *session, currentPage *page, options SnapshotOptions) (SnapshotResponse, error) {
+	if response, ok := manager.pendingDialogSnapshot(current, currentPage); ok {
+		return response, nil
+	}
 	current.mu.Lock()
-	rememberSnapshotRefs(currentPage, snapshot)
+	generation := currentPage.generation
+	current.mu.Unlock()
+	type snapshotResult struct {
+		snapshot Snapshot
+		err      error
+	}
+	changes := dialogChanges(currentPage.page)
+	var snapshot Snapshot
+	var err error
+	if changes == nil {
+		snapshot, err = currentPage.page.Snapshot(ctx, options)
+	} else {
+		readCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		if response, ok := manager.pendingDialogSnapshot(current, currentPage); ok {
+			return response, nil
+		}
+		result := make(chan snapshotResult, 1)
+		go func() {
+			value, snapshotErr := currentPage.page.Snapshot(readCtx, options)
+			result <- snapshotResult{snapshot: value, err: snapshotErr}
+		}()
+		select {
+		case value := <-result:
+			snapshot, err = value.snapshot, value.err
+		case <-changes:
+			cancel()
+			if response, ok := manager.pendingDialogSnapshot(current, currentPage); ok {
+				return response, nil
+			}
+			err = errors.New("页面弹窗状态发生变化")
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+	}
+	if err != nil {
+		if response, ok := manager.pendingDialogSnapshot(current, currentPage); ok {
+			return response, nil
+		}
+		return SnapshotResponse{}, err
+	}
+	current.mu.Lock()
+	// generation 在导航、外部 Tab 更新时单调递增。快照读取期间页面已经
+	// 变化时，只把结果返回给调用方，不能用旧 URL 和旧 refs 覆盖新投影。
+	if currentPage.generation == generation {
+		if snapshot.Revision >= currentPage.refRevision {
+			currentPage.info = snapshot.Info
+			currentPage.status = "ready"
+			rememberSnapshotRefs(currentPage, snapshot)
+			cached := snapshot
+			cached.Elements = append([]Element(nil), snapshot.Elements...)
+			currentPage.lastSnapshot = &cached
+		}
+	}
 	tabsRevision := tabsRevisionLocked(current)
 	tabsChanged := !current.snapshotInitialized || current.snapshotRevision != tabsRevision
 	current.snapshotRevision = tabsRevision
@@ -56,7 +130,55 @@ func (manager *Manager) snapshotPage(ctx context.Context, current *session, curr
 	activePageID := current.activeTab
 	tabs := tabViewsLocked(current)
 	current.mu.Unlock()
-	return SnapshotResponse{SessionID: current.id, PageID: currentPage.id, Revision: snapshot.Revision, URL: snapshot.Info.URL, Title: snapshot.Info.Title, Text: snapshot.Text, Elements: snapshot.Elements, Truncated: snapshot.Truncated, NextOffset: options.Offset + len(snapshot.Elements), ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged, Tabs: tabs}, nil
+	// 自定义 Page 可能尚未设置 PaginationKnown；满页时沿用旧的
+	// next_offset 推断，避免第三方实现的分页静默停止。
+	effectiveMaxElements := options.MaxElements
+	if effectiveMaxElements <= 0 {
+		effectiveMaxElements = 100
+	} else if effectiveMaxElements > maxSnapshotElements {
+		effectiveMaxElements = maxSnapshotElements
+	}
+	hasMore := snapshot.HasMore
+	if !snapshot.PaginationKnown && len(snapshot.Elements) == effectiveMaxElements {
+		hasMore = true
+	}
+	nextOffset := 0
+	if hasMore {
+		nextOffset = options.Offset + len(snapshot.Elements)
+	}
+	return SnapshotResponse{SessionID: current.id, PageID: currentPage.id, Revision: snapshot.Revision, URL: snapshot.Info.URL, Title: snapshot.Info.Title, Text: snapshot.Text, Elements: snapshot.Elements, Truncated: snapshot.Truncated, TextTruncated: snapshot.TextTruncated, NextOffset: nextOffset, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged, Tabs: tabs}, nil
+}
+
+// pendingDialogSnapshot 在 renderer 被原生弹窗暂停时返回最近一次成功页面投影，
+// 并把当前弹窗作为页面状态附加；它不读取 DOM，也不消费弹窗。
+func (manager *Manager) pendingDialogSnapshot(current *session, currentPage *page) (SnapshotResponse, bool) {
+	if current == nil || currentPage == nil {
+		return SnapshotResponse{}, false
+	}
+	dialog := pendingPageDialog(currentPage.page)
+	if dialog == nil {
+		return SnapshotResponse{}, false
+	}
+	current.mu.Lock()
+	response := SnapshotResponse{
+		SessionID: current.id, PageID: currentPage.id,
+		URL: currentPage.info.URL, Title: currentPage.info.Title,
+		Revision: currentPage.refRevision,
+		Elements: []Element{}, Dialogs: []Dialog{*dialog},
+		ActivePageID: current.activeTab, TabsRevision: tabsRevisionLocked(current),
+		Tabs: tabViewsLocked(current),
+	}
+	if currentPage.lastSnapshot != nil {
+		cached := currentPage.lastSnapshot
+		response.Revision = cached.Revision
+		response.URL, response.Title = cached.Info.URL, cached.Info.Title
+		response.Text = cached.Text
+		response.Elements = append([]Element(nil), cached.Elements...)
+		response.Truncated = cached.Truncated
+		response.TextTruncated = cached.TextTruncated
+	}
+	current.mu.Unlock()
+	return response, true
 }
 
 // Click 执行浏览器页面操作，使用普通 context 和明确目标。
@@ -70,11 +192,22 @@ func (manager *Manager) Click(ctx context.Context, request ClickRequest) (ClickR
 		return ClickResponse{}, err
 	}
 
+	if _, _, err := clickParameters(ClickOptions{Button: request.Button, ClickCount: request.ClickCount}); err != nil {
+		return ClickResponse{}, err
+	}
+
 	current, currentPage, err := manager.get(operationCtx, request.SessionID, request.PageID)
 	if err != nil {
 		return ClickResponse{}, err
 	}
-	if request.Ref == "" || request.Revision == 0 {
+	pointMode := request.Ref == ""
+	if pointMode {
+		if request.X == nil || request.Y == nil {
+			return ClickResponse{}, errors.New("browserClick 需要 ref 或 x/y")
+		}
+	} else if request.X != nil || request.Y != nil {
+		return ClickResponse{}, errors.New("browserClick 的 ref 与 x/y 只能二选一")
+	} else if request.Revision == 0 {
 		return ClickResponse{}, errors.New("browserClick 需要 ref 和 revision")
 	}
 	if request.WaitAfterMS < 0 {
@@ -88,24 +221,66 @@ func (manager *Manager) Click(ctx context.Context, request ClickRequest) (ClickR
 	defer unlockInteraction()
 	current.mu.Lock()
 	beforeTabsRevision := tabsRevisionLocked(current)
-	refErr := validatePageRef(currentPage, request.Ref, request.Revision)
+	beforeActive := current.activeTab
+	refErr := error(nil)
+	if !pointMode {
+		refErr = validatePageRef(currentPage, request.Ref, request.Revision)
+	}
 	current.mu.Unlock()
 	if refErr != nil {
 		return ClickResponse{}, refErr
 	}
-	if err := currentPage.page.Click(operationCtx, ElementRef{Ref: request.Ref, Revision: request.Revision}); err != nil {
-		return ClickResponse{}, err
-	}
-	if request.WaitAfterMS > 0 {
-		if err := waitContext(operationCtx, time.Duration(request.WaitAfterMS)*time.Millisecond); err != nil {
+	if pointMode {
+		current.mu.Lock()
+		viewport := currentPage.viewport
+		current.mu.Unlock()
+		if err := validateViewportPoint(viewport, *request.X, *request.Y); err != nil {
 			return ClickResponse{}, err
 		}
+		pointer, ok := currentPage.page.(PointClickPage)
+		if !ok {
+			return ClickResponse{}, browserError("click_point_unsupported", "当前浏览器页面不支持按坐标点击", "使用快照 ref 或实现 PointClickPage", true)
+		}
+		if err := pointer.ClickPoint(operationCtx, *request.X, *request.Y, ClickOptions{Button: request.Button, ClickCount: request.ClickCount}); err != nil {
+			return ClickResponse{}, err
+		}
+	} else if err := currentPage.page.Click(operationCtx, ElementRef{Ref: request.Ref, Revision: request.Revision}, ClickOptions{Button: request.Button, ClickCount: request.ClickCount}); err != nil {
+		return ClickResponse{}, err
 	}
-	candidateID := recordSequenceStep(current, currentPage, SequenceStep{Type: "click", Locator: locatorForSequenceElement(element), WaitAfterMS: request.WaitAfterMS}, "succeeded")
+	var waitErr error
+	if request.WaitAfterMS > 0 {
+		waitErr = waitContext(operationCtx, time.Duration(request.WaitAfterMS)*time.Millisecond)
+	}
+	candidateID := ""
+	// 既有序列格式只表达默认的元素单击；不能把坐标、右键或双击
+	// 偷换成回放时的左键单击。
+	if !pointMode && (request.Button == "" || request.Button == "left") && request.ClickCount <= 1 {
+		candidateID = recordSequenceStep(current, currentPage, SequenceStep{Type: "click", Locator: locatorForSequenceElement(element), WaitAfterMS: request.WaitAfterMS}, "succeeded")
+	}
 	manager.emit(operationCtx, Event{Kind: "interaction_finished", SessionID: current.id, PageID: currentPage.id})
 	unlockInteraction()
 	activePageID, tabsRevision, tabsChanged := manager.tabChange(operationCtx, current, beforeTabsRevision)
 	response := ClickResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, Changed: true, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged, CandidateID: candidateID}
+	response.Snapshot, response.SnapshotError = manager.actionSnapshot(operationCtx, current, currentPage)
+	if waitErr != nil {
+		notice := "click 已执行，wait_after_ms 未完成（" + waitErr.Error() + "）；页面可能仍在加载，不要重放点击，可继续 browserWait 或 browserSnapshot 检查"
+		if response.SnapshotError != "" {
+			notice = response.SnapshotError + "；" + notice
+		}
+		response.SnapshotError = notice
+	}
+	if request.IncludeScreenshot {
+		pageID := request.PageID
+		if activePageID != "" && activePageID != beforeActive && activePageID != request.PageID {
+			pageID = activePageID
+		}
+		shot, shotErr := manager.Screenshot(operationCtx, ScreenshotRequest{SessionID: request.SessionID, PageID: pageID})
+		if shotErr != nil {
+			response.ScreenshotError = shotErr.Error()
+		} else {
+			response.Screenshot = &shot
+		}
+	}
 	return response, nil
 }
 
@@ -148,7 +323,9 @@ func (manager *Manager) Hover(ctx context.Context, request HoverRequest) (HoverR
 	}
 	unlockInteraction()
 	activePageID, tabsRevision, tabsChanged := manager.tabChange(operationCtx, current, beforeTabsRevision)
-	return HoverResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}, nil
+	response := HoverResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
+	response.Snapshot, response.SnapshotError = manager.actionSnapshot(operationCtx, current, currentPage)
+	return response, nil
 }
 
 // Type 执行浏览器页面操作，使用普通 context 和明确目标。
@@ -191,7 +368,7 @@ func (manager *Manager) typeElement(ctx context.Context, request TypeRequest, re
 		return TypeResponse{}, err
 	}
 	if request.Submit {
-		if err := currentPage.page.Press(ctx, "Enter"); err != nil {
+		if err := currentPage.page.Press(ctx, PressOptions{Key: "Enter"}); err != nil {
 			return TypeResponse{}, err
 		}
 	}
@@ -202,6 +379,7 @@ func (manager *Manager) typeElement(ctx context.Context, request TypeRequest, re
 	unlockInteraction()
 	activePageID, tabsRevision, tabsChanged := manager.tabChange(ctx, current, beforeTabsRevision)
 	response := TypeResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, TextLength: len([]rune(request.Text)), Submitted: request.Submit, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged, CandidateID: candidateID}
+	response.Snapshot, response.SnapshotError = manager.actionSnapshot(ctx, current, currentPage)
 	return response, nil
 }
 
@@ -242,7 +420,9 @@ func (manager *Manager) SelectOption(ctx context.Context, request SelectOptionRe
 	}
 	unlockInteraction()
 	activePageID, tabsRevision, tabsChanged := manager.tabChange(ctx, current, beforeTabsRevision)
-	return SelectOptionResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, Value: value, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}, nil
+	response := SelectOptionResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, Value: value, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
+	response.Snapshot, response.SnapshotError = manager.actionSnapshot(ctx, current, currentPage)
+	return response, nil
 }
 
 // Press 执行浏览器页面操作，使用普通 context 和明确目标。
@@ -254,12 +434,19 @@ func (manager *Manager) Press(ctx context.Context, request PressRequest) (PressR
 		return PressResponse{}, err
 	}
 
+	if _, err := pressParameters(PressOptions{Key: request.Key, Modifiers: request.Modifiers}); err != nil {
+		return PressResponse{}, err
+	}
+	if (request.Ref == "") != (request.Revision == 0) {
+		return PressResponse{}, errors.New("browserPress 的 ref 和 revision 必须一起提供")
+	}
+	var targetRef *ElementRef
+	if request.Ref != "" {
+		targetRef = &ElementRef{Ref: request.Ref, Revision: request.Revision}
+	}
 	current, currentPage, err := manager.get(ctx, request.SessionID, request.PageID)
 	if err != nil {
 		return PressResponse{}, err
-	}
-	if request.Key == "" {
-		return PressResponse{}, errors.New("browserPress 需要 key")
 	}
 	unlockInteraction, err := lockSessionInteraction(ctx, current)
 	if err != nil {
@@ -268,13 +455,21 @@ func (manager *Manager) Press(ctx context.Context, request PressRequest) (PressR
 	defer unlockInteraction()
 	current.mu.Lock()
 	beforeTabsRevision := tabsRevisionLocked(current)
+	var refErr error
+	if targetRef != nil {
+		refErr = validatePageRef(currentPage, targetRef.Ref, targetRef.Revision)
+	}
 	current.mu.Unlock()
-	if err := currentPage.page.Press(ctx, request.Key); err != nil {
+	if refErr != nil {
+		return PressResponse{}, refErr
+	}
+	if err := currentPage.page.Press(ctx, PressOptions{Key: request.Key, Modifiers: request.Modifiers, Ref: targetRef}); err != nil {
 		return PressResponse{}, err
 	}
 	unlockInteraction()
 	activePageID, tabsRevision, tabsChanged := manager.tabChange(ctx, current, beforeTabsRevision)
 	response := PressResponse{SessionID: current.id, PageID: currentPage.id, Key: request.Key, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
+	response.Snapshot, response.SnapshotError = manager.actionSnapshot(ctx, current, currentPage)
 	return response, nil
 }
 
@@ -328,7 +523,11 @@ func (manager *Manager) Scroll(ctx context.Context, request ScrollRequest) (Scro
 		return ScrollResponse{}, err
 	}
 	manager.emit(ctx, Event{Kind: "interaction_finished", SessionID: current.id, PageID: currentPage.id})
-	return ScrollResponse{SessionID: current.id, PageID: currentPage.id, DeltaX: request.DeltaX, DeltaY: request.DeltaY, X: x, Y: y}, nil
+	unlockInteraction()
+	_ = manager.reconcileTabs(ctx, current)
+	response := ScrollResponse{SessionID: current.id, PageID: currentPage.id, DeltaX: request.DeltaX, DeltaY: request.DeltaY, X: x, Y: y}
+	response.Snapshot, response.SnapshotError = manager.actionSnapshot(ctx, current, currentPage)
+	return response, nil
 }
 
 // tabChange 在交互返回前刷新一次真实 Tab 列表，并返回模型需要立即
@@ -376,15 +575,79 @@ func (manager *Manager) Wait(ctx context.Context, request WaitRequest) (WaitResp
 				return WaitResponse{}, browserError("stale_reference", "元素引用已经过期", "在目标 page_id 上重新调用 browserSnapshot", true)
 			}
 			selector = `[data-browserkit-ref="` + strings.ReplaceAll(strings.ReplaceAll(request.RefOrSelector, `\`, `\\`), `"`, `\"`) + `"]`
+			if request.Condition == "selector_visible" {
+				// 批量步骤可能已删除元素，但 manager 的 ref 投影直到批次结束
+				// 才更新。先确认 ref 仍在 DOM 中，避免把一个明确的失效引用
+				// 等成超时。自定义 Page 未实现时保持原有等待语义。
+				if checker, ok := currentPage.page.(RefAwarePage); ok {
+					// 这是一次可选的加速检查：读取失败时退回正常等待，
+					// 避免把页面导航中的瞬时错误变成 wait 失败。检查只使用
+					// 剩余预算的一小部分，防止大 DOM 预检吃掉全部等待时间。
+					if budget, ok := refCheckBudget(waitCtx); ok {
+						checkCtx, checkCancel := context.WithTimeout(waitCtx, budget)
+						exists, existsErr := checker.HasRef(checkCtx, selector)
+						checkCancel()
+						if existsErr == nil && !exists {
+							return WaitResponse{}, browserError("stale_reference", "元素已从页面移除", "重新调用 browserSnapshot；若元素会被异步删除，改用 CSS selector", true)
+						}
+					}
+				}
+			}
 		} else if request.Revision != 0 || isSnapshotRef(request.RefOrSelector) {
 			return WaitResponse{}, browserError("invalid_reference", "当前 Tab 没有该元素引用", "在目标 page_id 上重新调用 browserSnapshot", true)
 		}
 	}
 	if err := currentPage.page.Wait(waitCtx, WaitOptions{Condition: request.Condition, Selector: selector}); err != nil {
+		// 调用方主动取消或父 context 到期保持原始语义；请求期限和页面
+		// OperationTimeout 才转成可重试的 wait_timeout。
+		if ctx.Err() != nil {
+			return WaitResponse{}, ctx.Err()
+		}
+		if errors.Is(err, context.DeadlineExceeded) || waitCtx.Err() == context.DeadlineExceeded {
+			return WaitResponse{}, waitTimeoutError(request.Condition, request.RefOrSelector)
+		}
 		return WaitResponse{}, err
 	}
 	response := WaitResponse{SessionID: current.id, PageID: currentPage.id, Condition: request.Condition, Completed: true}
 	return response, nil
+}
+
+func refCheckBudget(ctx context.Context) (time.Duration, bool) {
+	const maxBudget = 50 * time.Millisecond
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return maxBudget, true
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return 0, false
+	}
+	budget := remaining / 4
+	if budget > maxBudget {
+		budget = maxBudget
+	}
+	// 预算太小时预检本身就可能吃掉整个等待窗口；直接跳过，
+	// 让真正的条件检查使用完整剩余时间。
+	if budget < 10*time.Millisecond {
+		return 0, false
+	}
+	return budget, true
+}
+
+func waitTimeoutError(condition, target string) *Error {
+	if target == "" {
+		target = "页面加载"
+	}
+	advice := "确认目标内容是否出现"
+	switch condition {
+	case "selector_hidden":
+		advice = "确认元素是否已经隐藏或从 DOM 移除"
+	case "load_complete":
+		advice = "确认页面是否仍在加载"
+	}
+	message := "等待条件 " + condition + " 超时：" + target + "。" + advice
+	next := "必要时查看 browserSnapshot；需要更长等待时同时增大 timeout_ms 和浏览器 OperationTimeout"
+	return &Error{Kind: "wait_timeout", Message: message, RecommendedNextStep: next, Recoverable: true}
 }
 
 // isSnapshotRef 只识别 BrowserKit 生成的 e<token>_<number> 形式。
@@ -445,7 +708,7 @@ func (manager *Manager) Evaluate(ctx context.Context, request EvaluateRequest) (
 		return EvaluateResponse{}, browserError("result_too_large", "JavaScript 返回值超过大小限制", "只返回必要的 JSON 摘要", true)
 	}
 	manager.emit(ctx, Event{Kind: "evaluation_finished", SessionID: current.id, PageID: currentPage.id})
-	response := EvaluateResponse{SessionID: current.id, PageID: currentPage.id, Type: result.Type, Value: result.Value}
+	response := EvaluateResponse{SessionID: current.id, PageID: currentPage.id, Type: result.Type, Value: result.Value, Dialogs: pendingPageDialogs(currentPage.page)}
 	return response, nil
 }
 
@@ -457,6 +720,9 @@ func (manager *Manager) Screenshot(ctx context.Context, request ScreenshotReques
 	if err := requirePage(request.SessionID, request.PageID, "browserScreenshot"); err != nil {
 		return ScreenshotResponse{}, err
 	}
+	if request.Grid && request.FullPage {
+		return ScreenshotResponse{}, errors.New("grid 截图不支持 full_page；请截取视口或 region")
+	}
 
 	current, currentPage, err := manager.get(ctx, request.SessionID, request.PageID)
 	if err != nil {
@@ -465,6 +731,12 @@ func (manager *Manager) Screenshot(ctx context.Context, request ScreenshotReques
 	screenshot, err := manager.captureScreenshot(ctx, current, currentPage, ScreenshotOptions{FullPage: request.FullPage})
 	if err != nil {
 		return ScreenshotResponse{}, err
+	}
+	if request.Grid {
+		size := screenshotDimensions(screenshot.Data)
+		if size.Width*size.Height > maxGridPixels {
+			return ScreenshotResponse{}, errors.New("网格截图尺寸超过限制")
+		}
 	}
 	if request.Region != nil {
 		if request.FullPage {
@@ -480,12 +752,64 @@ func (manager *Manager) Screenshot(ctx context.Context, request ScreenshotReques
 	if err != nil {
 		return ScreenshotResponse{}, err
 	}
+	size := screenshotDimensions(screenshot.Data)
+	width := size.Width
+	height := size.Height
+	current.mu.Lock()
+	viewport := currentPage.viewport
+	current.mu.Unlock()
+	if request.Grid {
+		originX, originY := 0.0, 0.0
+		regionWidth := float64(width)
+		regionHeight := float64(height)
+		if request.Region != nil {
+			originX, originY = request.Region.X, request.Region.Y
+			regionWidth, regionHeight = request.Region.Width, request.Region.Height
+		} else if !request.FullPage && viewport.Width > 0 && viewport.Height > 0 {
+			regionWidth = float64(viewport.Width)
+			regionHeight = float64(viewport.Height)
+		}
+		annotated, gridErr := annotateGrid(screenshot.Data, originX, originY, regionWidth, regionHeight)
+		if gridErr != nil {
+			return ScreenshotResponse{}, gridErr
+		}
+		screenshot.Data = annotated
+	}
 	if err := os.WriteFile(path, screenshot.Data, 0o600); err != nil {
 		return ScreenshotResponse{}, err
 	}
-
+	size = screenshotDimensions(screenshot.Data)
+	width = size.Width
+	height = size.Height
 	manager.emit(ctx, Event{Kind: "screenshot_ready", SessionID: current.id, PageID: currentPage.id})
-	return ScreenshotResponse{SessionID: current.id, PageID: currentPage.id, Path: path, Format: screenshot.Format, Bytes: len(screenshot.Data), Data: screenshot.Data}, nil
+	return ScreenshotResponse{SessionID: current.id, PageID: currentPage.id, Path: path, Format: screenshot.Format, Bytes: len(screenshot.Data), Data: screenshot.Data, Width: width, Height: height, ViewportWidth: viewport.Width, ViewportHeight: viewport.Height}, nil
+}
+
+func validateViewportPoint(viewport Viewport, x, y float64) error {
+	if err := validateInputPoint(x, y); err != nil {
+		return err
+	}
+	if viewport.Width > 0 && x >= float64(viewport.Width) {
+		return errors.New("坐标超出视口宽度")
+	}
+	if viewport.Height > 0 && y >= float64(viewport.Height) {
+		return errors.New("坐标超出视口高度")
+	}
+	return nil
+}
+
+type imageDimensions struct {
+	Width  int
+	Height int
+}
+
+// screenshotDimensions 读取 PNG 头，避免为尺寸解码整张图片。
+func screenshotDimensions(data []byte) imageDimensions {
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return imageDimensions{}
+	}
+	return imageDimensions{Width: config.Width, Height: config.Height}
 }
 
 func cropScreenshot(data []byte, region ScreenshotRegion) ([]byte, error) {

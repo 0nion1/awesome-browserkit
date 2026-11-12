@@ -43,7 +43,7 @@ func TestRealBrowserLoadingTimeoutReturnsCurrentContent(t *testing.T) {
 	defer cancel()
 	check := func(status OpenLoadStatus, warning string, snapshot *SnapshotResponse) {
 		t.Helper()
-		if status != OpenLoadTimeout || !strings.Contains(warning, "2 秒") || snapshot == nil || !strings.Contains(snapshot.Text, "当前已可读") {
+		if status != OpenLoadTimeout || !strings.Contains(warning, "总计 3 秒") || snapshot == nil || !strings.Contains(snapshot.Text, "当前已可读") {
 			t.Fatalf("未返回超时提醒与当前内容：status=%s warning=%s snapshot=%+v", status, warning, snapshot)
 		}
 		for _, element := range snapshot.Elements {
@@ -75,8 +75,8 @@ func TestRealBrowserLoadingTimeoutReturnsCurrentContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	elapsed := time.Since(started)
-	if elapsed < 1800*time.Millisecond || elapsed > 3500*time.Millisecond {
-		t.Fatalf("加载等待未限定为 2 秒：%s", elapsed)
+	if elapsed < 2800*time.Millisecond || elapsed > 4500*time.Millisecond {
+		t.Fatalf("加载等待未限定为总计 3 秒：%s", elapsed)
 	}
 	check(navigated.LoadStatus, navigated.Warning, navigated.Snapshot)
 	t.Logf("导航用时 %s，页面仍在加载时可继续操作", elapsed)

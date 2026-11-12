@@ -59,5 +59,9 @@ func (manager *Manager) UploadFile(ctx context.Context, request UploadFileReques
 		return UploadFileResponse{}, err
 	}
 	manager.emit(ctx, Event{Kind: "interaction_finished", SessionID: current.id, PageID: currentPage.id})
-	return UploadFileResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, FileName: filepath.Base(path), Bytes: info.Size()}, nil
+	unlock()
+	_ = manager.reconcileTabs(ctx, current)
+	response := UploadFileResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, FileName: filepath.Base(path), Bytes: info.Size()}
+	response.Snapshot, response.SnapshotError = manager.actionSnapshot(ctx, current, currentPage)
+	return response, nil
 }

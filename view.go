@@ -155,14 +155,15 @@ func (manager *Manager) View(ctx context.Context) (BrowserViewState, error) {
 	// viewport；不要再调用 LiveState 重复枚举 target 和读取 TargetInfo。
 	list, err := manager.ListTabs(ctx, TabsRequest{})
 	if err != nil {
-		var browserErr *Error
-		if errors.As(err, &browserErr) && (browserErr.Kind == "session_closed" || browserErr.Kind == "session_not_found" || browserErr.Kind == "browser_closed") {
+		// ListTabs 直接返回生命周期错误；解释类型不经原生 errors.As 的反射校验。
+		browserErr, ok := err.(*Error)
+		if ok && (browserErr.Kind == "session_closed" || browserErr.Kind == "session_not_found" || browserErr.Kind == "browser_closed") {
 			// Browser session 一旦从 Manager 的活动表中摘除，ListTabs 返回
 			// session_not_found。对 Web 临时视图而言这和 session_closed 是
 			// 同一终态，必须显式发送 tabs: []，让前端丢弃旧 Tab 和最后帧。
 			return BrowserViewState{Closed: true, Tabs: []BrowserTabView{}}, nil
 		}
-		if errors.As(err, &browserErr) && browserErr.Kind == "page_not_found" {
+		if ok && browserErr.Kind == "page_not_found" {
 			return BrowserViewState{Available: false, Tabs: []BrowserTabView{}}, nil
 		}
 		// CDP 在导航、target 切换和页面刚建立时可能暂时无法读取状态；

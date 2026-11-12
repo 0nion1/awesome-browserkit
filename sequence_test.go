@@ -353,3 +353,31 @@ func TestSequenceReplayRejectsMalformedDefinitionsBeforeOpeningBrowser(t *testin
 		t.Fatalf("校验失败前不应启动浏览器，实际启动 %d 次", openCount)
 	}
 }
+
+func TestSequenceDoesNotMisrecordExtendedClicks(t *testing.T) {
+	manager, _ := fakeManager(t, Config{})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.StartSequence(context.Background(), SequenceStartRequest{SessionID: opened.SessionID, PageID: opened.PageID, Goal: "Inspect"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, y := 10.0, 20.0
+	for _, request := range []ClickRequest{
+		{SessionID: opened.SessionID, PageID: opened.PageID, X: &x, Y: &y},
+		{SessionID: opened.SessionID, PageID: opened.PageID, Ref: "e1", Revision: 1, Button: "right"},
+		{SessionID: opened.SessionID, PageID: opened.PageID, Ref: "e1", Revision: 1, ClickCount: 2},
+	} {
+		response, err := manager.Click(context.Background(), request)
+		if err != nil || response.CandidateID != "" {
+			t.Fatalf("extended click misrecorded: response=%+v err=%v", response, err)
+		}
+	}
+	draft, err := manager.ReadSequence(context.Background(), SequenceReadRequest{SessionID: opened.SessionID})
+	if err != nil || len(draft.Candidates) != 1 {
+		t.Fatalf("invalid replay candidates: %+v err=%v", draft, err)
+	}
+}

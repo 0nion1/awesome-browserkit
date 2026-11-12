@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -21,6 +22,10 @@ func TestRealBrowserOwnsAndRemovesLocalProfile(t *testing.T) {
 	}
 	root := t.TempDir()
 	t.Setenv("TMPDIR", root)
+	if runtime.GOOS == "windows" {
+		t.Setenv("TMP", root)
+		t.Setenv("TEMP", root)
+	}
 	sessionValue, err := NewSession(context.Background(), SessionConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +47,11 @@ func TestRealBrowserOwnsAndRemovesLocalProfile(t *testing.T) {
 }
 
 func TestRealBrowserProfileIdentityMatchesRequests(t *testing.T) {
-	if _, ok := launcher.LookPath(); !ok {
+	binary := os.Getenv("BROWSERKIT_BROWSER_EXECUTABLE")
+	if binary == "" {
+		binary, _ = launcher.LookPath()
+	}
+	if binary == "" {
 		t.Skip("本机没有 Chrome")
 	}
 	headers := make(chan http.Header, 1)
@@ -55,7 +64,7 @@ func TestRealBrowserProfileIdentityMatchesRequests(t *testing.T) {
 	}))
 	defer site.Close()
 	ctx := context.Background()
-	sessionValue, err := NewSession(ctx, SessionConfig{})
+	sessionValue, err := NewSession(ctx, SessionConfig{ExecPath: binary})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,15 +76,20 @@ func TestRealBrowserProfileIdentityMatchesRequests(t *testing.T) {
 	if _, err := page.Navigate(ctx, site.URL); err != nil {
 		t.Fatal(err)
 	}
-	result, err := page.Evaluate(ctx, `({ua:navigator.userAgent, webdriver:navigator.webdriver, language:navigator.language, platform:navigator.platform})`, EvaluateOptions{})
+	result, err := page.Evaluate(ctx, `({ua:navigator.userAgent, webdriver:navigator.webdriver, language:navigator.language, platform:navigator.platform, uaPlatform:navigator.userAgentData.platform, brands:navigator.userAgentData.brands})`, EvaluateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var identity struct {
-		UA        string `json:"ua"`
-		Webdriver bool   `json:"webdriver"`
-		Language  string `json:"language"`
-		Platform  string `json:"platform"`
+		UA         string `json:"ua"`
+		Webdriver  bool   `json:"webdriver"`
+		Language   string `json:"language"`
+		Platform   string `json:"platform"`
+		UAPlatform string `json:"uaPlatform"`
+		Brands     []struct {
+			Brand   string `json:"brand"`
+			Version string `json:"version"`
+		} `json:"brands"`
 	}
 	if err := json.Unmarshal(result.Value, &identity); err != nil {
 		t.Fatal(err)
@@ -86,5 +100,19 @@ func TestRealBrowserProfileIdentityMatchesRequests(t *testing.T) {
 	}
 	if !strings.Contains(requestHeaders.Get("Sec-Ch-Ua"), "v=\""+strings.Split(strings.Split(identity.UA, "Chrome/")[1], ".")[0]+"\"") {
 		t.Fatalf("Client Hints 主版本与 UA 不一致：%q / %q", requestHeaders.Get("Sec-Ch-Ua"), identity.UA)
+	}
+	if requestHeaders.Get("Sec-Ch-Ua-Platform") != `"`+identity.UAPlatform+`"` {
+		t.Fatalf("Client Hints 平台与页面身份不一致：%+v / %v", identity, requestHeaders)
+	}
+	for _, brand := range identity.Brands {
+		if !strings.Contains(requestHeaders.Get("Sec-Ch-Ua"), `"`+brand.Brand+`";v="`+brand.Version+`"`) {
+			t.Fatalf("Client Hints 品牌与页面身份不一致：%+v / %v", identity, requestHeaders)
+		}
+		if brand.Brand == "Chromium" && !strings.Contains(identity.UA, "Chrome/"+brand.Version+".0.0.0") || brand.Brand == "Microsoft Edge" && !strings.HasSuffix(identity.UA, " Edg/"+brand.Version+".0.0.0") {
+			t.Fatalf("UA 未保留浏览器品牌或版本：%+v / %v", identity, requestHeaders)
+		}
+	}
+	if runtime.GOOS == "windows" && (!strings.Contains(identity.UA, "Windows NT 10.0; Win64; x64") || identity.Platform != "Win32" || identity.UAPlatform != "Windows") {
+		t.Fatalf("Windows 浏览器身份不一致：%+v", identity)
 	}
 }

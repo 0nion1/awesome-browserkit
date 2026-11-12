@@ -580,7 +580,8 @@ func (manager *Manager) Navigate(ctx context.Context, request NavigateRequest) (
 	if err != nil {
 		return NavigateResponse{}, err
 	}
-	if _, err := waitPageIdle(ctx, currentPage.page); err != nil {
+	loadStatus, err := pageLoadStatus(ctx, currentPage.page)
+	if err != nil {
 		return NavigateResponse{}, err
 	}
 	info, err = currentPage.page.Info(ctx)
@@ -595,7 +596,8 @@ func (manager *Manager) Navigate(ctx context.Context, request NavigateRequest) (
 	candidateID := recordSequenceStep(current, currentPage, SequenceStep{Type: "navigate", URL: info.URL}, "succeeded")
 	manager.emit(ctx, Event{Kind: "navigation_finished", SessionID: current.id, PageID: currentPage.id, URL: info.URL})
 	activePageID, tabsRevision, tabsChanged := manager.tabChange(ctx, current, beforeTabsRevision)
-	response := NavigateResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
+	snapshot, warning := manager.loadSnapshot(ctx, current, currentPage, loadStatus)
+	response := NavigateResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
 	response.CandidateID = candidateID
 	return response, nil
 }
@@ -789,7 +791,7 @@ func (manager *Manager) NewTab(ctx context.Context, request OpenRequest) (OpenRe
 	manager.emit(ctx, Event{Kind: "tab_opened", SessionID: current.id, PageID: entry.id})
 	if request.URL != "" {
 		nav, err := manager.Navigate(ctx, NavigateRequest{SessionID: current.id, PageID: entry.id, URL: request.URL})
-		return OpenResponse{SessionID: current.id, PageID: entry.id, URL: nav.URL, Title: nav.Title, LoadStatus: OpenLoadLoaded}, err
+		return OpenResponse{SessionID: current.id, PageID: entry.id, URL: nav.URL, Title: nav.Title, LoadStatus: nav.LoadStatus, Snapshot: nav.Snapshot, Warning: nav.Warning}, err
 	}
 	return OpenResponse{SessionID: current.id, PageID: entry.id, LoadStatus: OpenLoadLoaded}, nil
 }

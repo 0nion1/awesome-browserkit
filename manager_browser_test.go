@@ -110,6 +110,9 @@ type fakePage struct {
 	evaluatedScripts []string
 	idleCalled       bool
 	idleErr          error
+	idleTimeout      time.Duration
+	waitErr          error
+	snapshotErr      error
 	navigateResult   *PageInfo
 	inputMu          sync.Mutex
 	inputBlock       <-chan struct{}
@@ -153,7 +156,7 @@ func (page *fakePage) Navigate(_ context.Context, address string) (PageInfo, err
 	return page.info, nil
 }
 func (page *fakePage) Snapshot(context.Context, SnapshotOptions) (Snapshot, error) {
-	return Snapshot{Info: page.info, Revision: 1, Text: "hello", Elements: []Element{{Ref: "e1", Role: "button", Name: "Save", Locator: ElementLocator{Selector: "#save", XPath: `//*[@id="save"]`, Role: "button", Name: "Save"}}}}, nil
+	return Snapshot{Info: page.info, Revision: 1, Text: "hello", Elements: []Element{{Ref: "e1", Role: "button", Name: "Save", Locator: ElementLocator{Selector: "#save", XPath: `//*[@id="save"]`, Role: "button", Name: "Save"}}}}, page.snapshotErr
 }
 func (page *fakePage) Click(_ context.Context, ref ElementRef) error {
 	page.lastRef = ref
@@ -172,10 +175,11 @@ func (page *fakePage) Press(context.Context, string) error { return nil }
 func (page *fakePage) Wait(_ context.Context, options WaitOptions) error {
 	page.waitCalled = true
 	page.waitOptions = options
-	return nil
+	return page.waitErr
 }
-func (page *fakePage) WaitIdle(context.Context, time.Duration) error {
+func (page *fakePage) WaitIdle(_ context.Context, timeout time.Duration) error {
 	page.idleCalled = true
+	page.idleTimeout = timeout
 	return page.idleErr
 }
 func (page *fakePage) Screenshot(context.Context, ScreenshotOptions) (Screenshot, error) {

@@ -51,10 +51,12 @@ type TabView struct {
 
 // TabsResponse 是 browserTabs 的输出。
 type TabsResponse struct {
-	SessionID    string    `json:"session_id"`
-	ActivePageID string    `json:"active_page_id,omitempty"`
-	TabsRevision uint64    `json:"tabs_revision"`
-	Tabs         []TabView `json:"tabs"`
+	SessionID     string    `json:"session_id"`
+	ActivePageID  string    `json:"active_page_id,omitempty"`
+	TabsRevision  uint64    `json:"tabs_revision"`
+	Tabs          []TabView `json:"tabs"`
+	Recording     bool      `json:"recording"`
+	RecordedSteps int       `json:"recorded_steps"`
 }
 
 // TabsRequest 是 browserTabs 的输入。

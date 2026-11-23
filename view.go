@@ -38,7 +38,8 @@ func BrowserStateFromTabs(list TabsResponse) BrowserViewState {
 	result := BrowserViewState{
 		Available: len(list.Tabs) > 0, SessionID: list.SessionID,
 		ActivePageID: list.ActivePageID, TabsRevision: list.TabsRevision,
-		Tabs: make([]BrowserTabView, 0, len(list.Tabs)),
+		Tabs:      make([]BrowserTabView, 0, len(list.Tabs)),
+		Recording: list.Recording, RecordedSteps: list.RecordedSteps,
 	}
 	for _, tab := range list.Tabs {
 		view := BrowserTabView{PageID: tab.PageID, URL: BrowserViewURL(tab.URL), Title: tab.Title, Viewport: tab.Viewport, OpenerPageID: tab.OpenerPageID, Status: tab.Status, Active: tab.Active}
@@ -169,19 +170,7 @@ func (manager *Manager) View(ctx context.Context) (BrowserViewState, error) {
 		// 这不是 browserClose，前端应保留已经显示的浮窗等待下一次同步。
 		return BrowserViewState{}, nil
 	}
-	view := BrowserStateFromTabs(list)
-	manager.mu.Lock()
-	current := manager.sessions[list.SessionID]
-	manager.mu.Unlock()
-	if current != nil {
-		current.mu.Lock()
-		if current.sequenceDraft != nil && current.sequenceDraft.manual {
-			view.Recording = true
-			view.RecordedSteps = len(current.sequenceDraft.candidates)
-		}
-		current.mu.Unlock()
-	}
-	return view, nil
+	return BrowserStateFromTabs(list), nil
 }
 
 // BrowserAssetsFromResponse 将观测资源投影为前端列表。

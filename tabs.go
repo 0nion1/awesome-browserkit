@@ -361,6 +361,10 @@ func (manager *Manager) ListTabs(ctx context.Context, request TabsRequest) (Tabs
 func (manager *Manager) tabsResponseLocked(current *session) TabsResponse {
 	revision := tabsRevisionLocked(current)
 	response := TabsResponse{SessionID: current.id, ActivePageID: current.activeTab, TabsRevision: revision, Tabs: make([]TabView, 0, len(current.tabOrder))}
+	if current.sequenceDraft != nil && current.sequenceDraft.manual {
+		response.Recording = true
+		response.RecordedSteps = len(current.sequenceDraft.candidates)
+	}
 	for _, id := range current.tabOrder {
 		value := current.tabs[id]
 		if value == nil {

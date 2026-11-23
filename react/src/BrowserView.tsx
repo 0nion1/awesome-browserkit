@@ -495,6 +495,9 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
     activePageRef.current = undefined
     stateRevisionRef.current = 0
     tabSelectionRef.current += 1
+    setRecording(false)
+    setRecordedSteps(0)
+    setRecordingDialog(false)
 
     setSyncing(false)
     setWaitingForFrame(false)
@@ -523,6 +526,9 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
       setTabs([])
       setActivePageID(undefined)
       frameCacheRef.current.clear()
+      setRecording(false)
+      setRecordedSteps(0)
+      setRecordingDialog(false)
 
       clearKeyboardState()
       heldMouseRef.current.clear()
@@ -536,9 +542,14 @@ function BrowserSurface({ endpoint: sessionID, source = httpBrowserSource, pageI
       if (!active) return
       if (!acceptState(state)) return
       stateCallback.current?.(state)
-      setRecording(Boolean(state.recording))
-      setRecordedSteps(state.recorded_steps || 0)
+      // 某些宿主的切 Tab 局部状态只携带 tabs。缺失录制字段表示“未知”，
+      // 不能解释为 false，否则按钮会在 session 仍录制时错误复位。
+      if (state.recording !== undefined) setRecording(state.recording)
+      if (state.recorded_steps !== undefined) setRecordedSteps(state.recorded_steps)
       if (state.closed) {
+        setRecording(false)
+        setRecordedSteps(0)
+        setRecordingDialog(false)
         seenRef.current = false
 
         setSyncing(false)

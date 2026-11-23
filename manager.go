@@ -50,6 +50,8 @@ var defaultBrowserViewport = Viewport{Width: 1920, Height: 1080}
 
 const liveInputQueueSize = 64
 
+const manualSequenceRecordQueueSize = 64
+
 const liveInputDispatchTimeout = time.Second
 
 type liveInput struct {
@@ -58,6 +60,13 @@ type liveInput struct {
 	event    InputEvent
 	epoch    uint64
 	barrier  chan struct{}
+}
+
+type manualSequenceRecord struct {
+	page    *page
+	draft   *sequenceDraft
+	event   InputEvent
+	barrier chan struct{}
 }
 
 type session struct {
@@ -79,6 +88,7 @@ type session struct {
 	reconcileMu   sync.Mutex
 	tabMu         sync.Mutex
 	inputQueue    chan liveInput
+	recordQueue   chan manualSequenceRecord
 	inputEpoch    uint64
 	inputCancel   context.CancelFunc
 	sequenceDraft *sequenceDraft
@@ -315,7 +325,7 @@ func (manager *Manager) createSessionWithConfig(ctx context.Context, request Ope
 		id: manager.newID("bsess"), browser: browser,
 		external: externalBrowserConfig(sessionConfig),
 		tabs:     make(map[string]*page), createdAt: time.Now(), lastUsed: time.Now(),
-		ctx: sessionCtx, cancel: sessionCancel, inputQueue: make(chan liveInput, liveInputQueueSize), inputEpoch: 1,
+		ctx: sessionCtx, cancel: sessionCancel, inputQueue: make(chan liveInput, liveInputQueueSize), recordQueue: make(chan manualSequenceRecord, manualSequenceRecordQueueSize), inputEpoch: 1,
 	}
 	viewport := request.Viewport
 	if viewport.Width <= 0 || viewport.Height <= 0 {
@@ -350,6 +360,7 @@ func (manager *Manager) createSessionWithConfig(ctx context.Context, request Ope
 		return nil, nil, "", err
 	}
 	go manager.dispatchLiveInputs(created)
+	go manager.dispatchManualSequenceRecords(created)
 	loadStatus := OpenLoadLoaded
 	if request.URL == "" && !attach {
 		loadStatus, err = pageLoadStatus(ctx, createdPage.page)

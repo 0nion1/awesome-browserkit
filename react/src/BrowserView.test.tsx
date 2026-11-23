@@ -419,6 +419,16 @@ describe('BrowserLiveWindow', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('/tmp/sequence.json')
   })
 
+  it('keeps recording active when a tab update omits recording fields', async () => {
+    mockedFetchBrowserState.mockResolvedValue(singleTabState())
+    render(<BrowserView endpoint="/browser" />)
+    await configuredFrame()
+    await receiveState(singleTabState({}, { recording: true, recorded_steps: 2 }))
+    expect(screen.getByRole('button', { name: '停止并保存操作录制' })).toBeInTheDocument()
+    await receiveState(singleTabState({ page_id: 'page-b', url: 'https://example.com/two' }, { tabs_revision: 2 }))
+    expect(screen.getByRole('button', { name: '停止并保存操作录制' })).toHaveAttribute('title', '正在录制，已记录 2 步')
+  })
+
   it('requires the explicit keyboard button in manual activation mode', async () => {
     mockedFetchBrowserState.mockResolvedValue(singleTabState())
     const { rerender } = render(<BrowserView endpoint="/browser" input={{ keyboardActivation: 'manual' }} />)

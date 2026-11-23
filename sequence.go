@@ -10,11 +10,14 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 const sequenceSchemaVersion = 1
 
 const maxSequenceSteps = 100
+
+const manualSequenceInputDebounce = 75 * time.Millisecond
 
 var sequenceVariablePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 
@@ -352,6 +355,9 @@ func (manager *Manager) FinishSequenceRecording(ctx context.Context, request Seq
 	if err := manager.waitLiveInputBarrier(ctx, current); err != nil {
 		return SequenceResponse{}, err
 	}
+	if err := manager.waitManualSequenceBarrier(ctx, current); err != nil {
+		return SequenceResponse{}, err
+	}
 	current.mu.Lock()
 	draft := current.sequenceDraft
 	if draft == nil || !draft.manual {
@@ -589,13 +595,6 @@ func recordSequenceInput(current *session, currentPage *page, element Element, r
 }
 
 func (manager *Manager) manualSequenceElementAt(ctx context.Context, current *session, currentPage *page, x, y float64) (Element, error) {
-	snapshot, err := currentPage.page.Snapshot(ctx, SnapshotOptions{MaxChars: 1, MaxElements: maxSnapshotElements})
-	if err != nil {
-		return Element{}, err
-	}
-	current.mu.Lock()
-	rememberSnapshotRefs(currentPage, snapshot)
-	current.mu.Unlock()
 	inspector, ok := currentPage.page.(pointInspector)
 	if !ok {
 		return Element{}, errors.New("当前浏览器页面不支持点击录制")
@@ -605,32 +604,167 @@ func (manager *Manager) manualSequenceElementAt(ctx context.Context, current *se
 		return Element{}, err
 	}
 	current.mu.Lock()
-	defer current.mu.Unlock()
 	element := currentPage.elements[inspected.Ref]
+	current.mu.Unlock()
 	if element.Ref != "" {
 		return element, nil
 	}
-	return Element{}, errors.New("点击位置没有可录制元素")
+	// 该函数只由独立录制队列调用。缓存未命中时才复用完整快照生成的
+	// selector/XPath/role，避免另建一套较弱的定位器实现。
+	snapshot, err := currentPage.page.Snapshot(ctx, SnapshotOptions{MaxChars: 1, MaxElements: maxSnapshotElements})
+	if err == nil {
+		current.mu.Lock()
+		rememberSnapshotRefs(currentPage, snapshot)
+		element = currentPage.elements[inspected.Ref]
+		current.mu.Unlock()
+		if element.Ref != "" {
+			return element, nil
+		}
+	}
+	// 非交互元素可能不在快照集合内，仍保留 InspectPoint 的 role/name 兜底。
+	return Element{Ref: inspected.Ref, Role: inspected.Role, Name: inspected.Name, Locator: ElementLocator{Role: inspected.Role, Name: inspected.Name}}, nil
 }
 
-func (manager *Manager) recordManualSequenceInput(ctx context.Context, current *session, currentPage *page, event InputEvent, clicked Element) {
-	if event.Kind == "mouse" && event.Action == "up" && event.Button == "left" && clicked.Ref != "" {
-		recordSequenceStep(current, currentPage, SequenceStep{Type: "click", Locator: locatorForSequenceElement(clicked)}, "succeeded")
-		manager.emit(ctx, Event{Kind: "sequence_recording_changed", SessionID: current.id, PageID: currentPage.id})
+func (manager *Manager) recordManualSequenceInput(ctx context.Context, current *session, currentPage *page, draft *sequenceDraft, event InputEvent) {
+	pointerBoundary := event.Kind == "mouse" && event.Button == "left" && (event.Action == "down" || event.Action == "up")
+	if !pointerBoundary && !manualSequenceInputChanged(event) {
 		return
 	}
-	inputChanged := event.Kind == "text" || event.Kind == "composition" || event.Kind == "key" && event.Action == "down" && (event.Text != "" || event.Key == "Backspace" || event.Key == "Delete") || event.Kind == "shortcut" && (event.Action == "paste" || event.Action == "select_all")
-	if !inputChanged {
+	record := manualSequenceRecord{page: currentPage, draft: draft, event: event}
+	if pointerBoundary {
+		// 点位解析也离开实时输入队列；down 时预取目标，up 时按顺序提交。
+		select {
+		case current.recordQueue <- record:
+		case <-ctx.Done():
+		case <-current.ctx.Done():
+		}
 		return
 	}
-	snapshot, err := currentPage.page.Snapshot(ctx, SnapshotOptions{MaxChars: 1, MaxElements: maxSnapshotElements})
+	// 录制不能反向阻塞浏览器输入。队列满时允许丢弃当前采样；已经排队的
+	// 防抖采样读取的是页面最终值，因此连续输入仍会归并为正确语义步骤。
+	select {
+	case current.recordQueue <- record:
+	default:
+	}
+}
+
+func manualSequenceInputChanged(event InputEvent) bool {
+	return event.Kind == "text" || event.Kind == "composition" || event.Kind == "key" && event.Action == "down" && (event.Text != "" || event.Key == "Backspace" || event.Key == "Delete") || event.Kind == "shortcut" && (event.Action == "paste" || event.Action == "select_all")
+}
+
+func (manager *Manager) dispatchManualSequenceRecords(current *session) {
+	var pending *manualSequenceRecord
+	clickTargets := make(map[manualSequenceClickKey]Element)
+
+outer:
+	for {
+		var record manualSequenceRecord
+		if pending != nil {
+			record = *pending
+			pending = nil
+		} else {
+			select {
+			case <-current.ctx.Done():
+				return
+			case record = <-current.recordQueue:
+			}
+		}
+		if record.barrier != nil {
+			close(record.barrier)
+			continue
+		}
+		if !manualSequenceInputChanged(record.event) {
+			manager.processManualSequencePointer(current, record, clickTargets)
+			continue
+		}
+		timer := time.NewTimer(manualSequenceInputDebounce)
+
+		for {
+			select {
+			case <-current.ctx.Done():
+				timer.Stop()
+				return
+			case next := <-current.recordQueue:
+				if next.barrier != nil {
+					timer.Stop()
+					manager.captureManualSequenceInput(current.ctx, current, record.page, record.draft)
+					close(next.barrier)
+					continue outer
+				}
+				if !manualSequenceInputChanged(next.event) || next.page != record.page || next.draft != record.draft {
+					timer.Stop()
+					manager.captureManualSequenceInput(current.ctx, current, record.page, record.draft)
+					pending = &next
+					continue outer
+				}
+				record = next
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(manualSequenceInputDebounce)
+			case <-timer.C:
+				manager.captureManualSequenceInput(current.ctx, current, record.page, record.draft)
+				continue outer
+			}
+		}
+	}
+}
+
+type manualSequenceClickKey struct {
+	page  *page
+	draft *sequenceDraft
+}
+
+func (manager *Manager) processManualSequencePointer(current *session, record manualSequenceRecord, targets map[manualSequenceClickKey]Element) {
+	key := manualSequenceClickKey{page: record.page, draft: record.draft}
+	if record.event.Action == "down" {
+		operationCtx, cancel := context.WithTimeout(current.ctx, liveInputDispatchTimeout)
+		target, _ := manager.manualSequenceElementAt(operationCtx, current, record.page, record.event.X, record.event.Y)
+		cancel()
+		if target.Ref != "" {
+			targets[key] = target
+		}
+		return
+	}
+	target := targets[key]
+	delete(targets, key)
+	if target.Ref == "" {
+		operationCtx, cancel := context.WithTimeout(current.ctx, liveInputDispatchTimeout)
+		target, _ = manager.manualSequenceElementAt(operationCtx, current, record.page, record.event.X, record.event.Y)
+		cancel()
+	}
+	if target.Ref != "" {
+		manager.commitManualSequenceClick(current.ctx, current, record.page, record.draft, target)
+	}
+}
+
+func (manager *Manager) commitManualSequenceClick(ctx context.Context, current *session, currentPage *page, expected *sequenceDraft, clicked Element) {
+	current.mu.Lock()
+	draft := current.sequenceDraft
+	if draft == nil || draft != expected || !draft.manual {
+		current.mu.Unlock()
+		return
+	}
+	step := SequenceStep{Type: "click", Page: draft.pageAlias(currentPage, current), Locator: locatorForSequenceElement(clicked)}
+	draft.appendCandidate(step, "succeeded")
+	current.mu.Unlock()
+	manager.emit(ctx, Event{Kind: "sequence_recording_changed", SessionID: current.id, PageID: currentPage.id})
+}
+
+func (manager *Manager) captureManualSequenceInput(ctx context.Context, current *session, currentPage *page, expected *sequenceDraft) {
+	operationCtx, cancel := context.WithTimeout(ctx, liveInputDispatchTimeout)
+	defer cancel()
+	snapshot, err := currentPage.page.Snapshot(operationCtx, SnapshotOptions{MaxChars: 1, MaxElements: maxSnapshotElements})
 	if err != nil || snapshot.ActiveElementRef == "" {
 		return
 	}
 	current.mu.Lock()
 	rememberSnapshotRefs(currentPage, snapshot)
 	draft := current.sequenceDraft
-	if draft == nil || !draft.manual {
+	if draft == nil || draft != expected || !draft.manual {
 		current.mu.Unlock()
 		return
 	}
@@ -657,6 +791,25 @@ func (manager *Manager) recordManualSequenceInput(ctx context.Context, current *
 	draft.manualInputs[key] = manualSequenceInput{candidateIndex: len(draft.candidates) - 1, variableIndex: variableIndex}
 	current.mu.Unlock()
 	manager.emit(ctx, Event{Kind: "sequence_recording_changed", SessionID: current.id, PageID: currentPage.id})
+}
+
+func (manager *Manager) waitManualSequenceBarrier(ctx context.Context, current *session) error {
+	barrier := make(chan struct{})
+	select {
+	case current.recordQueue <- manualSequenceRecord{barrier: barrier}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-current.ctx.Done():
+		return errors.New("浏览器 session 已关闭")
+	}
+	select {
+	case <-barrier:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-current.ctx.Done():
+		return errors.New("浏览器 session 已关闭")
+	}
 }
 
 func locatorForSequenceElement(element Element) ElementLocator {

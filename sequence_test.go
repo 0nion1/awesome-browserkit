@@ -7,12 +7,18 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type manualRecordingPage struct {
 	*fakePage
-	value string
+	mu              sync.Mutex
+	value           string
+	dispatched      chan struct{}
+	snapshotStarted chan struct{}
+	snapshotRelease chan struct{}
 }
 
 type manualRecordingSession struct {
@@ -28,7 +34,19 @@ func (session *manualRecordingSession) Close() error               { session.clo
 func (session *manualRecordingSession) Closed() bool               { return session.closed }
 
 func (page *manualRecordingPage) Snapshot(context.Context, SnapshotOptions) (Snapshot, error) {
-	return Snapshot{Info: page.info, Revision: 1, ActiveElementRef: "e1", ActiveElementValue: page.value, Elements: []Element{
+	if page.snapshotStarted != nil {
+		select {
+		case page.snapshotStarted <- struct{}{}:
+		default:
+		}
+	}
+	if page.snapshotRelease != nil {
+		<-page.snapshotRelease
+	}
+	page.mu.Lock()
+	value := page.value
+	page.mu.Unlock()
+	return Snapshot{Info: page.info, Revision: 1, ActiveElementRef: "e1", ActiveElementValue: value, Elements: []Element{
 		{Ref: "e1", Role: "textbox", Name: "Customer name", Locator: ElementLocator{Selector: "#customer", Role: "textbox", Name: "Customer name"}},
 		{Ref: "e2", Role: "button", Name: "Save customer", Locator: ElementLocator{Selector: "#save", Role: "button", Name: "Save customer"}},
 	}}, nil
@@ -44,7 +62,12 @@ func (page *manualRecordingPage) InspectPoint(_ context.Context, x, _ float64) (
 
 func (page *manualRecordingPage) DispatchInput(ctx context.Context, input InputEvent) error {
 	if input.Kind == "text" {
+		page.mu.Lock()
 		page.value += input.Text
+		page.mu.Unlock()
+	}
+	if page.dispatched != nil {
+		page.dispatched <- struct{}{}
 	}
 	return page.fakePage.DispatchInput(ctx, input)
 }
@@ -185,6 +208,86 @@ func TestManualSequenceRecordingTurnsLiveInputsIntoSemanticSteps(t *testing.T) {
 	state, err := manager.SequenceRecordingState(context.Background())
 	if err != nil || state.Recording {
 		t.Fatalf("保存后仍处于录制状态: %+v %v", state, err)
+	}
+}
+
+func TestManualSequenceRecordingDoesNotBlockLiveInputOnSnapshot(t *testing.T) {
+	page := &manualRecordingPage{fakePage: &fakePage{info: PageInfo{URL: "https://example.com/form"}}, dispatched: make(chan struct{}, 2)}
+	manager, err := NewManager(Config{Factory: func(context.Context, SessionConfig) (Session, error) {
+		return &manualRecordingSession{page: page}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: page.info.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.StartSequenceRecording(context.Background(), SequenceRecordingStartRequest{PageID: opened.PageID}); err != nil {
+		t.Fatal(err)
+	}
+	page.snapshotStarted = make(chan struct{}, 1)
+	page.snapshotRelease = make(chan struct{})
+	if err := manager.DispatchLiveInput(context.Background(), opened.PageID, InputEvent{Kind: "text", Text: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-page.dispatched:
+	case <-time.After(time.Second):
+		t.Fatal("第一条输入没有送达页面")
+	}
+	select {
+	case <-page.snapshotStarted:
+	case <-time.After(time.Second):
+		t.Fatal("录制快照没有开始")
+	}
+	if err := manager.DispatchLiveInput(context.Background(), opened.PageID, InputEvent{Kind: "text", Text: "B"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-page.dispatched:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("录制快照阻塞了后续浏览器输入")
+	}
+	close(page.snapshotRelease)
+	finished, err := manager.FinishSequenceRecording(context.Background(), SequenceRecordingFinishRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSavedSequence(t, finished)
+	if len(finished.Sequence.Variables) != 1 || finished.Sequence.Variables[0].Default != "AB" {
+		t.Fatalf("异步录制没有保存最终输入值: %+v", finished.Sequence.Variables)
+	}
+}
+
+func TestManualSequenceRecordingStateSurvivesTabProjection(t *testing.T) {
+	manager, _ := fakeManager(t, Config{})
+	defer manager.Close(context.Background())
+	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com/one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.StartSequenceRecording(context.Background(), SequenceRecordingStartRequest{PageID: opened.PageID}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.NewTab(context.Background(), OpenRequest{SessionID: opened.SessionID, URL: "https://example.com/two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ActivateTab(context.Background(), TabRequest{SessionID: opened.SessionID, PageID: second.PageID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ActivateTab(context.Background(), TabRequest{SessionID: opened.SessionID, PageID: opened.PageID}); err != nil {
+		t.Fatal(err)
+	}
+	tabs, err := manager.ListTabs(context.Background(), TabsRequest{SessionID: opened.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := BrowserStateFromTabs(tabs)
+	if !tabs.Recording || !view.Recording || tabs.RecordedSteps < 1 || view.RecordedSteps != tabs.RecordedSteps {
+		t.Fatalf("切换 Tab 后录制状态丢失: tabs=%+v view=%+v", tabs, view)
 	}
 }
 

@@ -339,6 +339,16 @@ go run ./examples/demo --addr 127.0.0.1:8878 --chrome /path/to/chrome
 可以用 `browserkit --allow-private-network --url http://127.0.0.1:8879/` 手动调用函数。
 `make smoke` 会在临时浏览器中使用同一靶场，通过 JSON 工具调用验证全部已启用的浏览器函数。
 
+运行 `make snapshot-lab` 后可访问
+[`http://127.0.0.1:8879/snapshot.html`](http://127.0.0.1:8879/snapshot.html)。
+该快照专项测试集覆盖持续变化与反复替换的元素、100ms 更新的动态集合、分阶段异步页面、
+隐藏/禁用/弹层状态、Shadow DOM、同源 iframe、状态与角色保真、可操作性边界、
+大型下拉框，以及密集元素的 offset 分页。BrowserKit 与 Codex 的可复现实测、
+20 项 BrowserKit 欠缺清单和优先级分析见
+[`docs/snapshot-codex-comparison.md`](docs/snapshot-codex-comparison.md)。
+Codex 内置 Browser 的 20 项独立欠缺清单见
+[`docs/codex-browser-gap-analysis.md`](docs/codex-browser-gap-analysis.md)。
+
 ## 许可证
 
 [Apache-2.0](LICENSE)。

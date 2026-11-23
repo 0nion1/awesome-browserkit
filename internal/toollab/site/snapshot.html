@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Snapshot behavior lab</title>
+  <link rel="stylesheet" href="/snapshot-lab.css">
+  <script src="/snapshot-lab.js" defer></script>
+</head>
+<body>
+  <header class="hero">
+    <p class="eyebrow">BrowserKit deterministic target</p>
+    <h1>Snapshot behavior lab</h1>
+    <p id="lab-description">A reproducible surface for semantic, changing, high-frequency, asynchronous, embedded, and dense interfaces.</p>
+    <nav aria-label="Scenario index">
+      <a href="#semantic">Semantic</a><a href="#mutation">Mutation</a><a href="#feed">Live feed</a>
+      <a href="#async">Async</a><a href="#embedded">Embedded</a><a href="#dense">Dense</a>
+      <a href="#fidelity">Fidelity</a>
+    </nav>
+  </header>
+
+  <main>
+    <section id="semantic" aria-labelledby="semantic-title">
+      <div class="section-heading">
+        <div><span class="scenario">S1</span><h2 id="semantic-title">Semantic controls and visibility</h2></div>
+        <p>Labels, ARIA, state, pointer targets, hidden content, and overlays.</p>
+      </div>
+      <div class="control-grid">
+        <label for="account-name">Account name</label><input id="account-name" autocomplete="off" placeholder="Type a name">
+        <label><input id="alerts" type="checkbox"> Enable alerts</label>
+        <label for="region">Region</label>
+        <select id="region"><option value="us-west">US West</option><option value="eu-central">EU Central</option><option value="ap-south">AP South</option></select>
+        <button id="disabled-action" type="button" disabled>Disabled action</button>
+        <button id="aria-disabled-action" type="button" aria-disabled="true">ARIA disabled action</button>
+        <button id="open-dialog" type="button">Open review dialog</button>
+        <div id="pointer-action" class="pointer-action" tabindex="0">Pointer-only action</div>
+      </div>
+      <button id="hidden-action" type="button" hidden>Hidden action</button>
+      <div aria-hidden="true"><button id="aria-hidden-action" type="button">ARIA hidden action</button></div>
+      <p id="semantic-result" role="status">No semantic action yet</p>
+      <dialog id="review-dialog" aria-labelledby="dialog-title">
+        <h3 id="dialog-title">Review changes</h3>
+        <p>This content exists in the DOM but is interactive only while the dialog is open.</p>
+        <button id="confirm-dialog" type="button">Confirm review</button>
+        <button id="close-dialog" type="button">Close dialog</button>
+      </dialog>
+    </section>
+
+    <section id="mutation" aria-labelledby="mutation-title">
+      <div class="section-heading">
+        <div><span class="scenario">S2</span><h2 id="mutation-title">Changing elements</h2></div>
+        <p>In-place text changes, visibility toggles, and complete node replacement.</p>
+      </div>
+      <div class="toolbar"><button id="pause-mutations" type="button" aria-pressed="false">Pause mutations</button><span id="mutation-state" role="status">Mutations running</span></div>
+      <div class="metric-row">
+        <div><span class="metric-label">Clock</span><strong id="fast-clock">Tick 0000</strong></div>
+        <div><span class="metric-label">Same DOM node</span><button id="in-place-action" type="button">Phase amber</button></div>
+        <div><span class="metric-label">Replaced DOM node</span><button id="replaced-action" type="button">Generation 000</button></div>
+      </div>
+      <div id="blinking-panel"><button id="blinking-action" type="button">Blinking action</button></div>
+      <p id="replacement-result">No replacement clicked</p>
+    </section>
+
+    <section id="feed" aria-labelledby="feed-title">
+      <div class="section-heading">
+        <div><span class="scenario">S3</span><h2 id="feed-title">High-frequency collection</h2></div>
+        <p>A bounded list is reordered and fully replaced every 100 ms.</p>
+      </div>
+      <div class="toolbar"><button id="pause-feed" type="button" aria-pressed="false">Pause live feed</button><span id="feed-state" role="status">Feed running</span></div>
+      <ul id="live-feed" class="live-feed" aria-label="Live events"></ul>
+      <p id="feed-result">No live event selected</p>
+    </section>
+
+    <section id="async" aria-labelledby="async-title">
+      <div class="section-heading">
+        <div><span class="scenario">S4</span><h2 id="async-title">Asynchronous staged update</h2></div>
+        <p>Loading, partial, complete, error, and retry-visible states.</p>
+      </div>
+      <div class="toolbar"><button id="start-async" type="button">Load async report</button><button id="start-error" type="button">Load failing report</button></div>
+      <div id="async-panel" aria-live="polite" aria-busy="false">
+        <p id="async-state">Async idle</p><div id="summary-slot"></div><ul id="detail-list"></ul>
+      </div>
+    </section>
+
+    <section id="embedded" aria-labelledby="embedded-title">
+      <div class="section-heading">
+        <div><span class="scenario">S5</span><h2 id="embedded-title">Embedded trees</h2></div>
+        <p>An open Shadow DOM and a same-origin iframe.</p>
+      </div>
+      <div id="snapshot-shadow-host"></div>
+      <iframe title="Snapshot embedded checkout" src="/frame.html"></iframe>
+    </section>
+
+    <section id="dense" aria-labelledby="dense-title">
+      <div class="section-heading">
+        <div><span class="scenario">S6</span><h2 id="dense-title">Dense pagination surface</h2></div>
+        <p>One hundred sixty stable actions verify max-elements limits and offset pagination.</p>
+      </div>
+      <div id="dense-actions" class="dense-actions" aria-label="Dense actions"></div>
+      <p id="dense-result">No dense action selected</p>
+    </section>
+
+    <section id="fidelity" aria-labelledby="fidelity-title">
+      <div class="section-heading">
+        <div><span class="scenario">S7</span><h2 id="fidelity-title">State and fidelity edges</h2></div>
+        <p>Accessible state, names, destinations, inertness, obstruction, large selects, and encapsulation boundaries.</p>
+      </div>
+      <div class="fidelity-grid">
+        <label><input id="checked-preference" type="checkbox" checked> Checked preference</label>
+        <label><input id="radio-preference" type="radio" name="mode" checked> Selected mode</label>
+        <div id="role-switch" role="switch" aria-checked="true" aria-label="ARIA switch without tabindex">Switch visual</div>
+        <button id="disclosure-state" type="button" aria-pressed="true" aria-expanded="true">Disclosure state</button>
+        <label for="prefilled-field">Prefilled account</label>
+        <input id="prefilled-field" value="existing-value" aria-describedby="prefilled-help">
+        <p id="prefilled-help">This description should be associated with the account field.</p>
+        <a id="destination-link" href="/detail.html?source=snapshot-fidelity">Destination link</a>
+        <input id="submit-value" type="submit" value="Submit from value">
+        <div id="editable-note" contenteditable="true" aria-label="Editable note">Draft text</div>
+        <button id="long-name-action" type="button">Long accessible action name ABCDEFGHIJKLMNOPQRSTUVWXYZ ABCDEFGHIJKLMNOPQRSTUVWXYZ ABCDEFGHIJKLMNOPQRSTUVWXYZ ABCDEFGHIJKLMNOPQRSTUVWXYZ ABCDEFGHIJKLMNOPQRSTUVWXYZ ABCDEFGHIJKLMNOPQRSTUVWXYZ END</button>
+        <div inert><button id="inert-action" type="button">Inert action</button></div>
+        <div class="covered-target"><button id="covered-action" type="button">Covered action</button><span aria-hidden="true"></span></div>
+        <label for="multiple-select">Multiple regions</label>
+        <select id="multiple-select" multiple><option value="west">West</option><option value="east">East</option></select>
+        <label for="large-select">Large option set</label>
+        <select id="large-select"></select>
+        <button id="app-owned-ref" type="button" data-browserkit-ref="application-owned-value">Application-owned ref attribute</button>
+        <div id="closed-shadow-host"></div>
+      </div>
+      <p id="fidelity-result">No fidelity edge activated</p>
+    </section>
+  </main>
+
+  <footer>Fixture version: snapshot-lab-v1</footer>
+</body>
+</html>

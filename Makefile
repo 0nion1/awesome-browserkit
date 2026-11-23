@@ -1,4 +1,4 @@
-.PHONY: install test race smoke build demo lab pack cli server
+.PHONY: install test race smoke build demo lab snapshot-lab pack cli server
 install:
 	go mod download
 	npm ci --prefix react
@@ -13,7 +13,7 @@ race:
 	go test -race ./...
 
 smoke:
-	go test -tags=browser_smoke . ./cmd/browserkit -run 'TestRealBrowserOwnsAndRemovesLocalProfile|TestRealBrowserProfileIdentityMatchesRequests|TestRealBrowserManagerWorkflow|TestRealBrowserNetworkPolicy|TestRealBrowserFunctionToolLab|TestRealBrowserEmbeddedTargets|TestRealBrowserSequenceGenerateAndReplay|TestRealCLIModes' -count=1 -v
+	go test -tags=browser_smoke . ./cmd/browserkit -run 'TestRealBrowserOwnsAndRemovesLocalProfile|TestRealBrowserProfileIdentityMatchesRequests|TestRealBrowserManagerWorkflow|TestRealBrowserNetworkPolicy|TestRealBrowserFunctionToolLab|TestRealBrowserEmbeddedTargets|TestRealBrowserSnapshotBehaviorLab|TestRealBrowserSequenceGenerateAndReplay|TestRealCLIModes' -count=1 -v
 
 build:
 	go build ./...
@@ -31,6 +31,9 @@ demo:
 
 lab:
 	go run ./examples/tool-lab
+
+snapshot-lab:
+	go run ./examples/tool-lab --addr 127.0.0.1:8879
 
 pack:
 	cd react && npm pack

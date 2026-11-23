@@ -207,18 +207,22 @@ func (manager *Manager) dispatchLiveInputs(current *session) {
 			current.mu.Lock()
 			valid = !current.closed && current.activeTab == input.page.id &&
 				current.tabs[input.page.id] == input.page && current.inputEpoch == input.epoch
-			recording := valid && current.sequenceDraft != nil && current.sequenceDraft.manual
+			var recordingDraft *sequenceDraft
+			if valid && current.sequenceDraft != nil && current.sequenceDraft.manual {
+				recordingDraft = current.sequenceDraft
+			}
 			current.mu.Unlock()
 			if input.viewerID != "" {
 				valid = valid && manager.CanControl(input.viewerID)
 			}
 			if valid {
-				var clicked Element
-				if recording && input.event.Kind == "mouse" && input.event.Action == "up" && input.event.Button == "left" {
-					clicked, _ = manager.manualSequenceElementAt(operationCtx, current, input.page, input.event.X, input.event.Y)
+				// 在点击改变焦点前只刷新一次此前的文本语义记录。连续按键仍不
+				// 等待录制快照，跨控件边界才同步提交最终字段值。
+				if recordingDraft != nil && input.event.Kind == "mouse" && input.event.Action == "down" && input.event.Button == "left" {
+					_ = manager.waitManualSequenceBarrier(operationCtx, current)
 				}
-				if err := inputPage.DispatchInput(operationCtx, input.event); err == nil && recording {
-					manager.recordManualSequenceInput(operationCtx, current, input.page, input.event, clicked)
+				if err := inputPage.DispatchInput(operationCtx, input.event); err == nil && recordingDraft != nil {
+					manager.recordManualSequenceInput(operationCtx, current, input.page, recordingDraft, input.event)
 				}
 			}
 			current.interactionMu.Unlock()

@@ -349,6 +349,17 @@ Use `browserkit --allow-private-network --url http://127.0.0.1:8879/` to try
 function calls manually. `make smoke` runs the same lab in a temporary browser
 and verifies every enabled browser function through JSON tool calls.
 
+For snapshot stress testing, run `make snapshot-lab` and open
+[`http://127.0.0.1:8879/snapshot.html`](http://127.0.0.1:8879/snapshot.html).
+The suite covers changing and replaced elements, a 100 ms live collection,
+staged asynchronous UI, visibility states, Shadow DOM, a same-origin iframe,
+state/role fidelity, interactability edges, large selects, and dense offset
+pagination. The reproducible BrowserKit-versus-Codex evaluation and the
+20-item BrowserKit gap analysis are documented in
+[`docs/snapshot-codex-comparison.md`](docs/snapshot-codex-comparison.md).
+The separate Codex in-app Browser gap analysis is in
+[`docs/codex-browser-gap-analysis.md`](docs/codex-browser-gap-analysis.md).
+
 ## License
 
 [Apache-2.0](LICENSE).

@@ -27,11 +27,11 @@ func (manager *Manager) Functions() []Function {
 		return nil
 	}
 	functions := []Function{
-		{Name: "browserOpen", Description: "启动可复用浏览器 session 并打开一个 HTTP/HTTPS 页面；返回前等待页面空闲，并在 load_status 中报告 loaded 或 timeout。返回 session_id 和 page_id；需要图片时再调用 browserScreenshot。完成操作后用 browserClose 释放 session。", Handler: manager.openFunction},
+		{Name: "browserOpen", Description: "启动可复用浏览器 session 并打开一个 HTTP/HTTPS 页面；最多等待 2 秒加载完成并进入空闲，load_status 报告 loaded 或 timeout。超时仍成功返回页面身份、当前内容 snapshot 和未完全加载提醒 warning，由模型判断继续操作或再次检查；不要因 timeout 重复打开页面。需要图片时再调用 browserScreenshot。完成操作后用 browserClose 释放 session。", Handler: manager.openFunction},
 		{Name: "browserTabs", Description: "列出浏览器 session 中的网页 Tab，并返回当前激活的 page_id。", Handler: manager.tabsFunction},
 		{Name: "browserActivateTab", Description: "激活指定浏览器 Tab，让后续直播画面和输入切换到该 Tab。", Handler: manager.activateTabFunction},
 		{Name: "browserCloseTab", Description: "关闭浏览器 session 中指定的网页 Tab。", Handler: manager.closeTabFunction},
-		{Name: "browserNavigate", Description: "在已有浏览器 page 中导航到 HTTP/HTTPS 地址，返回前等待页面空闲。", Handler: manager.Navigate},
+		{Name: "browserNavigate", Description: "在已有浏览器 page 中导航到 HTTP/HTTPS 地址；最多等待 2 秒加载完成并进入空闲，load_status 报告 loaded 或 timeout。超时仍成功返回当前内容 snapshot 和未完全加载提醒 warning，由模型判断继续操作或再次检查；不要因 timeout 重复导航。", Handler: manager.Navigate},
 		{Name: "browserSnapshot", Description: "获取页面文本摘要和绑定 revision 的可交互元素引用；先同步 Tab 状态。省略 page_id 时使用最新 active page，并返回 active_page_id、tabs_revision、tabs_changed 和 Tab 摘要；支持 max_elements 限量和 offset 分页，下一页使用 next_offset。交互后页面内容或控件状态可能变化，即使 revision 未变也可能需要重新获取快照；元素列表中缺少某个控件时，它也可能尚未启用。", Handler: manager.Snapshot},
 		{Name: "browserClick", Description: "点击指定 page_id 页面快照中的元素引用。ref 只能用于生成它的 page_id。点击后页面内容或控件状态可能变化，下一步操作前可能需要重新调用 browserSnapshot。", Handler: manager.Click},
 		{Name: "browserHover", Description: "将指针移动到指定 page_id 的快照元素。ref 只能用于生成它的页面。悬停可能展开菜单或显示新控件，操作这些控件前可能需要重新调用 browserSnapshot。", Handler: manager.Hover},

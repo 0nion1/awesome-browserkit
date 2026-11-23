@@ -92,6 +92,37 @@ func TestFunctionsFollowCapabilitiesAndDoNotShareCatalog(t *testing.T) {
 	}
 }
 
+func TestFunctionParametersHaveDescriptions(t *testing.T) {
+	manager, _ := fakeManager(t, Config{AllowEvaluate: true, AllowDevtools: true, UploadDir: t.TempDir()})
+	defer manager.Close(context.Background())
+	var check func(reflect.Type, string)
+	check = func(typ reflect.Type, path string) {
+		for typ.Kind() == reflect.Pointer || typ.Kind() == reflect.Slice || typ.Kind() == reflect.Array {
+			typ = typ.Elem()
+		}
+		if typ.Kind() != reflect.Struct {
+			return
+		}
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			name := strings.Split(field.Tag.Get("json"), ",")[0]
+			if !field.IsExported() || name == "-" {
+				continue
+			}
+			if strings.TrimSpace(field.Tag.Get("jsonschema_description")) == "" {
+				t.Errorf("%s.%s 缺少参数说明", path, name)
+			}
+			check(field.Type, path+"."+name)
+		}
+	}
+	for _, function := range manager.Functions() {
+		check(reflect.TypeOf(function.Handler).In(1), function.Name)
+	}
+	if _, exists := reflect.TypeFor[NavigateRequest]().FieldByName("TimeoutMS"); exists {
+		t.Fatal("导航请求仍暴露未使用的 TimeoutMS")
+	}
+}
+
 func TestUploadFunctionRequiresConfiguredDirectory(t *testing.T) {
 	manager, _ := fakeManager(t, Config{UploadDir: t.TempDir()})
 	defer manager.Close(context.Background())

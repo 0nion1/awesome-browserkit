@@ -39,8 +39,9 @@ func (p *testPage) Navigate(_ context.Context, address string) (browserkit.PageI
 	p.info = browserkit.PageInfo{URL: address, Title: "Fixture"}
 	return p.info, nil
 }
-func (p *testPage) Close(context.Context) error                   { return nil }
-func (p *testPage) WaitIdle(context.Context, time.Duration) error { return nil }
+func (p *testPage) Close(context.Context) error                        { return nil }
+func (p *testPage) WaitIdle(context.Context, time.Duration) error      { return nil }
+func (p *testPage) Wait(context.Context, browserkit.WaitOptions) error { return nil }
 func (p *testPage) Screenshot(context.Context, browserkit.ScreenshotOptions) (browserkit.Screenshot, error) {
 	return browserkit.Screenshot{Data: []byte("jpeg"), Format: "jpeg"}, nil
 }

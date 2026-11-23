@@ -13,7 +13,7 @@ race:
 	go test -race ./...
 
 smoke:
-	go test -tags=browser_smoke . ./cmd/browserkit -run 'TestRealBrowserOwnsAndRemovesLocalProfile|TestRealBrowserProfileIdentityMatchesRequests|TestRealBrowserManagerWorkflow|TestRealBrowserNetworkPolicy|TestRealBrowserFunctionToolLab|TestRealBrowserEmbeddedTargets|TestRealBrowserSnapshotBehaviorLab|TestRealBrowserSequenceGenerateAndReplay|TestRealCLIModes' -count=1 -v
+	go test -tags=browser_smoke . ./cmd/browserkit -run 'TestRealBrowserOwnsAndRemovesLocalProfile|TestRealBrowserProfileIdentityMatchesRequests|TestRealBrowserManagerWorkflow|TestRealBrowserNetworkPolicy|TestRealBrowserFunctionToolLab|TestRealBrowserEmbeddedTargets|TestRealBrowserSnapshotBehaviorLab|TestRealBrowserSequenceGenerateAndReplay|TestRealBrowserLoadingTimeoutReturnsCurrentContent|TestRealCLIModes' -count=1 -v
 
 build:
 	go build ./...

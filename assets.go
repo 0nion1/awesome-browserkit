@@ -14,10 +14,10 @@ const (
 
 // AssetsRequest 是 browserAssets 的输入。
 type AssetsRequest struct {
-	SessionID string `json:"session_id"`
-	PageID    string `json:"page_id,omitempty"`
-	Host      string `json:"host,omitempty"`
-	Limit     int    `json:"limit,omitempty"`
+	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。留空时使用当前活动 session。"`
+	PageID    string `json:"page_id,omitempty" jsonschema_description:"可选的目标 page_id；省略时使用所选 session 的当前激活 Tab。"`
+	Host      string `json:"host,omitempty" jsonschema_description:"可选的资源主机名过滤条件，不区分大小写且精确匹配，不自动匹配子域名；也可填写完整 URL，此时只取 hostname；省略时返回所有主机的资源。"`
+	Limit     int    `json:"limit,omitempty" jsonschema_description:"最多返回的最近资源条数；省略或为 0 时默认 100，允许 1 到 500；更早记录被省略时响应 truncated 为 true。"`
 }
 
 // AssetsResponse 是 browserAssets 的有界只读响应。

@@ -6,10 +6,10 @@ import (
 
 // OpenRequest 是 browserOpen 的输入。
 type OpenRequest struct {
-	SessionID string   `json:"session_id,omitempty"`
-	URL       string   `json:"url,omitempty"`
-	InjectJS  string   `json:"inject_js,omitempty" jsonschema_description:"可选的 JavaScript。新建 session 时会在每个后续 document 创建早期注入；复用已有 session 时只注册一次并立即执行当前 document，不会替换或删除已有注入脚本。重复 browserOpen 可省略此字段。"`
-	Viewport  Viewport `json:"viewport,omitempty"`
+	SessionID string   `json:"session_id,omitempty" jsonschema_description:"可选的已有 session_id；省略时创建新浏览器 session，填写时复用该 session 的当前激活 Tab。"`
+	URL       string   `json:"url,omitempty" jsonschema_description:"要打开的 HTTP/HTTPS 地址；省略时新建空白页，复用 session 时保留当前地址；复用时支持相对于当前页面的 URL。"`
+	InjectJS  string   `json:"inject_js,omitempty" jsonschema_description:"可选的 JavaScript，需宿主启用 allow_evaluate，并受 MaxScriptBytes 限制。新建 session 时在后续 document 创建早期注入；复用时去重注册并立即执行当前 document，不替换或删除已有脚本。"`
+	Viewport  Viewport `json:"viewport,omitempty" jsonschema_description:"新建页面的 CSS 视口尺寸；任一维度省略或不大于 0 时使用 1920×1080；复用 session 时忽略此字段。"`
 }
 
 // ViewportRequest 描述宿主为指定浏览器页面设置的 CSS 视口。
@@ -19,7 +19,7 @@ type ViewportRequest struct {
 	Viewport  Viewport `json:"viewport"`
 }
 
-// OpenLoadStatus 是 browserOpen 完成页面空闲等待后的状态。
+// OpenLoadStatus 是打开或导航页面最多等待 2 秒后的加载状态。
 type OpenLoadStatus string
 
 const (
@@ -36,6 +36,10 @@ type OpenResponse struct {
 	URL        string         `json:"url"`
 	Title      string         `json:"title,omitempty"`
 	LoadStatus OpenLoadStatus `json:"load_status"`
+	// Snapshot 是加载超时时当前可读取的页面快照，可直接使用其中的元素引用。
+	Snapshot *SnapshotResponse `json:"snapshot,omitempty"`
+	// Warning 提醒模型当前内容可能不完整，由模型决定是否继续等待。
+	Warning string `json:"warning,omitempty"`
 }
 
 // TabView 是模型和宿主可见的浏览器 Tab 摘要。
@@ -61,13 +65,13 @@ type TabsResponse struct {
 
 // TabsRequest 是 browserTabs 的输入。
 type TabsRequest struct {
-	SessionID string `json:"session_id"`
+	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
 }
 
 // TabRequest 是 browserActivateTab 的输入。
 type TabRequest struct {
-	SessionID string `json:"session_id"`
-	PageID    string `json:"page_id"`
+	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
+	PageID    string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
 }
 
 // TabResponse 是 browserActivateTab 的输出。
@@ -94,14 +98,20 @@ type CloseTabResponse struct {
 
 // NavigateRequest 是 browserNavigate 的输入。
 type NavigateRequest struct {
-	SessionID string `json:"session_id"`
-	PageID    string `json:"page_id"`
-	URL       string `json:"url"`
-	TimeoutMS int    `json:"timeout_ms,omitempty"`
+	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。留空时使用当前活动 session。"`
+	PageID    string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	URL       string `json:"url" jsonschema_description:"目标 HTTP/HTTPS 地址，也支持相对于该 Tab 当前地址的 URL；导航后原有快照引用失效。"`
 }
 
 // NavigateResponse 是 browserNavigate 的输出。
 type NavigateResponse struct {
+	// LoadStatus 表示最多等待 2 秒后的加载状态。
+	LoadStatus OpenLoadStatus `json:"load_status"`
+	// Snapshot 是加载超时时当前可读取的页面快照，可直接使用其中的元素引用。
+	Snapshot *SnapshotResponse `json:"snapshot,omitempty"`
+	// Warning 提醒模型当前内容可能不完整，由模型决定是否继续等待。
+	Warning string `json:"warning,omitempty"`
+
 	SessionID    string `json:"session_id"`
 	PageID       string `json:"page_id"`
 	URL          string `json:"url"`
@@ -114,11 +124,11 @@ type NavigateResponse struct {
 
 // SnapshotRequest 是 browserSnapshot 的输入。
 type SnapshotRequest struct {
-	SessionID   string `json:"session_id" jsonschema:"required,minLength=1"`
-	PageID      string `json:"page_id,omitempty" jsonschema_description:"可选；省略时先同步 Tab 状态并使用当前 active page。"`
-	MaxChars    int    `json:"max_chars,omitempty" jsonschema:"minimum=1,maximum=1048576" jsonschema_description:"页面正文最多返回的字符数，浏览器内先截断。"`
-	MaxElements int    `json:"max_elements,omitempty" jsonschema:"minimum=1,maximum=1000" jsonschema_description:"本页最多返回的可交互元素数量。"`
-	Offset      int    `json:"offset,omitempty" jsonschema:"minimum=0,maximum=1000000000" jsonschema_description:"跳过前面的可交互元素；使用上一页返回的 next_offset 继续读取。"`
+	SessionID   string `json:"session_id" jsonschema:"required,minLength=1" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
+	PageID      string `json:"page_id,omitempty" jsonschema_description:"可选的目标 page_id；省略时先同步 Tab 状态，再使用当前激活 Tab。"`
+	MaxChars    int    `json:"max_chars,omitempty" jsonschema:"minimum=1,maximum=1048576" jsonschema_description:"页面正文最多返回的字符数；省略时默认 12000，最大 1048576，在浏览器内截断。"`
+	MaxElements int    `json:"max_elements,omitempty" jsonschema:"minimum=1,maximum=1000" jsonschema_description:"本页最多返回的可交互元素数量；省略时默认 100，最大 1000。"`
+	Offset      int    `json:"offset,omitempty" jsonschema:"minimum=0,maximum=1000000000" jsonschema_description:"跳过的可交互元素数量；省略时从 0 开始，使用上一页返回的 next_offset 继续读取；最大 1000000000。"`
 }
 
 // SnapshotResponse 是 browserSnapshot 的输出；elements 中的 ref 只属于 page_id。
@@ -141,12 +151,12 @@ type SnapshotResponse struct {
 
 // ClickRequest 是 browserClick 的输入。
 type ClickRequest struct {
-	SessionID   string `json:"session_id"`
-	PageID      string `json:"page_id"`
-	Ref         string `json:"ref"`
-	Revision    uint64 `json:"revision"`
-	WaitAfterMS int    `json:"wait_after_ms,omitempty"`
-	TimeoutMS   int    `json:"timeout_ms,omitempty"`
+	SessionID   string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
+	PageID      string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	Ref         string `json:"ref" jsonschema_description:"目标元素引用；使用目标 page_id 的 browserSnapshot 返回的 ref，不能跨 Tab 使用。"`
+	Revision    uint64 `json:"revision" jsonschema_description:"生成 ref 的同一次 browserSnapshot 返回的 revision，必须大于 0；引用失效时重新获取快照。"`
+	WaitAfterMS int    `json:"wait_after_ms,omitempty" jsonschema_description:"点击成功后额外等待的毫秒数；省略或为 0 时不额外等待，不能为负数，等待计入 timeout_ms 的请求时限。"`
+	TimeoutMS   int    `json:"timeout_ms,omitempty" jsonschema_description:"操作超时毫秒数；省略或为 0 时不增加请求级时限，仍受宿主 context 和浏览器 OperationTimeout（默认 30 秒）限制；填写正数时取这些时限中的较短者。"`
 }
 
 // ClickResponse 是 browserClick 的输出。
@@ -163,10 +173,10 @@ type ClickResponse struct {
 
 // HoverRequest 是 browserHover 的输入。
 type HoverRequest struct {
-	SessionID string `json:"session_id"`
-	PageID    string `json:"page_id"`
-	Ref       string `json:"ref"`
-	Revision  uint64 `json:"revision"`
+	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
+	PageID    string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	Ref       string `json:"ref" jsonschema_description:"目标元素引用；使用目标 page_id 的 browserSnapshot 返回的 ref，不能跨 Tab 使用。"`
+	Revision  uint64 `json:"revision" jsonschema_description:"生成 ref 的同一次 browserSnapshot 返回的 revision，必须大于 0；引用失效时重新获取快照。"`
 }
 
 // HoverResponse 是 browserHover 的输出。内部鼠标轨迹不作为响应内容暴露。
@@ -181,15 +191,15 @@ type HoverResponse struct {
 
 // TypeRequest 是 browserType 的输入。text 只用于执行，不出现在响应中。
 type TypeRequest struct {
-	SessionID string `json:"session_id"`
-	PageID    string `json:"page_id"`
-	Ref       string `json:"ref"`
-	Revision  uint64 `json:"revision"`
-	Text      string `json:"text"`
+	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
+	PageID    string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	Ref       string `json:"ref" jsonschema_description:"目标元素引用；使用目标 page_id 的 browserSnapshot 返回的 ref，不能跨 Tab 使用。"`
+	Revision  uint64 `json:"revision" jsonschema_description:"生成 ref 的同一次 browserSnapshot 返回的 revision，必须大于 0；引用失效时重新获取快照。"`
+	Text      string `json:"text" jsonschema_description:"要输入的文本，可以为空；默认先清空原值，append=true 时追加；响应不会回显输入内容。"`
 	Append    bool   `json:"append,omitempty" jsonschema_description:"是否把文本追加到元素当前值末尾；省略或为 false 时先清空当前值。"`
-	Submit    bool   `json:"submit,omitempty"`
+	Submit    bool   `json:"submit,omitempty" jsonschema_description:"输入完成后是否向页面发送 Enter；省略或为 false 时只输入文本。"`
 	// SequenceVariable 在操作序列录制期间指定该输入使用的变量名。
-	SequenceVariable string `json:"sequence_variable,omitempty"`
+	SequenceVariable string `json:"sequence_variable,omitempty" jsonschema_description:"操作序列录制期间为此输入指定的变量名；回放时可覆盖该变量。"`
 }
 
 // TypeResponse 是 browserType 的输出，不回显输入内容。
@@ -207,12 +217,12 @@ type TypeResponse struct {
 
 // SelectOptionRequest 是 browserSelectOption 的输入。value 和 label 二选一。
 type SelectOptionRequest struct {
-	SessionID string `json:"session_id"`
-	PageID    string `json:"page_id"`
-	Ref       string `json:"ref"`
-	Revision  uint64 `json:"revision"`
-	Value     string `json:"value,omitempty"`
-	Label     string `json:"label,omitempty"`
+	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
+	PageID    string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	Ref       string `json:"ref" jsonschema_description:"目标元素引用；使用目标 page_id 的 browserSnapshot 返回的 ref，不能跨 Tab 使用。"`
+	Revision  uint64 `json:"revision" jsonschema_description:"生成 ref 的同一次 browserSnapshot 返回的 revision，必须大于 0；引用失效时重新获取快照。"`
+	Value     string `json:"value,omitempty" jsonschema_description:"要选择的原生单选下拉框选项值，使用快照 options 中的 value；与 label 二选一，不能为空。"`
+	Label     string `json:"label,omitempty" jsonschema_description:"要选择的原生单选下拉框可见标签，使用快照 options 中的 label；与 value 二选一，不能为空。"`
 }
 
 // SelectOptionResponse 是 browserSelectOption 的输出。
@@ -228,11 +238,11 @@ type SelectOptionResponse struct {
 
 // UploadFileRequest 是 browserUploadFile 的输入。
 type UploadFileRequest struct {
-	SessionID string `json:"session_id"`
-	PageID    string `json:"page_id"`
-	Ref       string `json:"ref"`
-	Revision  uint64 `json:"revision"`
-	Path      string `json:"path"`
+	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
+	PageID    string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	Ref       string `json:"ref" jsonschema_description:"目标原生 file input 的快照 ref；必须来自同一 page_id 的 browserSnapshot。"`
+	Revision  uint64 `json:"revision" jsonschema_description:"生成 ref 的同一次 browserSnapshot 返回的 revision，必须大于 0；引用失效时重新获取快照。"`
+	Path      string `json:"path" jsonschema_description:"浏览器宿主机器上的绝对文件路径；解析符号链接后必须位于宿主授权的 UploadDir 内，文件必须是大小不超过 10 MiB 的普通文件。"`
 }
 
 // UploadFileResponse 只返回文件名，不回显宿主路径或内容。
@@ -246,9 +256,9 @@ type UploadFileResponse struct {
 
 // PressRequest 是 browserPress 的输入。
 type PressRequest struct {
-	SessionID string `json:"session_id"`
-	PageID    string `json:"page_id"`
-	Key       string `json:"key"`
+	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
+	PageID    string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	Key       string `json:"key" jsonschema_description:"发送到页面当前焦点的按键；仅支持 Enter、Tab、Escape、Backspace、ArrowUp、ArrowDown、ArrowLeft、ArrowRight、Space，名称区分大小写。"`
 }
 
 // PressResponse 是 browserPress 的输出。
@@ -263,12 +273,12 @@ type PressResponse struct {
 
 // ScrollRequest 是 browserScroll 的输入，距离及坐标均为视口 CSS 像素。
 type ScrollRequest struct {
-	SessionID string   `json:"session_id"`
-	PageID    string   `json:"page_id"`
-	DeltaX    float64  `json:"delta_x,omitempty"`
-	DeltaY    float64  `json:"delta_y,omitempty"`
-	X         *float64 `json:"x,omitempty"`
-	Y         *float64 `json:"y,omitempty"`
+	SessionID string   `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
+	PageID    string   `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	DeltaX    float64  `json:"delta_x,omitempty" jsonschema_description:"水平滚动距离，单位 CSS 像素；正数向右，负数向左，省略为 0；绝对值不超过 10000，与 delta_y 至少一个非零。"`
+	DeltaY    float64  `json:"delta_y,omitempty" jsonschema_description:"垂直滚动距离，单位 CSS 像素；正数向下，负数向上，省略为 0；绝对值不超过 10000，与 delta_x 至少一个非零。"`
+	X         *float64 `json:"x,omitempty" jsonschema_description:"滚轮事件起点的视口横坐标，单位 CSS 像素；省略时使用视口宽度的一半，必须大于等于 0 且小于视口宽度；可用于指定嵌套滚动区域。"`
+	Y         *float64 `json:"y,omitempty" jsonschema_description:"滚轮事件起点的视口纵坐标，单位 CSS 像素；省略时使用视口高度的一半，必须大于等于 0 且小于视口高度；可用于指定嵌套滚动区域。"`
 }
 
 // ScrollResponse 表示滚轮事件已由浏览器接收。
@@ -284,11 +294,11 @@ type ScrollResponse struct {
 // WaitRequest 是 browserWait 的输入。
 type WaitRequest struct {
 	SessionID     string `json:"session_id" jsonschema:"required,minLength=1" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
-	PageID        string `json:"page_id" jsonschema:"required,minLength=1" jsonschema_description:"目标网页 page 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
-	Condition     string `json:"condition" jsonschema:"required,enum=selector_visible,enum=selector_hidden,enum=url_contains,enum=title_contains,enum=text_contains,enum=load_complete" jsonschema_description:"等待条件：selector_visible/hidden 等待 CSS selector 或 browserSnapshot 返回的 ref 出现/隐藏；url_contains、title_contains、text_contains 分别匹配当前 URL、标题或正文；load_complete 等待 document.readyState=complete。"`
-	RefOrSelector string `json:"ref_or_selector" jsonschema:"maxLength=4096" jsonschema_description:"selector_visible/hidden 时填写 CSS selector，或直接填写同一 page_id 的 browserSnapshot 元素 ref；url/title/text_contains 时填写要匹配的文本；load_complete 时可省略。"`
-	Revision      uint64 `json:"revision,omitempty" jsonschema:"minimum=1" jsonschema_description:"可选的 browserSnapshot revision。使用元素 ref 时传入快照响应中的 revision，可在页面变化后尽早得到 stale_reference。"`
-	TimeoutMS     int    `json:"timeout_ms,omitempty" jsonschema:"minimum=1,maximum=600000" jsonschema_description:"等待超时毫秒数；省略时使用浏览器默认操作超时。"`
+	PageID        string `json:"page_id" jsonschema:"required,minLength=1" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	Condition     string `json:"condition" jsonschema:"required,enum=selector_visible,enum=selector_hidden,enum=url_contains,enum=title_contains,enum=text_contains,enum=load_complete" jsonschema_description:"等待条件：selector_visible/selector_hidden 等待 CSS selector 或快照 ref 可见/隐藏；url_contains、title_contains、text_contains 分别匹配 URL、标题或正文；load_complete 等待 document.readyState=complete。"`
+	RefOrSelector string `json:"ref_or_selector" jsonschema:"maxLength=4096" jsonschema_description:"selector_visible/selector_hidden 时填写 CSS selector 或同一 page_id 的快照 ref；url/title/text_contains 时填写待匹配文本；load_complete 时可省略。"`
+	Revision      uint64 `json:"revision,omitempty" jsonschema:"minimum=1" jsonschema_description:"仅在使用快照 ref 等待时可填写对应 browserSnapshot 的 revision，用于检查引用过期；使用 CSS selector 时省略。"`
+	TimeoutMS     int    `json:"timeout_ms,omitempty" jsonschema:"minimum=1,maximum=600000" jsonschema_description:"等待超时毫秒数，可填 1 到 600000；省略时使用浏览器 OperationTimeout（默认 30 秒）；实际时限取此值、浏览器操作时限和宿主 context 中的较短者。"`
 }
 
 // WaitResponse 是 browserWait 的输出。
@@ -301,11 +311,11 @@ type WaitResponse struct {
 
 // EvaluateRequest 是 browserEvaluate 的输入。
 type EvaluateRequest struct {
-	SessionID    string `json:"session_id"`
-	PageID       string `json:"page_id"`
-	Code         string `json:"code"`
-	TimeoutMS    int    `json:"timeout_ms,omitempty"`
-	AwaitPromise *bool  `json:"await_promise,omitempty"`
+	SessionID    string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
+	PageID       string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	Code         string `json:"code" jsonschema_description:"在目标页面 console 域执行的 JavaScript 表达式或语句，需宿主启用 allow_evaluate，并受 MaxScriptBytes 限制；返回值应可序列化为 JSON，且不超过 MaxResultBytes。"`
+	TimeoutMS    int    `json:"timeout_ms,omitempty" jsonschema_description:"操作超时毫秒数；省略或为 0 时不增加请求级时限，仍受宿主 context 和浏览器 OperationTimeout（默认 30 秒）限制；填写正数时取这些时限中的较短者。"`
+	AwaitPromise *bool  `json:"await_promise,omitempty" jsonschema_description:"是否等待返回的 Promise 完成；省略时默认为 true，false 时不等待。"`
 }
 
 // EvaluateResponse 是 browserEvaluate 的输出。
@@ -318,21 +328,21 @@ type EvaluateResponse struct {
 
 // ScreenshotRequest 是 browserScreenshot 的输入。
 type ScreenshotRequest struct {
-	SessionID string `json:"session_id"`
-	PageID    string `json:"page_id"`
-	FullPage  bool   `json:"full_page,omitempty"`
-	// Region 使用截图时的页面视口 CSS 坐标；省略时截取整个页面。
-	Region *ScreenshotRegion `json:"region,omitempty"`
+	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；原样使用 browserOpen 或 browserTabs 返回的 session_id。"`
+	PageID    string `json:"page_id" jsonschema_description:"目标网页 Tab 标识；原样使用 browserOpen、browserTabs 或 browserSnapshot 返回的 page_id。"`
+	FullPage  bool   `json:"full_page,omitempty" jsonschema_description:"是否截取完整可滚动页面；省略或为 false 时截取当前视口；不能与 region 同时启用。"`
+	// Region 使用截图时的页面视口 CSS 坐标；省略时由 FullPage 决定截图范围。
+	Region *ScreenshotRegion `json:"region,omitempty" jsonschema_description:"可选的视口裁剪区域；填写截图时的 CSS 坐标及视口尺寸，区域必须完全位于视口内，且 full_page 必须为 false。"`
 }
 
 // ScreenshotRegion 描述待截取的页面视口区域及当时的视口尺寸。
 type ScreenshotRegion struct {
-	X              float64 `json:"x"`
-	Y              float64 `json:"y"`
-	Width          float64 `json:"width"`
-	Height         float64 `json:"height"`
-	ViewportWidth  float64 `json:"viewport_width"`
-	ViewportHeight float64 `json:"viewport_height"`
+	X              float64 `json:"x" jsonschema_description:"裁剪区域左上角相对于视口左边缘的 CSS 像素坐标，必须大于等于 0。"`
+	Y              float64 `json:"y" jsonschema_description:"裁剪区域左上角相对于视口上边缘的 CSS 像素坐标，必须大于等于 0。"`
+	Width          float64 `json:"width" jsonschema_description:"裁剪区域宽度，单位 CSS 像素；必须大于 0，且 x + width 不超过 viewport_width。"`
+	Height         float64 `json:"height" jsonschema_description:"裁剪区域高度，单位 CSS 像素；必须大于 0，且 y + height 不超过 viewport_height。"`
+	ViewportWidth  float64 `json:"viewport_width" jsonschema_description:"截图时完整视口的 CSS 像素宽度，必须大于 0；用于把 CSS 坐标换算为截图像素坐标。"`
+	ViewportHeight float64 `json:"viewport_height" jsonschema_description:"截图时完整视口的 CSS 像素高度，必须大于 0；用于把 CSS 坐标换算为截图像素坐标。"`
 }
 
 // ScreenshotResponse 是 browserScreenshot 的输出。
@@ -349,7 +359,7 @@ type ScreenshotResponse struct {
 
 // CloseRequest 是 browserClose 的输入。
 type CloseRequest struct {
-	SessionID string `json:"session_id"`
+	SessionID string `json:"session_id" jsonschema_description:"要关闭的 browserOpen session_id；释放该 session 的全部页面和资源；外部浏览器只断开连接，已关闭的 session 可重复关闭。"`
 }
 
 // CloseResponse 是 browserClose 的输出。

@@ -250,6 +250,12 @@ handler := browserhttp.NewHandler(manager, browserhttp.Options{
 `Handler` 的签名为 `func(context.Context, Request) (Response, error)`。
 
 请求和响应使用导出的命名结构体，宿主负责 Schema 校验和工具调用协议。
+全部工具输入字段（含嵌套字段）通过 `jsonschema_description` 提供中文参数说明，涵盖用途、默认值和约束。
+`browserNavigate` 不再接受未使用的 `timeout_ms` 字段。
+打开或导航页面时，加载完成与页面空闲共用最多 2 秒的等待窗口；浏览器启动和导航请求仍受 `Session.OperationTimeout` 与宿主 context 限制。
+超过等待窗口后页面继续加载，调用成功返回 `load_status: "timeout"`、当前页面 `snapshot` 和未完全加载提醒 `warning`。
+模型可直接使用快照中的元素引用继续操作，或调用 `browserWait`、`browserSnapshot` 检查后续状态；无需重新打开或导航。
+若当前内容暂时无法读取，`warning` 会包含读取失败原因，页面仍保留。
 适配示例见 [examples/functions](examples/functions/main.go)。
 
 ### 操作序列生成与回放

@@ -1,7 +1,7 @@
 # Codex 浏览器交互的 20 项欠缺
 
-日期：2026-10-26（Asia/Shanghai）  
-测试目标：`http://127.0.0.1:8879/snapshot.html`  
+日期：2026-10-26（Asia/Shanghai）\
+测试目标：`http://127.0.0.1:8879/snapshot.html`\
 测试表面：当前 Codex 桌面应用的 in-app Browser、accessibility snapshot、元素索引操作和 `pageAssets`
 
 ## 范围与方法

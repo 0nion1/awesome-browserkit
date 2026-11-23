@@ -1,7 +1,7 @@
 # BrowserKit snapshot 与 Codex 页面理解实测
 
-日期：2026-10-26（Asia/Shanghai）  
-仓库基线：`e36f901`，叠加当前工作区改动  
+日期：2026-10-26（Asia/Shanghai）\
+仓库基线：`e36f901`，叠加当前工作区改动\
 环境：macOS arm64、Go 1.25.8、Google Chrome 156.0.8078.47
 
 ## 结论

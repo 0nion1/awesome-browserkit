@@ -97,13 +97,13 @@ type Element struct {
 // ElementLocator 描述可跨页面重载重新解析的元素定位信息。
 // Ref 仍用于当前 document 内的安全操作；Locator 只用于操作序列回放。
 type ElementLocator struct {
-	Selector      string `json:"selector,omitempty"`
-	XPath         string `json:"xpath,omitempty"`
-	AbsoluteXPath string `json:"absolute_xpath,omitempty"`
-	Role          string `json:"role,omitempty"`
-	Name          string `json:"name,omitempty"`
-	Type          string `json:"type,omitempty"`
-	FrameURL      string `json:"frame_url,omitempty"`
+	Selector      string `json:"selector,omitempty" jsonschema_description:"稳定的 CSS 选择器。"`
+	XPath         string `json:"xpath,omitempty" jsonschema_description:"元素的 XPath 定位表达式。"`
+	AbsoluteXPath string `json:"absolute_xpath,omitempty" jsonschema_description:"元素的绝对 XPath 定位表达式。"`
+	Role          string `json:"role,omitempty" jsonschema_description:"元素的语义角色，用于 role/name 兜底匹配。"`
+	Name          string `json:"name,omitempty" jsonschema_description:"元素的可访问名称，用于 role/name 兜底匹配。"`
+	Type          string `json:"type,omitempty" jsonschema_description:"可选的元素输入类型，用于限制语义匹配。"`
+	FrameURL      string `json:"frame_url,omitempty" jsonschema_description:"可选的所属 frame URL，用于限定匹配范围。"`
 }
 
 // ElementOption 是原生下拉框中可供选择的选项。

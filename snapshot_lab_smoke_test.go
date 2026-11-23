@@ -231,9 +231,10 @@ func TestRealBrowserSnapshotBehaviorLab(t *testing.T) {
 
 	// 同一 document 内的文本变化和 DOM 替换不会提升 revision；同节点 ref
 	// 保持稳定，而被替换节点的旧 ref 必须在下一次操作时立即失败。
+	mutationBaseline := snapshotLabSnapshot(lab, sessionID, pageID, 1_000, 0)
 	inPlace := Element{}
 	replaced := Element{}
-	for _, element := range initial.Elements {
+	for _, element := range mutationBaseline.Elements {
 		if element.Role == "button" && strings.HasPrefix(element.Name, "Phase ") {
 			inPlace = element
 		}
@@ -248,14 +249,14 @@ func TestRealBrowserSnapshotBehaviorLab(t *testing.T) {
 	time.Sleep(650 * time.Millisecond)
 	err = lab.invoke("browserClick", map[string]any{
 		"session_id": sessionID, "page_id": pageID,
-		"ref": replaced.Ref, "revision": initial.Revision,
+		"ref": replaced.Ref, "revision": mutationBaseline.Revision,
 	}, new(ClickResponse))
 	if err == nil || !strings.Contains(err.Error(), "stale_reference") {
 		t.Fatalf("被定时替换元素的旧 ref 没有快速报告 stale_reference: %v", err)
 	}
 	changed := snapshotLabSnapshot(lab, sessionID, pageID, 1_000, 0)
-	if changed.Revision != initial.Revision {
-		t.Fatalf("同 document 的 DOM 变化不应提升 revision: before=%d after=%d", initial.Revision, changed.Revision)
+	if changed.Revision != mutationBaseline.Revision {
+		t.Fatalf("同 document 的 DOM 变化不应提升 revision: before=%d after=%d", mutationBaseline.Revision, changed.Revision)
 	}
 	var changedInPlace, changedReplacement Element
 	for _, element := range changed.Elements {

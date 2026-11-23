@@ -23,61 +23,61 @@ var sequenceVariablePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`
 
 // SequenceVariable 是操作序列使用的可覆盖输入。
 type SequenceVariable struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	Default     string `json:"default,omitempty"`
-	Sensitive   bool   `json:"sensitive,omitempty"`
+	Name        string `json:"name" jsonschema_description:"变量名：以字母或下划线开头，仅含字母、数字和下划线，最长 64 字符。"`
+	Description string `json:"description,omitempty" jsonschema_description:"变量用途说明。"`
+	Default     string `json:"default,omitempty" jsonschema_description:"未提供覆盖值时使用的默认文本。"`
+	Sensitive   bool   `json:"sensitive,omitempty" jsonschema_description:"是否将变量标记为敏感输入。"`
 }
 
 // SequencePage 使用逻辑别名描述序列涉及的页面。
 type SequencePage struct {
-	Alias   string `json:"alias"`
-	Opener  string `json:"opener,omitempty"`
-	URLHint string `json:"url_hint,omitempty"`
+	Alias   string `json:"alias" jsonschema_description:"序列内唯一的页面逻辑别名。"`
+	Opener  string `json:"opener,omitempty" jsonschema_description:"打开此页面的父页面逻辑别名。"`
+	URLHint string `json:"url_hint,omitempty" jsonschema_description:"录制时观察到的页面 URL 提示。"`
 }
 
 // SequenceProviderCall 描述回放期间需要宿主外部能力介入的步骤。
 type SequenceProviderCall struct {
-	Capability    string         `json:"capability"`
-	Instruction   string         `json:"instruction,omitempty"`
-	Variable      string         `json:"variable"`
-	SourceLocator ElementLocator `json:"source_locator,omitempty"`
-	TargetLocator ElementLocator `json:"target_locator"`
+	Capability    string         `json:"capability" jsonschema_description:"需要宿主提供的外部能力名称。"`
+	Instruction   string         `json:"instruction,omitempty" jsonschema_description:"交给宿主执行外部能力的说明。"`
+	Variable      string         `json:"variable" jsonschema_description:"用于保存外部结果的已声明变量名。"`
+	SourceLocator ElementLocator `json:"source_locator,omitempty" jsonschema_description:"可选的外部能力来源元素定位器。"`
+	TargetLocator ElementLocator `json:"target_locator" jsonschema_description:"用于填写外部结果的目标元素定位器。"`
 }
 
 // SequenceStep 是可验证和回放的单个浏览器动作。
 type SequenceStep struct {
-	ID             string                `json:"id"`
-	Type           string                `json:"type"`
-	Page           string                `json:"page"`
-	URL            string                `json:"url,omitempty"`
-	Locator        ElementLocator        `json:"locator,omitempty"`
-	ValueTemplate  string                `json:"value_template,omitempty"`
-	Append         bool                  `json:"append,omitempty"`
-	Submit         bool                  `json:"submit,omitempty"`
-	WaitAfterMS    int                   `json:"wait_after_ms,omitempty"`
-	ScriptTemplate string                `json:"script_template,omitempty"`
-	ScriptMode     string                `json:"script_mode,omitempty"`
-	Provider       *SequenceProviderCall `json:"provider,omitempty"`
-	Group          string                `json:"group,omitempty"`
+	ID             string                `json:"id" jsonschema_description:"序列内唯一的步骤 ID。"`
+	Type           string                `json:"type" jsonschema_description:"动作类型：navigate、click、input、script 或 provider-call。"`
+	Page           string                `json:"page" jsonschema_description:"此步骤所属的页面逻辑别名。"`
+	URL            string                `json:"url,omitempty" jsonschema_description:"navigate 步骤的目标 URL，可包含变量占位符。"`
+	Locator        ElementLocator        `json:"locator,omitempty" jsonschema_description:"click 或 input 步骤用于重新定位元素的定位器。"`
+	ValueTemplate  string                `json:"value_template,omitempty" jsonschema_description:"输入文本模板，可用 {{变量名}} 引用已声明变量。"`
+	Append         bool                  `json:"append,omitempty" jsonschema_description:"是否追加输入；默认替换已有文本。"`
+	Submit         bool                  `json:"submit,omitempty" jsonschema_description:"输入完成后是否发送 Enter。"`
+	WaitAfterMS    int                   `json:"wait_after_ms,omitempty" jsonschema_description:"执行此步骤后等待的毫秒数。"`
+	ScriptTemplate string                `json:"script_template,omitempty" jsonschema_description:"脚本步骤的 JavaScript 模板，可引用已声明变量。"`
+	ScriptMode     string                `json:"script_mode,omitempty" jsonschema_description:"脚本模式：action 或 assertion；assertion 必须返回 true。"`
+	Provider       *SequenceProviderCall `json:"provider,omitempty" jsonschema_description:"provider-call 步骤的外部能力请求。"`
+	Group          string                `json:"group,omitempty" jsonschema_description:"步骤所属的逻辑分组 ID。"`
 }
 
 // SequenceGroup 保存模型清洗后的逻辑分组，不改变组内动作内容或顺序。
 type SequenceGroup struct {
-	ID      string   `json:"id"`
-	Purpose string   `json:"purpose,omitempty"`
-	Steps   []string `json:"steps"`
+	ID      string   `json:"id" jsonschema_description:"逻辑分组 ID。"`
+	Purpose string   `json:"purpose,omitempty" jsonschema_description:"分组的业务目的。"`
+	Steps   []string `json:"steps" jsonschema_description:"属于此组的步骤 ID 列表。"`
 }
 
 // BrowserSequence 是可跨 session 保存和回放的版本化操作序列。
 type BrowserSequence struct {
-	SchemaVersion          int                `json:"schema_version"`
-	Goal                   string             `json:"goal"`
-	EnvironmentRequirement string             `json:"environment_requirement"`
-	Variables              []SequenceVariable `json:"variables,omitempty"`
-	Pages                  []SequencePage     `json:"pages"`
-	Groups                 []SequenceGroup    `json:"groups,omitempty"`
-	Steps                  []SequenceStep     `json:"steps"`
+	SchemaVersion          int                `json:"schema_version" jsonschema_description:"操作序列格式版本，目前必须为 1。"`
+	Goal                   string             `json:"goal" jsonschema_description:"本次操作序列要完成的目标。"`
+	EnvironmentRequirement string             `json:"environment_requirement" jsonschema_description:"回放环境要求，目前必须为 fresh，使用全新临时浏览器。"`
+	Variables              []SequenceVariable `json:"variables,omitempty" jsonschema_description:"序列使用的变量定义和默认值。"`
+	Pages                  []SequencePage     `json:"pages" jsonschema_description:"序列使用的页面别名定义。"`
+	Groups                 []SequenceGroup    `json:"groups,omitempty" jsonschema_description:"步骤的逻辑分组。"`
+	Steps                  []SequenceStep     `json:"steps" jsonschema_description:"按执行顺序排列的 1 至 100 个步骤，首步必须为 navigate。"`
 }
 
 // SequenceCandidate 是探索阶段已经实际执行过的候选动作。
@@ -89,15 +89,15 @@ type SequenceCandidate struct {
 
 // SequenceStartRequest 开始收集一次探索产生的候选步骤。
 type SequenceStartRequest struct {
-	SessionID string             `json:"session_id"`
-	PageID    string             `json:"page_id"`
-	Goal      string             `json:"goal"`
-	Variables []SequenceVariable `json:"variables,omitempty"`
+	SessionID string             `json:"session_id" jsonschema_description:"浏览器 session 标识；使用 browserOpen 返回的 session_id。"`
+	PageID    string             `json:"page_id" jsonschema_description:"目标 Tab 标识；使用同一 session 的 page_id。"`
+	Goal      string             `json:"goal" jsonschema_description:"本次操作序列要完成的目标。"`
+	Variables []SequenceVariable `json:"variables,omitempty" jsonschema_description:"序列使用的变量定义和默认值。"`
 }
 
 // SequenceReadRequest 读取当前 session 的候选步骤。
 type SequenceReadRequest struct {
-	SessionID string `json:"session_id"`
+	SessionID string `json:"session_id" jsonschema_description:"浏览器 session 标识；使用 browserOpen 返回的 session_id。"`
 }
 
 // SequenceDraftResponse 返回当前草稿，不回显临时元素 ref。
@@ -111,15 +111,15 @@ type SequenceDraftResponse struct {
 
 // SequenceSelectionGroup 由模型选择候选步骤组成最终逻辑分组。
 type SequenceSelectionGroup struct {
-	CandidateIDs []string `json:"candidate_ids"`
-	Purpose      string   `json:"purpose,omitempty"`
+	CandidateIDs []string `json:"candidate_ids" jsonschema_description:"保留的候选步骤 ID，必须遵循原执行顺序，不得重复或改写。"`
+	Purpose      string   `json:"purpose,omitempty" jsonschema_description:"分组的业务目的。"`
 }
 
 // SequenceFinishRequest 完成候选清洗。候选只能删除和分组，不能重排或改写。
 type SequenceFinishRequest struct {
-	SessionID  string                   `json:"session_id"`
-	Groups     []SequenceSelectionGroup `json:"groups"`
-	OutputPath string                   `json:"output_path,omitempty"`
+	SessionID  string                   `json:"session_id" jsonschema_description:"浏览器 session 标识；使用 browserOpen 返回的 session_id。"`
+	Groups     []SequenceSelectionGroup `json:"groups" jsonschema_description:"最终保留的候选步骤及分组；只允许删除和分组，不能重排。"`
+	OutputPath string                   `json:"output_path,omitempty" jsonschema_description:"保存序列 JSON 的文件路径；省略时创建临时文件，已有文件不会被覆盖。"`
 }
 
 // SequenceResponse 返回最终操作序列。
@@ -150,12 +150,12 @@ type SequenceRecordingState struct {
 
 // SequenceScriptRequest 显式执行并记录一段序列脚本。
 type SequenceScriptRequest struct {
-	SessionID    string `json:"session_id"`
-	PageID       string `json:"page_id"`
-	CodeTemplate string `json:"code_template"`
-	Mode         string `json:"mode,omitempty"`
-	TimeoutMS    int    `json:"timeout_ms,omitempty"`
-	AwaitPromise *bool  `json:"await_promise,omitempty"`
+	SessionID    string `json:"session_id" jsonschema_description:"浏览器 session 标识；使用 browserOpen 返回的 session_id。"`
+	PageID       string `json:"page_id" jsonschema_description:"目标 Tab 标识；使用同一 session 的 page_id。"`
+	CodeTemplate string `json:"code_template" jsonschema_description:"要执行并录制的 JavaScript 模板，可引用草稿中已声明的变量；需启用 allow_evaluate。"`
+	Mode         string `json:"mode,omitempty" jsonschema_description:"action 执行动作，assertion 要求返回 true；默认 action。"`
+	TimeoutMS    int    `json:"timeout_ms,omitempty" jsonschema_description:"脚本执行超时毫秒数；省略或为 0 时使用请求和宿主超时限制。"`
+	AwaitPromise *bool  `json:"await_promise,omitempty" jsonschema_description:"是否等待脚本返回的 Promise 完成；省略时使用 browserEvaluate 默认行为。"`
 }
 
 // SequenceScriptResponse 返回脚本结果及候选 ID。
@@ -169,16 +169,16 @@ type SequenceScriptResponse struct {
 
 // SequenceProviderCallRequest 记录一次已经由宿主求值的外部能力调用。
 type SequenceProviderCallRequest struct {
-	SessionID      string `json:"session_id"`
-	PageID         string `json:"page_id"`
-	TargetRef      string `json:"target_ref"`
-	TargetRevision uint64 `json:"target_revision"`
-	SourceRef      string `json:"source_ref,omitempty"`
-	SourceRevision uint64 `json:"source_revision,omitempty"`
-	Capability     string `json:"capability"`
-	Instruction    string `json:"instruction,omitempty"`
-	Variable       string `json:"variable"`
-	Value          string `json:"value"`
+	SessionID      string `json:"session_id" jsonschema_description:"浏览器 session 标识；使用 browserOpen 返回的 session_id。"`
+	PageID         string `json:"page_id" jsonschema_description:"目标 Tab 标识；使用同一 session 的 page_id。"`
+	TargetRef      string `json:"target_ref" jsonschema_description:"接收外部结果的元素 ref，来自目标页面快照。"`
+	TargetRevision uint64 `json:"target_revision" jsonschema_description:"生成 target_ref 的快照 revision。"`
+	SourceRef      string `json:"source_ref,omitempty" jsonschema_description:"可选的外部能力来源元素 ref。"`
+	SourceRevision uint64 `json:"source_revision,omitempty" jsonschema_description:"提供 source_ref 时对应的快照 revision。"`
+	Capability     string `json:"capability" jsonschema_description:"需要宿主提供的外部能力名称。"`
+	Instruction    string `json:"instruction,omitempty" jsonschema_description:"交给宿主执行外部能力的说明。"`
+	Variable       string `json:"variable" jsonschema_description:"用于保存外部结果的已声明变量名。"`
+	Value          string `json:"value" jsonschema_description:"宿主已取得的外部结果；立即填写目标并作为变量默认值保存。"`
 }
 
 // SequenceProviderCallResponse 返回已填写的外部结果及候选 ID。
@@ -191,16 +191,16 @@ type SequenceProviderCallResponse struct {
 
 // SequenceReplayRequest 在全新临时浏览器环境回放一个序列。
 type SequenceReplayRequest struct {
-	Sequence  BrowserSequence   `json:"sequence"`
-	Variables map[string]string `json:"variables,omitempty"`
+	Sequence  BrowserSequence   `json:"sequence" jsonschema_description:"要在全新临时浏览器中回放的完整操作序列。"`
+	Variables map[string]string `json:"variables,omitempty" jsonschema_description:"按变量名指定覆盖文本；只能覆盖序列已声明的变量。"`
 }
 
 // SequenceResumeRequest 为暂停的 provider-call 提交结果并续播。
 type SequenceResumeRequest struct {
-	ReplayID   string `json:"replay_id"`
-	Token      string `json:"token"`
-	Value      string `json:"value,omitempty"`
-	UseDefault bool   `json:"use_default,omitempty"`
+	ReplayID   string `json:"replay_id" jsonschema_description:"sequenceReplay 返回的暂停回放 ID。"`
+	Token      string `json:"token" jsonschema_description:"暂停响应返回的一次性 resume_token。"`
+	Value      string `json:"value,omitempty" jsonschema_description:"宿主提供的外部能力结果；use_default 为 false 时使用此值。"`
+	UseDefault bool   `json:"use_default,omitempty" jsonschema_description:"是否使用该变量的默认值恢复回放。"`
 }
 
 // SequenceProviderRequest 是暂停时交给宿主处理的外部能力请求。

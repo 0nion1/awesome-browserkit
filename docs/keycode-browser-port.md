@@ -6,6 +6,34 @@ keycode 同步的原始 BrowserKit 基线为 `1d22c4ff7e0981c00ccbf756ceb704e1ad
 合并按该基线做三方比较，保留本项目的独立 HTTP 服务、CLI、React 包与序列功能。
 原生依赖版本不变，运行时不依赖 keycode、Agent、插件加载器或宿主 UI。
 
+## 2026-11-24 复核
+
+重新 fetch keycode `origin/main`，当前提交为 `e31e178c1ed69fc378f1cc1c129294d65bb9c00e`。
+该提交的整个 `plugin/browser` Git tree 与上次来源 `9f5c208c` 相同，
+tree ID 均为 `8057db0deaf0f8339f7b31cd21e66e26f67d8191`。
+因此 main 合入后的浏览器代码没有新增待回迁修改。
+
+逐文件检查 SDK，转换包名和测试导入后，原有 70 个 Go 文件中 55 个完全相同，
+其余 15 个差异为 BrowserKit 保留的序列录制回放、定位信息、独立宿主适配和测试适配。
+iframe/OOPIF 实现 `page_frame.go`、批量动作 `operations_batch.go`、
+弹窗接口 `operations_dialog.go`、页面动作 `page_actions.go` 等文件与 keycode main 一致。
+主文档快照 `page.go` 的差异只增加序列定位器及内部焦点采样，
+保留 keycode 的 open Shadow DOM、同源 iframe 遍历和原生弹窗处理逻辑。
+
+新增真实 Chrome 组合回归 `TestRealBrowserNestedShadowDialog`：
+分别在主文档、同源 iframe 中创建两层 open Shadow DOM，
+通过快照 ref 输入文本、点击按钮、读取待处理 prompt，
+再用 `HandleDialog` 提交文本，并断言 Shadow DOM 正文中的最终结果。
+加载中弹窗的时间测试先建立浏览器 session，避免将 Chrome 冷启动耗时误判为弹窗等待。
+
+支持边界与 keycode 一致：仅遍历 open Shadow DOM；跨域 frame 的采集脚本
+仍不递归其内部 Shadow DOM；跨域快照最多聚合 3 个 frame，OOPIF 操作支持一层。
+这些是两边共有的边界，不能将其视为所有 Shadow DOM 与 iframe 组合均已支持。
+
+迁移提交推送在 `origin/feature/keycode-browser-improvements`。
+复核时 `origin/main` 为 `ec8605b`，`github/main` 为 `e31b3fa`，
+两者均未包含迁移提交 `f07329c`；直接使用这些 main 分支仍然缺少本次增强。
+
 ## 页面操作
 
 - `browserAct` 顺序执行最多 20 个动作，只在批次结束时读取最终快照。

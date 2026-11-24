@@ -20,6 +20,9 @@ func TestRealBrowserDialogPriorityPages(t *testing.T) {
 		var releaseOnce sync.Once
 		defer releaseOnce.Do(func() { close(release) })
 		mux := http.NewServeMux()
+		mux.HandleFunc("/ready", func(writer http.ResponseWriter, _ *http.Request) {
+			_, _ = writer.Write([]byte(`<!doctype html><title>Ready</title>`))
+		})
 		mux.HandleFunc("/", func(writer http.ResponseWriter, _ *http.Request) {
 			_, _ = writer.Write([]byte(`<!doctype html><title>Slow Dialog</title>
 <h1>弹窗前页面已经可读</h1><img src="/slow-resource">
@@ -39,8 +42,14 @@ func TestRealBrowserDialogPriorityPages(t *testing.T) {
 		}
 		defer manager.Close(context.Background())
 
+		// 冷启动 Chrome 不属于页面加载的等待窗口；先建立可复用 session，
+		// 再计时验证弹窗确实打断了加载等待，而不是测本机启动速度。
+		ready, err := manager.Open(context.Background(), OpenRequest{URL: server.URL + "/ready"})
+		if err != nil {
+			t.Fatal(err)
+		}
 		started := time.Now()
-		opened, err := manager.Open(context.Background(), OpenRequest{URL: server.URL})
+		opened, err := manager.Open(context.Background(), OpenRequest{SessionID: ready.SessionID, URL: server.URL})
 		if err != nil {
 			t.Fatal(err)
 		}

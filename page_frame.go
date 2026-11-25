@@ -189,43 +189,60 @@ func (page *rodPage) frameBindings(ctx context.Context) ([]frameBinding, error) 
 	}
 
 	result := make([]frameBinding, 0, len(order))
+	frameIndexes := make(map[proto.PageFrameID]int, len(order))
 	for _, id := range order {
 		binding := bindings[id]
 		binding.Prefix = frameRefPrefixFor(binding.FrameID, binding.LoaderID)
-		if binding.Owner == nil {
+		switch {
+		case binding.Unavailable != "":
+		case binding.Owner == nil:
 			binding.Unavailable = "frame owner unavailable"
-		} else {
+		default:
 			owner, ownerErr := (proto.DOMGetFrameOwner{FrameID: id}).Call(binding.Owner.Context(ctx))
 			if ownerErr != nil || owner == nil {
 				binding.Unavailable = "frame owner unavailable"
 			} else {
-				visibility := page.frameOwnerVisibilityIn(ctx, binding.Owner, owner.BackendNodeID)
-				binding.Hidden, binding.MetadataOnly, binding.SuppressText = visibility.Hidden, visibility.MetadataOnly, visibility.SuppressText
-			}
-		}
-		result = append(result, binding)
-	}
-	for index := range result {
-		for parentID := result[index].ParentID; parentID != ""; {
-			parent, ok := bindings[parentID]
-			if !ok {
-				break
-			}
-			// 可见性取已完成宿主检查的条目。
-			for _, candidate := range result {
-				if candidate.FrameID == parentID {
-					result[index].Hidden = result[index].Hidden || candidate.Hidden
-					result[index].MetadataOnly = result[index].MetadataOnly || candidate.MetadataOnly
-					result[index].SuppressText = result[index].SuppressText || candidate.SuppressText
+				visibility, ok := page.frameOwnerVisibilityIn(ctx, binding.Owner, owner.BackendNodeID)
+				if !ok {
+					binding.Unavailable = "frame_visibility_unavailable"
+				} else {
+					binding.Hidden, binding.MetadataOnly, binding.SuppressText = *visibility.Hidden, visibility.MetadataOnly, visibility.SuppressText
 				}
 			}
-			parentID = parent.ParentID
+		}
+		frameIndexes[id] = len(result)
+		result = append(result, binding)
+	}
+	// 子 frame 继承已经核实的祖先状态，包括祖先探测失败。
+	classified := make([]bool, len(result))
+	var classify func(int)
+	classify = func(index int) {
+		if classified[index] {
+			return
+		}
+		classified[index] = true
+		frame := &result[index]
+		if parentIndex, ok := frameIndexes[frame.ParentID]; ok {
+			classify(parentIndex)
+			parent := result[parentIndex]
+			if frame.Unavailable == "" && parent.Unavailable != "" {
+				frame.Unavailable = "frame_ancestor_visibility_unavailable"
+			}
+			frame.Hidden = frame.Hidden || parent.Hidden
+			frame.MetadataOnly = frame.MetadataOnly || parent.MetadataOnly
+			frame.SuppressText = frame.SuppressText || parent.SuppressText
+		}
+		if frame.Unavailable == "" && !frame.Hidden && (frame.MetadataOnly || frame.SuppressText) {
+			readable, ok := page.frameCanReadTop(ctx, *frame)
+			if !ok {
+				frame.Unavailable = "frame_origin_unavailable"
+			} else {
+				frame.Hidden = !readable
+			}
 		}
 	}
 	for index := range result {
-		if (result[index].MetadataOnly || result[index].SuppressText) && !result[index].Hidden && !page.frameCanReadTop(ctx, result[index]) {
-			result[index].Hidden = true
-		}
+		classify(index)
 	}
 	// 已移除或导航的 frame 文档不能保留旧引用。
 	page.frameMu.Lock()
@@ -850,21 +867,25 @@ func (page *rodPage) closeOOPIFs() {
 }
 
 type frameVisibility struct {
-	Hidden       bool `json:"hidden"`
-	MetadataOnly bool `json:"metadata_only"`
-	SuppressText bool `json:"suppress_text"`
+	Hidden       *bool `json:"hidden"`
+	MetadataOnly bool  `json:"metadata_only"`
+	SuppressText bool  `json:"suppress_text"`
 }
 
 // frameOwnerVisibilityIn 区分不可枚举的宿主与只允许返回控件元数据的宿主。
-func (page *rodPage) frameOwnerVisibilityIn(ctx context.Context, client *rod.Page, backendNodeID proto.DOMBackendNodeID) frameVisibility {
+func (page *rodPage) frameOwnerVisibilityIn(ctx context.Context, client *rod.Page, backendNodeID proto.DOMBackendNodeID) (frameVisibility, bool) {
 	if backendNodeID == 0 {
-		return frameVisibility{}
+		return frameVisibility{}, false
 	}
 	node, err := proto.DOMResolveNode{BackendNodeID: backendNodeID}.Call(client.Context(ctx))
 	if err != nil || node == nil || node.Object == nil || node.Object.ObjectID == "" {
-		// 嵌套跨进程 frame 的 owner 可能无法从主 world 解析；保守保留内容。
-		return frameVisibility{}
+		return frameVisibility{}, false
 	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 500*time.Millisecond)
+		defer cancel()
+		_ = (proto.RuntimeReleaseObject{ObjectID: node.Object.ObjectID}).Call(client.Context(cleanupCtx))
+	}()
 	result, err := proto.RuntimeCallFunctionOn{
 		ObjectID: node.Object.ObjectID,
 		FunctionDeclaration: `function() {
@@ -906,31 +927,35 @@ func (page *rodPage) frameOwnerVisibilityIn(ctx context.Context, client *rod.Pag
 			const left = rect.left + window.scrollX, top = rect.top + window.scrollY;
 			// 正常滚动仅隐藏正文；负向文档坐标和远正向位置才屏蔽字段值。
 			if (this.clientWidth <= 1 || this.clientHeight <= 1 || rect.width <= 1 || rect.height <= 1 || left < -1000 || top < -1000 || rect.left > vw + 5000 || rect.top > vh + 5000) metadataOnly = true;
-			return {metadata_only: metadataOnly, suppress_text: metadataOnly || farOutside};
+			return {hidden: false, metadata_only: metadataOnly, suppress_text: metadataOnly || farOutside};
 		}`,
 		ReturnByValue: true,
 	}.Call(client.Context(ctx))
 	if err != nil || result == nil || result.Result == nil || result.ExceptionDetails != nil {
-		return frameVisibility{}
+		return frameVisibility{}, false
 	}
 	var visibility frameVisibility
-	if err := result.Result.Value.Unmarshal(&visibility); err != nil {
-		return frameVisibility{}
-	}
-	return visibility
+	err = result.Result.Value.Unmarshal(&visibility)
+	return visibility, err == nil && visibility.Hidden != nil
 }
 
 // frameCanReadTop 以浏览器实际访问权限核对完整祖先链，不根据 URL 推断源。
-func (page *rodPage) frameCanReadTop(ctx context.Context, binding frameBinding) bool {
+func (page *rodPage) frameCanReadTop(ctx context.Context, binding frameBinding) (bool, bool) {
 	raw, ok := page.frameEvaluate(ctx, binding, `(() => {
 		try {
 			for (let view = window; view !== view.top;) {
 				view = view.parent;
-				if (!view.document.documentElement) return false;
+				if (!view.document.documentElement) return null;
 			}
 			return true;
-		} catch { return false; }
+		} catch (error) {
+			if (error.name === 'SecurityError') return false;
+			throw error;
+		}
 	})()`)
-	var readable bool
-	return ok && json.Unmarshal(raw, &readable) == nil && readable
+	var readable *bool
+	if !ok || json.Unmarshal(raw, &readable) != nil || readable == nil {
+		return false, false
+	}
+	return *readable, true
 }

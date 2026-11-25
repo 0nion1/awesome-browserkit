@@ -17,11 +17,11 @@ Every document uses the collector in `page_snapshot.go`, including open shadow r
 | `partial` with `metadata_only` | Same-origin controls remain discoverable, but the frame's presentation suppresses text, values, and options. |
 | `partial` with `text_not_visible` | A same-origin frame's text is outside the visible area; ordinary field values remain available. |
 | `hidden` | The frame is excluded by the existing host-visibility rules. |
-| `unavailable` | The document, session, or execution context could not be read; the result includes a reason. |
+| `unavailable` | The document or session could not be read, or the browser could not verify the visibility or origin of the frame or one of its ancestors. The result includes a reason. |
 
 A `frame_id="*"` entry with status `unavailable` means frame discovery failed, so the result cannot assert that every descendant was listed. Each entry declares `shadow_dom=open_only`; `captured` is not a claim to return the complete DOM.
 
-Control discovery and value visibility are separate. A same-origin frame that is positioned far outside the page, has low opacity, or has no content area can still expose control references and names while withholding its values, select options, and text. Normal page scrolling can hide the frame's text without hiding its field values. Excluded cross-origin frames are not made visible by either rule.
+Control discovery and value visibility are separate. A same-origin frame that is positioned far outside the page, has low opacity, or has no content area can still expose control references and names while withholding its values, select options, and text. Normal page scrolling can hide the frame's text without hiding its field values. Excluded cross-origin frames are not made visible by either rule. `metadata_only` and `text_not_visible` remain the frame's coverage reasons on paginated results. Use `next_offset` to retrieve any additional controls.
 
 ## Transforms and hit testing
 

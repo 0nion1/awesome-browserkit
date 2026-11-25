@@ -848,8 +848,7 @@ func (session *rodSession) markClosed() {
 	if session == nil {
 		return
 	}
-	session.closed.Store(true)
-	session.closeDownloads()
+	session.beginClose()
 	session.connectionOnce.Do(func() { close(session.connectionDone) })
 	if session.cancel != nil {
 		session.cancel()

@@ -24,6 +24,16 @@ React 组件修改后，先构建 `react`，再构建 demo。
 修改工具名称、签名或说明后，检查 `testdata/functions.golden` 的差异。
 使用 `go test . -run TestFunctionsContract -update-functions` 更新预期结果。
 
+SDK 边界验证可在容器中运行，镜像使用当前机器架构的 Go 与 Chromium：
+
+```sh
+docker build -f scripts/Dockerfile.sdk-test -t browserkit-sdk-test:local .
+docker run --rm --shm-size=1g -v "$PWD:/workspace/browserkit" browserkit-sdk-test:local \
+  go test -tags=browser_smoke . -run 'TestRealHost|TestRealOperationCancellation|TestRealBrowserFrameBaseline|TestRealBrowserAffineFrameClicks|TestRealBrowserClosedShadowScopeAndClipping|TestRealBrowserAutomaticDownload|TestRealBrowserDownloadBudget|TestRealBrowserDownloadsNavigation|TestRealBrowserDownloadFromNestedOOPIF|TestRealBrowserNativeSelectAndFileChooser'
+```
+
+实际验证命令、结果和边界见 [SDK 验证记录](docs/sdk-baseline-review.md)。
+
 ## 提交变更
 
 说明问题、修改后的行为和验证结果。

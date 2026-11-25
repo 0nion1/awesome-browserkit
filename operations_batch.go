@@ -154,6 +154,10 @@ func (manager *Manager) Act(ctx context.Context, request ActRequest) (ActRespons
 			response.Screenshot = &shot
 		}
 	}
+	if ctx.Err() != nil {
+		response.Cancelled = true
+		return response, ctx.Err()
+	}
 	return response, nil
 }
 
@@ -204,11 +208,8 @@ func validateActStep(step ActStep) error {
 		if err := needRef(); err != nil {
 			return err
 		}
-		if step.Value == "" && step.Label == "" {
-			return newError("invalid_step", "select 需要 value 或 label", "二选一填写选项值或可见标签", true)
-		}
-		if step.Value != "" && step.Label != "" {
-			return newError("invalid_step", "select 的 value 和 label 只能二选一", "只保留其中一个条件", true)
+		if _, _, err := selectMatches(step.Value, step.Label, step.Values, step.Labels); err != nil {
+			return newError("invalid_step", err.Error(), "仅填写一种选择条件", true)
 		}
 	case "check":
 		if err := needRef(); err != nil {
@@ -354,8 +355,11 @@ func (manager *Manager) runActStep(ctx context.Context, request ActRequest, step
 		if err := needRef(); err != nil {
 			return nil, err
 		}
-		response, err := manager.SelectOption(ctx, SelectOptionRequest{SessionID: request.SessionID, PageID: request.PageID, Ref: step.Ref, Revision: request.Revision, Value: step.Value, Label: step.Label})
+		response, err := manager.SelectOption(ctx, SelectOptionRequest{SessionID: request.SessionID, PageID: request.PageID, Ref: step.Ref, Revision: request.Revision, Value: step.Value, Label: step.Label, Values: step.Values, Labels: step.Labels})
 		result.Value = response.Value
+		if err == nil {
+			result.Values = &response.Values
+		}
 		return dialogsOf(response.Snapshot), err
 	case "check":
 		if err := needRef(); err != nil {

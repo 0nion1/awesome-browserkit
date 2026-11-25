@@ -1,11 +1,11 @@
 browserOpen(OpenRequest) -> OpenResponse
-启动浏览器 session 并打开 HTTP/HTTPS 页面；默认总计等待最多 3 秒加载并进入空闲，随后返回 session_id、page_id、当前 snapshot 和 load_status（loaded 或 timeout）；超时不要重复打开。需要图片时再调用 browserScreenshot。
+启动浏览器 session 并打开 HTTP/HTTPS 页面；默认总计等待最多 3 秒加载并进入空闲，随后返回 session_id、page_id、当前 snapshot 和 load_status（loaded、timeout 或 download）；download 表示开始下载且保留页面，使用 browserDownload 查询；超时不要重复打开。需要图片时再调用 browserScreenshot。
 
 browserTabs(TabActionRequest) -> TabActionResponse
 管理 Tab：action=list/activate/close/new/reload，省略为 list；activate/close/reload 需要 page_id。
 
 browserNavigate(NavigateRequest) -> NavigateResponse
-在已有页面打开 url，或用 direction=back/forward/reload 导航；url 与 direction 二选一。默认总计等待最多 3 秒加载并进入空闲，随后返回当前 snapshot 和 load_status；超时不要重复导航。需要图片时再调用 browserScreenshot。
+在已有页面打开 url，或用 direction=back/forward/reload 导航；url 与 direction 二选一。默认总计等待最多 3 秒加载并进入空闲，随后返回当前 snapshot 和 load_status（loaded、timeout 或 download）；download 表示开始下载且保留页面，使用 browserDownload 查询；超时不要重复导航。需要图片时再调用 browserScreenshot。
 
 browserSnapshot(SnapshotRequest) -> SnapshotResponse
 返回页面文本、控件状态和绑定 revision 的 ref；含 disabled/checked/value/readonly/id/placeholder 等，敏感值除外并按码点截断；跨域 iframe 的正文以 [frame URL] 标注，其控件会给出 f 前缀 ref；同站点与跨站 OOPIF 都支持。省略 page_id 用当前 Tab；max_chars/max_elements/offset 分页，下一页用 next_offset。视觉任务建议同时设置 include_screenshot=true 和 screenshot_grid=true，一次取得页面结构和带坐标的截图；截图已随结果返回，不要紧接着重复 browserScreenshot。ref 只在同一 page_id 和 revision 内有效。
@@ -14,7 +14,7 @@ browserHandleDialog(HandleDialogRequest) -> HandleDialogResponse
 处理 browserSnapshot 返回的当前 JavaScript 弹窗；使用 dialogs[0] 的 id，并按 options 选择 accept 或 dismiss。prompt 接受时可填写 prompt_text。处理成功后页面才会继续执行。
 
 browserAct(ActRequest) -> ActResponse
-按顺序执行一组页面动作：click/hover/type/select/check 用 ref，click 也可用 x/y，press 的 ref 可选，scroll/evaluate 不需要 ref，wait 用 ref_or_selector，drag 可用 source_ref/from_x+from_y 和 target_ref/delta_x+delta_y（各自二选一，坐标起点只能配位移）。只返回最终 snapshot，适合表单和动态等待。任一步失败即停止并返回 failed_step；附加等待超时会 warning，后续步骤可能运行在未稳定页面上，不要因此重放。整批非原子，跨页导航后重新 browserSnapshot。
+按顺序执行一组页面动作：click/hover/type/select/check 用 ref，click 也可用 x/y，select 的参数同 browserSelectOption，press 的 ref 可选，scroll/evaluate 不需要 ref，wait 用 ref_or_selector，drag 可用 source_ref/from_x+from_y 和 target_ref/delta_x+delta_y（各自二选一，坐标起点只能配位移）。返回最终 snapshot 和步骤结果；失败即停止并返回 failed_step。附加等待超时会 warning，检查页面状态后再决定下一步。
 
 browserClick(ClickRequest) -> ClickResponse
 点击快照元素或视口坐标：ref+revision 或 x/y 二选一；button 支持 left/right/middle，click_count 为 1 或 2。返回最新 snapshot；snapshot_error 表示附加读取失败或 wait_after_ms 被 timeout_ms 截断，操作已完成，不要重放。需要视觉结果设 include_screenshot=true，截图已随结果返回，不要重复截图；异步加载用 browserWait。
@@ -26,7 +26,7 @@ browserType(TypeRequest) -> TypeResponse
 向快照元素输入文本，默认覆盖；append 追加，submit 发送 Enter。支持文本、number 和 date/month/week/time/datetime-local/color/range；非法或越界返回 invalid_value 并恢复原值。需要 ref 和 revision；返回最新 snapshot，snapshot_error 仅指附加读取失败，不要重放。
 
 browserSelectOption(SelectOptionRequest) -> SelectOptionResponse
-按 value 或 label 选择原生单选下拉框；需要 ref 和 revision。返回最新 snapshot；snapshot_error 仅指附加读取失败，不要重放。
+按值或标签替换原生单选或多选下拉框的选中项。需要 ref 和 revision；values 或 labels 传 [] 清空，返回实际选中的 values。
 
 browserSetChecked(SetCheckedRequest) -> SetCheckedResponse
 设置原生 checkbox/radio 或 ARIA checkbox/radio/switch 的 checked；radio 只能为 true，已是目标状态时不重复点击。需要 ref 和 revision；返回最新 snapshot，snapshot_error 仅指附加读取失败，不要重放。
@@ -83,10 +83,10 @@ sequenceScript(SequenceScriptRequest) -> SequenceScriptResponse
 显式执行并记录一个脚本候选；支持 action 和必须返回 true 的 assertion，只在启用 JavaScript 能力时提供。
 
 browserUploadFile(UploadFileRequest) -> UploadFileResponse
-把 UploadDir 内文件设置到 file input；需要 ref、revision 和绝对路径。返回最新 snapshot，snapshot_error 仅指附加读取失败，不要重放。
+把 UploadDir 内的文件设置到原生文件输入框。需要 ref、revision 和绝对路径 path 或 paths；chooser=true 时点击 ref 打开文件选择器。每个文件限 10 MiB。
 
 browserDownload(DownloadRequest) -> DownloadResponse
-点击链接/按钮并等待下载到 DownloadDir；返回文件名、路径和字节数。不要用它打开普通网页。
+start 触发一次点击，完成事实见 triggered，返回 download_unconfirmed；不猜测下载身份。list 查看实际下载，query/wait/cancel 使用 download_id。等待超时不取消下载。
 
 browserDevtoolsOpen(DevtoolsOpenRequest) -> DevtoolsOpenResponse
 为指定 page_id 按需开启 Console、运行时异常和 Network 元数据采集；重复调用不会清空当前采集。

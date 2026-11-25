@@ -1892,65 +1892,7 @@ func TestRealBrowserOOPIFHiddenHostExcluded(t *testing.T) {
 	}
 }
 
-func TestRealBrowserCrossFrameTransformVariantsRejected(t *testing.T) {
-	transforms := []string{
-		"scaleX(0.5)",
-		"scaleY(0.5)",
-		"rotate(180deg)",
-		"scaleX(-1)",
-		"skewX(20deg)",
-	}
-	for _, transform := range transforms {
-		t.Run(transform, func(t *testing.T) {
-			inner := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-				_, _ = writer.Write([]byte(`<!doctype html><body style="margin:0">
-<button style="position:absolute;left:10px;top:10px;width:100px;height:30px">VARIANT_BTN</button>
-</body>`))
-			}))
-			defer inner.Close()
-			outer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-				_, _ = writer.Write([]byte(`<!doctype html><body style="margin:0">
-<iframe src="` + inner.URL + `" style="position:absolute;left:80px;top:80px;width:400px;height:240px;border:0;transform:` + transform + `;transform-origin:0 0"></iframe>
-</body>`))
-			}))
-			defer outer.Close()
-			manager, err := NewManager(Config{AllowPrivateNetwork: true})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer manager.Close(context.Background())
-			ctx := context.Background()
-			opened, err := manager.Open(ctx, OpenRequest{URL: outer.URL, Viewport: Viewport{Width: 960, Height: 640}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			var snapshot SnapshotResponse
-			var button *Element
-			for attempt := 0; attempt < 20 && button == nil; attempt++ {
-				if attempt > 0 {
-					time.Sleep(100 * time.Millisecond)
-				}
-				snapshot, err = manager.Snapshot(ctx, SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID})
-				if err != nil {
-					t.Fatal(err)
-				}
-				for index := range snapshot.Elements {
-					if snapshot.Elements[index].Name == "VARIANT_BTN" {
-						button = &snapshot.Elements[index]
-					}
-				}
-			}
-			if button == nil {
-				t.Fatalf("变形 frame 内按钮未进入快照: %+v", snapshot.Elements)
-			}
-			if _, err := manager.Click(ctx, ClickRequest{SessionID: opened.SessionID, PageID: opened.PageID, Ref: button.Ref, Revision: snapshot.Revision}); err == nil || !strings.Contains(err.Error(), "变形") {
-				t.Fatalf("变形 frame 应返回明确错误，得到 %v", err)
-			}
-		})
-	}
-}
-
-func TestRealBrowserCrossFrameTransformRejected(t *testing.T) {
+func TestRealBrowserCrossFramePerspectiveRejected(t *testing.T) {
 	inner := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		_, _ = writer.Write([]byte(`<!doctype html><body style="margin:0">
 <button style="position:absolute;left:10px;top:10px;width:100px;height:30px" onclick="document.title='CLICKED'">SCALED_BTN</button>
@@ -1959,7 +1901,7 @@ func TestRealBrowserCrossFrameTransformRejected(t *testing.T) {
 	defer inner.Close()
 	outer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		_, _ = writer.Write([]byte(`<!doctype html><body style="margin:0">
-<iframe src="` + inner.URL + `" style="position:absolute;left:80px;top:80px;width:400px;height:240px;border:0;transform:scale(0.5);transform-origin:0 0"></iframe>
+<iframe src="` + inner.URL + `" style="position:absolute;left:80px;top:80px;width:400px;height:240px;border:0;transform:perspective(300px) rotateY(30deg);transform-origin:0 0"></iframe>
 </body>`))
 	}))
 	defer outer.Close()
@@ -1993,8 +1935,8 @@ func TestRealBrowserCrossFrameTransformRejected(t *testing.T) {
 		t.Fatalf("缩放 frame 内按钮未进入快照: %+v", snapshot.Elements)
 	}
 	_, err = manager.Click(ctx, ClickRequest{SessionID: opened.SessionID, PageID: opened.PageID, Ref: button.Ref, Revision: snapshot.Revision})
-	if err == nil || !strings.Contains(err.Error(), "缩放") {
-		t.Fatalf("缩放 frame 应返回明确错误，得到 %v", err)
+	if err == nil || !strings.Contains(err.Error(), "透视") {
+		t.Fatalf("透视 frame 应返回明确错误，得到 %v", err)
 	}
 }
 
@@ -2151,7 +2093,9 @@ func TestRealBrowserCrossFrameElementsAndActions(t *testing.T) {
 	for _, element := range snapshot.Elements {
 		switch element.Name {
 		case "CrossPassword":
-			t.Fatalf("跨域密码框不应进入快照: %+v", element)
+			if element.Ref == "" || element.Type != "password" || element.Value != "" {
+				t.Fatalf("跨域密码框必须可操作且不回显值: %+v", element)
+			}
 		case "CrossMasked":
 			if element.Value != "" {
 				t.Fatalf("跨域 OTP 字段不应回显值: %+v", element)
@@ -3024,12 +2968,9 @@ func TestRealBrowserDownloadWaitsForFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := smokeElementRef(t, snapshot, "link", "download file")
-	response, err := manager.Download(context.Background(), DownloadRequest{
+	response := triggerSingleFixtureDownload(t, manager, DownloadRequest{
 		SessionID: opened.SessionID, PageID: opened.PageID, Ref: ref, Revision: snapshot.Revision, TimeoutMS: 5000,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	data, err := os.ReadFile(response.Path)
 	if err != nil || string(data) != "download-content" || response.Bytes != int64(len(data)) {
 		t.Fatalf("下载文件=%+v data=%q err=%v", response, data, err)
@@ -3110,12 +3051,9 @@ func TestRealBrowserDownloadWaitsForChunkedCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := smokeElementRef(t, snapshot, "link", "slow file")
-	response, err := manager.Download(context.Background(), DownloadRequest{
+	response := triggerSingleFixtureDownload(t, manager, DownloadRequest{
 		SessionID: opened.SessionID, PageID: opened.PageID, Ref: ref, Revision: snapshot.Revision, TimeoutMS: 8000,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	data, err := os.ReadFile(response.Path)
 	if err != nil || string(data) != "0123456789abcde" || response.Bytes != 15 {
 		t.Fatalf("慢速下载未完整: response=%+v data=%q err=%v", response, data, err)
@@ -3190,12 +3128,9 @@ func TestRealBrowserDownloadFromNewTab(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref := smokeElementRef(t, snapshot, "link", "download")
-	response, err := manager.Download(context.Background(), DownloadRequest{
+	response := triggerSingleFixtureDownload(t, manager, DownloadRequest{
 		SessionID: opened.SessionID, PageID: opened.PageID, Ref: ref, Revision: snapshot.Revision, TimeoutMS: 8000,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	data, err := os.ReadFile(response.Path)
 	if err != nil || string(data) != "tab-content" {
 		t.Fatalf("新标签下载失败: response=%+v data=%q err=%v", response, data, err)

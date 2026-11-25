@@ -146,7 +146,7 @@ func (manager *Manager) snapshotPage(ctx context.Context, current *session, curr
 	if hasMore {
 		nextOffset = options.Offset + len(snapshot.Elements)
 	}
-	return SnapshotResponse{SessionID: current.id, PageID: currentPage.id, Revision: snapshot.Revision, URL: snapshot.Info.URL, Title: snapshot.Info.Title, Text: snapshot.Text, Elements: snapshot.Elements, Truncated: snapshot.Truncated, TextTruncated: snapshot.TextTruncated, NextOffset: nextOffset, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged, Tabs: tabs}, nil
+	return SnapshotResponse{SessionID: current.id, PageID: currentPage.id, Revision: snapshot.Revision, URL: snapshot.Info.URL, Title: snapshot.Info.Title, Text: snapshot.Text, Elements: snapshot.Elements, FrameCoverage: snapshot.FrameCoverage, Truncated: snapshot.Truncated, TextTruncated: snapshot.TextTruncated, NextOffset: nextOffset, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged, Tabs: tabs}, nil
 }
 
 // pendingDialogSnapshot 在 renderer 被原生弹窗暂停时返回最近一次成功页面投影，
@@ -176,6 +176,7 @@ func (manager *Manager) pendingDialogSnapshot(current *session, currentPage *pag
 		response.Elements = append([]Element(nil), cached.Elements...)
 		response.Truncated = cached.Truncated
 		response.TextTruncated = cached.TextTruncated
+		response.FrameCoverage = append([]FrameCoverage(nil), cached.FrameCoverage...)
 	}
 	current.mu.Unlock()
 	return response, true
@@ -383,7 +384,7 @@ func (manager *Manager) typeElement(ctx context.Context, request TypeRequest, re
 	return response, nil
 }
 
-// SelectOption 按快照中的值或标签选择单选原生下拉框选项。
+// SelectOption 按快照中的值或标签替换原生下拉框的选中项。
 func (manager *Manager) SelectOption(ctx context.Context, request SelectOptionRequest) (SelectOptionResponse, error) {
 	if err := contextErr(ctx); err != nil {
 		return SelectOptionResponse{}, err
@@ -391,16 +392,16 @@ func (manager *Manager) SelectOption(ctx context.Context, request SelectOptionRe
 	if err := requirePage(request.SessionID, request.PageID, "browserSelectOption"); err != nil {
 		return SelectOptionResponse{}, err
 	}
-	if request.Ref == "" || request.Revision == 0 || (request.Value == "" && request.Label == "") || (request.Value != "" && request.Label != "") {
-		return SelectOptionResponse{}, errors.New("browserSelectOption 需要 ref、revision，以及 value 或 label 其中之一")
+	if request.Ref == "" || request.Revision == 0 {
+		return SelectOptionResponse{}, errors.New("browserSelectOption 需要 ref 和 revision")
+	}
+	matches, byLabel, err := selectMatches(request.Value, request.Label, request.Values, request.Labels)
+	if err != nil {
+		return SelectOptionResponse{}, err
 	}
 	current, currentPage, err := manager.get(ctx, request.SessionID, request.PageID)
 	if err != nil {
 		return SelectOptionResponse{}, err
-	}
-	selectPage, ok := currentPage.page.(SelectOptionPage)
-	if !ok {
-		return SelectOptionResponse{}, browserError("select_unsupported", "当前浏览器页面不支持选择下拉选项", "使用支持 BrowserKit SelectOptionPage 的 Browser Factory", true)
 	}
 	unlockInteraction, err := lockSessionInteraction(ctx, current)
 	if err != nil {
@@ -414,15 +415,53 @@ func (manager *Manager) SelectOption(ctx context.Context, request SelectOptionRe
 	if refErr != nil {
 		return SelectOptionResponse{}, refErr
 	}
-	value, err := selectPage.SelectOption(ctx, ElementRef{Ref: request.Ref, Revision: request.Revision}, request.Value, request.Label)
+	ref := ElementRef{Ref: request.Ref, Revision: request.Revision}
+	var values []string
+	if selectPage, ok := currentPage.page.(SelectOptionsPage); ok {
+		values, err = selectPage.SelectOptions(ctx, ref, matches, byLabel)
+	} else if selectPage, ok := currentPage.page.(SelectOptionPage); ok && len(matches) == 1 && matches[0] != "" {
+		value, label := matches[0], ""
+		if byLabel {
+			value, label = "", value
+		}
+		selected, selectErr := selectPage.SelectOption(ctx, ref, value, label)
+		values, err = []string{selected}, selectErr
+	} else {
+		err = browserError("select_unsupported", "当前浏览器页面不支持该选择方式", "使用支持 SelectOptionsPage 的 Browser Factory", true)
+	}
 	if err != nil {
 		return SelectOptionResponse{}, err
 	}
 	unlockInteraction()
 	activePageID, tabsRevision, tabsChanged := manager.tabChange(ctx, current, beforeTabsRevision)
-	response := SelectOptionResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, Value: value, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
+	if values == nil {
+		values = []string{}
+	}
+	response := SelectOptionResponse{SessionID: current.id, PageID: currentPage.id, Ref: request.Ref, Values: values, ActivePageID: activePageID, TabsRevision: tabsRevision, TabsChanged: tabsChanged}
+	if len(values) > 0 {
+		response.Value = values[0]
+	}
 	response.Snapshot, response.SnapshotError = manager.actionSnapshot(ctx, current, currentPage)
 	return response, nil
+}
+
+func selectMatches(value, label string, values, labels *[]string) (matches []string, byLabel bool, err error) {
+	if (value != "" && values != nil) || (label != "" && labels != nil) {
+		return nil, false, errors.New("value、label、values 和 labels 只能填写一种")
+	}
+	if value != "" {
+		values = &[]string{value}
+	}
+	if label != "" {
+		labels = &[]string{label}
+	}
+	if (values == nil) == (labels == nil) {
+		return nil, false, errors.New("value、label、values 和 labels 必须填写其中一种")
+	}
+	if labels != nil {
+		return *labels, true, nil
+	}
+	return *values, false, nil
 }
 
 // Press 执行浏览器页面操作，使用普通 context 和明确目标。

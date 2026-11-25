@@ -266,14 +266,16 @@ func (manager *Manager) openExisting(ctx context.Context, request OpenRequest) (
 	}
 	if request.URL != "" {
 		target := resolveURL(request.URL, info.URL)
-		if _, err = currentPage.page.Navigate(ctx, target); err != nil {
+		if info, err = currentPage.page.Navigate(ctx, target); err != nil {
 			return OpenResponse{}, openFailed(err)
 		}
-		current.mu.Lock()
-		clearPageRefs(currentPage)
-		currentPage.generation++
-		current.mu.Unlock()
-		loadStatus, err = manager.pageLoadStatus(ctx, currentPage.page)
+		if !info.IsDownload {
+			current.mu.Lock()
+			clearPageRefs(currentPage)
+			currentPage.generation++
+			current.mu.Unlock()
+		}
+		loadStatus, err = manager.navigationLoadStatus(ctx, currentPage.page, info)
 		if err != nil {
 			return OpenResponse{}, openFailed(err)
 		}
@@ -450,14 +452,17 @@ func (manager *Manager) finishNewPage(ctx context.Context, current *session, cur
 		snapshot, warning := manager.loadSnapshot(ctx, current, currentPage, loadStatus)
 		return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: "about:blank", LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning, Dialogs: pendingPageDialogs(currentPage.page)}, nil
 	}
-	if _, err := currentPage.page.Navigate(ctx, address); err != nil {
-		return OpenResponse{}, err
-	}
-	loadStatus, err := manager.pageLoadStatus(ctx, currentPage.page)
+	info, err := currentPage.page.Navigate(ctx, address)
 	if err != nil {
 		return OpenResponse{}, err
 	}
-	info := PageInfo{URL: address}
+	loadStatus, err = manager.navigationLoadStatus(ctx, currentPage.page, info)
+	if err != nil {
+		return OpenResponse{}, err
+	}
+	if info.URL == "" {
+		info.URL = address
+	}
 	if pendingPageDialog(currentPage.page) == nil {
 		info, err = currentPage.page.Info(ctx)
 		if err != nil {
@@ -471,6 +476,13 @@ func (manager *Manager) finishNewPage(ctx context.Context, current *session, cur
 	manager.emit(ctx, Event{Kind: "navigation_finished", SessionID: current.id, PageID: currentPage.id, URL: info.URL})
 	snapshot, warning := manager.loadSnapshot(ctx, current, currentPage, loadStatus)
 	return OpenResponse{SessionID: current.id, PageID: currentPage.id, URL: info.URL, Title: info.Title, LoadStatus: loadStatus, Snapshot: snapshot, Warning: warning, Dialogs: pendingPageDialogs(currentPage.page)}, nil
+}
+
+func (manager *Manager) navigationLoadStatus(ctx context.Context, page Page, info PageInfo) (OpenLoadStatus, error) {
+	if info.IsDownload {
+		return OpenLoadDownload, nil
+	}
+	return manager.pageLoadStatus(ctx, page)
 }
 
 func resolveURL(address, base string) string {

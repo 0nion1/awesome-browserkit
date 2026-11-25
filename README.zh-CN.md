@@ -147,6 +147,7 @@ browserkit --url 'https://example.com'
 
 默认 `new` 模式使用临时 profile，以无头模式运行。
 所有本地启动的会话（包括库调用和 HTTP 服务）各有独立临时 profile。Cookie 和本地存储与日常浏览器隔离；关闭会话时删除 profile。显式设置 `SessionConfig.UserDataDir` 时沿用原有清理配置。
+认证代理、证书配置、宿主管理会话寿命、上传和下载跟踪见 [Go SDK 配置与调用示例](docs/host-sdk.md)。
 本地浏览器默认从实际安装的 Chrome 版本生成桌面 UA，并将其作为会话 profile 的身份设置；只有显式设置 `SessionConfig.UserAgent` 才覆盖 UA。无法读取版本时沿用 Chrome 自身的身份。启动时移除 Rod 的自动化标记和站点隔离覆盖，并禁用 Blink 的 `AutomationControlled` 特性。远程浏览器保持原有 profile 与启动设置。
 不传 `--url` 时，由 Agent 创建页面。
 
@@ -270,6 +271,7 @@ handler := browserhttp.NewHandler(manager, browserhttp.Options{
 快照补充表单值与控件状态，对敏感值做屏蔽并限制正文和字段值预算。
 快照和部分动作支持 `include_screenshot`，快照的 `screenshot_grid` 与截图的 `grid` 可附带 CSS 坐标网格。
 配置 `Config.DownloadDir` 或 CLI 的 `--download-dir` 后启用本地下载；远程 CDP 会话不支持该下载目录。
+`browserDownload.start` 只报告点击完成事实并返回 `download_unconfirmed`，不猜测下载归属；用 `list` 发现实际下载，再按 `download_id` 查询或等待。
 CLI 还支持 `--upload-dir` 开启上传。
 自定义 `Page` 实现需适配扩展动作接口，详见[迁移与兼容说明](docs/keycode-browser-port.md)。
 
@@ -354,9 +356,9 @@ go run ./examples/demo --addr 127.0.0.1:8878 --chrome /path/to/chrome
 
 运行 `make lab`，在 `http://127.0.0.1:8879/` 启动[工具靶场](internal/toollab/README.md)。
 页面包含表单、悬停菜单、异步数据、嵌套和长页滚动、DOM 替换、资源加载及弹出 Tab。
-快照包含原生表单标签、复选框角色和下拉选项。`browserSelectOption` 可按 value 或 label 选择原生单选下拉项；`browserScroll` 在视口中心或指定 CSS 坐标发送滚轮事件。
-快照还会发现同源 iframe 和 open Shadow DOM 内的控件。配置 `Config.UploadDir` 后才会暴露 `browserUploadFile`，仅接受该目录内不超过 10 MiB 的普通文件，响应只包含文件名和大小。
-跨源 iframe 以 `frame` 角色及 `frame_url` 出现在快照中；另外会聚合最多 3 个可见跨域 frame 的正文和控件，支持跨站 OOPIF，其控件使用独立的 `f` 前缀 ref。
+快照包含原生表单标签、复选框角色和下拉选项。`browserSelectOption` 和 `browserAct` 的 `select` 步骤都可用 `values` 或 `labels` 设置原生单选和多选控件，传 `[]` 清空，传 `[""]` 选择空字符串选项。`browserScroll` 在视口中心或指定 CSS 坐标发送滚轮事件。
+快照还会发现同源 iframe 和开放 Shadow DOM 内的控件。配置 `Config.UploadDir` 后可以用 `browserUploadFile` 上传该目录内的普通文件，传一个绝对 `path` 或一组绝对 `paths`，单个文件最大 10 MiB。可直接使用文件输入框的 `ref`，也可以传 `chooser: true` 点击打开原生文件选择器的元素。响应列出文件名和字节数。
+嵌套同源、跨域 iframe/OOPIF 及其开放 Shadow DOM 共用快照和操作入口，frame 控件使用绑定文档的独立 `f` 前缀 ref。整体文字与元素预算覆盖整个 Tab，元素可用 `next_offset` 续读；`frame_coverage` 明确各文档的覆盖状态和 `shadow_dom=open_only` 范围。变换、裁剪及闭合根的实际边界见 [frame 说明](docs/frame-tool-design.md)。
 可以用 `browserkit --allow-private-network --url http://127.0.0.1:8879/` 手动调用函数。
 `make smoke` 会在临时浏览器中使用同一靶场，通过 JSON 工具调用验证全部已启用的浏览器函数。
 

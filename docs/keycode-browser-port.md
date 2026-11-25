@@ -26,9 +26,9 @@ iframe/OOPIF 实现 `page_frame.go`、批量动作 `operations_batch.go`、
 再用 `HandleDialog` 提交文本，并断言 Shadow DOM 正文中的最终结果。
 加载中弹窗的时间测试先建立浏览器 session，避免将 Chrome 冷启动耗时误判为弹窗等待。
 
-支持边界与 keycode 一致：仅遍历 open Shadow DOM；跨域 frame 的采集脚本
-仍不递归其内部 Shadow DOM；跨域快照最多聚合 3 个 frame，OOPIF 操作支持一层。
-这些是两边共有的边界，不能将其视为所有 Shadow DOM 与 iframe 组合均已支持。
+此处原迁移基线的限制已由宿主 SDK 增强替换：跨域 frame 复用主文档的开放
+Shadow DOM 采集脚本，嵌套 OOPIF 沿父 session 链操作，不再限制为 3 个 frame。
+当前实现、覆盖回执与验证边界见 [frame 说明](frame-tool-design.md)。
 
 迁移提交推送在 `origin/feature/keycode-browser-improvements`。
 复核时 `origin/main` 为 `ec8605b`，`github/main` 为 `e31b3fa`，
@@ -61,11 +61,12 @@ iframe/OOPIF 实现 `page_frame.go`、批量动作 `operations_batch.go`、
 值按码点和总预算截断，密码、掩码、文件及敏感 autocomplete 字段不输出值。
 隐藏 iframe 宿主的正文和值也会被排除。
 
-快照最多聚合 3 个可见跨域 frame 的正文与控件，包括跨站 OOPIF。
+快照按整个 Tab 的文字/元素预算聚合嵌套 iframe/OOPIF 与开放 Shadow DOM，
+使用 `frame_coverage` 说明未覆盖范围，元素可按 `next_offset` 继续读取。
 frame 元素使用包含文档身份的独立 `f` 前缀 ref。
 点击、悬停、输入、下拉、勾选、按键、拖放、上传和等待可路由到 frame。
-旋转、镜像、skew、遮挡、裁剪或不支持的缩放返回明确错误，避免误点父页面。
-当前 OOPIF 操作支持一层；不支持的 frame 操作明确返回 `unsupported_frame_operation`。
+仿射旋转、缩放、镜像和 skew 使用 CDP quad 映射；透视、退化几何及无法核实
+命中点的遮挡/裁剪返回明确错误。闭合 Shadow DOM 不在快照及 ref 操作范围。
 
 快照与部分动作可使用 `include_screenshot`。
 快照的 `screenshot_grid` 或截图的 `grid` 提供 CSS 坐标网格；grid 不与 full_page 同用。

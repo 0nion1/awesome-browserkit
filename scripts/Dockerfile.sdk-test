@@ -1,0 +1,8 @@
+FROM golang:1.25-bookworm
+
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends chromium ca-certificates fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV BROWSERKIT_BROWSER_EXECUTABLE=/usr/bin/chromium
+WORKDIR /workspace/browserkit

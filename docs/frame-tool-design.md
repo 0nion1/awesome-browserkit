@@ -1,29 +1,35 @@
-# frame 与 Shadow DOM 的 SDK 边界
+# Frame and Shadow DOM support
 
-现有 `Snapshot` 和元素操作直接覆盖嵌套同源、跨域 iframe/OOPIF 及其开放 Shadow DOM，不增加另一套 frame 工具或由宿主换算坐标。`page_id` 仍标识顶层 Tab；`revision` 仍随顶层文档变化。子文档引用带 frame/loader 身份前缀，导航、移除或节点替换后不能静默指向新节点。跨域密码框有可操作 ref，但不返回密码值。
+The existing `Snapshot` and element operations cover nested same-origin and cross-origin iframes/OOPIFs and their open shadow roots. No separate frame tool or host-side coordinate conversion is required. `page_id` identifies the top-level tab, and its `revision` follows top-level document changes. Child references include frame and loader identity; navigation, removal, or node replacement cannot silently redirect an old reference to another element. Cross-origin password fields have actionable references but do not expose their values.
 
-`page_frame.go` 通过 `Page.getFrameTree` 发现同进程文档，再以父 session 中的 `DOM.getFrameOwner` 核实 OOPIF 归属，逐层绑定。没有固定 frame 数量、attach 数量或可见性检查次数上限。内部 child session 继承 session 寿命；单次调用取消不会取消这些绑定。移除 frame 或关闭 Tab 时释放绑定与临时状态。
+`page_frame.go` discovers in-process documents through `Page.getFrameTree`, then verifies OOPIF ownership with `DOM.getFrameOwner` in each parent session. Frame count, attachment count, and visibility probes have no fixed count limit. Child sessions retain the browser session lifetime rather than an individual operation's context, and their bindings are released when frames or tabs close.
 
-每个文档复用 `page_snapshot.go` 中的同一采集脚本，正文与控件均递归开放 Shadow DOM。文字、元素和字段值预算作用于整个 Tab。元素按一个全局 offset 分页，`next_offset` 可继续读取后续 frame，而不是只在第一页追加一部分跨域元素。
+Every document uses the collector in `page_snapshot.go`, including open shadow roots. Text, element, and value-preview budgets apply to the whole tab. One global element offset supports `next_offset` pagination across documents.
 
-`frame_coverage` 为每个已发现文档返回 Chrome frame 身份和 URL：
+## Snapshot coverage
 
-| status | 含义 |
+`frame_coverage` reports the Chrome frame identity and URL of each discovered document:
+
+| Status | Meaning |
 | --- | --- |
-| `captured` | 当前预算内完成该文档采集 |
-| `partial` | `reason=snapshot_budget`，文字或元素没有完全返回；元素可分页续读 |
-| `hidden` | iframe 宿主或祖先不可见，未采集内容 |
-| `unavailable` | 文档、session 或执行上下文不可用；原因随回执返回 |
+| `captured` | The document was collected within the current budget. |
+| `partial` with `snapshot_budget` | Text or elements were truncated; elements can be paged. |
+| `partial` with `metadata_only` | Same-origin controls remain discoverable, but the frame's presentation suppresses text, values, and options. |
+| `partial` with `text_not_visible` | A same-origin frame's text is outside the visible area; ordinary field values remain available. |
+| `hidden` | The frame is excluded by the existing host-visibility rules. |
+| `unavailable` | The document, session, or execution context could not be read; the result includes a reason. |
 
-`frame_id="*"` 的 unavailable 条目表示 frame 发现失败，无法断言已经列出所有后代。每个条目的 `shadow_dom=open_only` 都明确闭合 Shadow DOM 不在观察范围；captured 不能解释成完整 DOM。
+A `frame_id="*"` entry with status `unavailable` means frame discovery failed, so the result cannot assert that every descendant was listed. Each entry declares `shadow_dom=open_only`; `captured` is not a claim to return the complete DOM.
 
-## 变换和实际命中
+Control discovery and value visibility are separate. A same-origin frame that is positioned far outside the page, has low opacity, or has no content area can still expose control references and names while withholding its values, select options, and text. Normal page scrolling can hide the frame's text without hiding its field values. Excluded cross-origin frames are not made visible by either rule.
 
-点击、悬停和拖放从元素中心出发，用 `DOM.getBoxModel` 的 content quad 映射 frame 坐标，沿 OOPIF session 宿主链转换至顶层视口。支持非退化仿射缩放、旋转、镜像和 skew；`DOM.getNodeForLocation` 在每层父视口核对命中，裁剪或遮挡导致无法命中时返回 `frame_unavailable`，不会派发到父页面。元素中心不可见时不会寻找并猜测另一命中点。
+## Transforms and hit testing
 
-透视四边形或退化尺寸返回 `frame_transform_unsupported`。动态 transform 在采样与派发之间改变，以及复杂 3D 合成组合没有完整验证；不能宣称任意 CSS 变换均可操作。
+Click, hover, and drag operations map an element's center through `DOM.getBoxModel` content quads and the OOPIF owner chain into the top-level viewport. Nondegenerate affine scaling, rotation, mirroring, and skew are supported. `DOM.getNodeForLocation` checks the hit in each parent viewport; clipping or an overlay that prevents the intended hit returns `frame_unavailable` before input is dispatched to the wrong element. The implementation does not guess another click point when the center is unavailable.
 
-可控最小复现：
+Perspective quads and degenerate geometry return `frame_transform_unsupported`. Transforms changing between sampling and input dispatch, and arbitrary combinations of 3D compositing, have not been fully verified.
+
+Minimal perspective fixture:
 
 ```html
 <iframe src="https://other-origin.test/form"
@@ -31,9 +37,9 @@
          transform:perspective(300px) rotateY(30deg)"></iframe>
 ```
 
-此 frame 的快照仍可见，真实点击会在派发前返回透视变形错误。`TestRealBrowserCrossFramePerspectiveRejected` 验证该边界。`TestRealBrowserAffineFrameClicks` 实测 scale、rotate(20deg/180deg)、scaleX(-1) 和 skewX；`TestRealBrowserClosedShadowScopeAndClipping` 验证点击中心被 clip-path 裁剪时明确拒绝。
+The frame can still appear in the snapshot, but a click returns an unsupported-transform error before dispatch. `TestRealBrowserCrossFramePerspectiveRejected` covers this boundary. `TestRealBrowserAffineFrameClicks` covers scale, 20/180-degree rotation, `scaleX(-1)`, and skew. `TestRealBrowserClosedShadowScopeAndClipping` verifies explicit rejection when `clip-path` removes the intended click point.
 
-## 闭合 Shadow DOM
+## Closed shadow roots
 
 ```html
 <div id="host"></div>
@@ -43,8 +49,8 @@
 </script>
 ```
 
-开放根采集和安全 ref 路径无法进入上述闭合根；SDK 不为其中的按钮生成 ref，回执仍标明 `open_only`。Chromium 的 DOM 调试协议具有穿透部分闭合根的能力，但当前架构未把调试节点身份与所有动作、文档失效和跨进程操作可靠贯通，因此没有将这种能力伪装为完整支持。该最小复现及实际缺失由 `TestRealBrowserClosedShadowScopeAndClipping` 验证。
+The collector and reference resolver do not enter this closed root. The SDK does not issue a reference for its button, and coverage remains explicitly `open_only`. Chromium's debugging protocol can inspect some closed-root nodes, but those identities have not been integrated consistently with actions, document invalidation, and cross-process frames. This is not advertised as complete closed-root support. `TestRealBrowserClosedShadowScopeAndClipping` verifies the actual omission.
 
-## 已执行的定向验证
+## Validation
 
-容器内 Go 1.25.14 / Chromium 156（linux/arm64），`browser_smoke` 用例覆盖两层跨站 OOPIF 的开放 Shadow DOM、密码输入和真实点击、10 个业务子 frame、全 Tab 元素分页、预算覆盖回执、节点克隆导致旧 ref 失效、导航失效、已有引用跨分页保留、隐藏宿主、页面滚动及遮挡。命令与结果见 [SDK 验证记录](sdk-baseline-review.md)。linux/amd64 的真实浏览器行为及更长时运行未执行验证。
+Docker tests use Go 1.25.14 and Chromium 156 on linux/arm64. Targeted fixtures cover nested OOPIFs with open shadow roots, password input and clicks, ten business frames, global pagination and coverage, cloned-node and navigation invalidation, hidden hosts, scrolling, and overlays. `TestRealBrowserSnapshotFormValues` checks that same-origin control metadata remains present while masked values stay empty. Commands and results are recorded in [SDK validation](sdk-baseline-review.md). Real Chromium execution on linux/amd64 and extended stress runs remain unverified.

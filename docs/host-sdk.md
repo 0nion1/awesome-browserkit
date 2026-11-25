@@ -117,6 +117,8 @@ Chromium 的 `downloadWillBegin` 只有下载身份、frame 和 URL，没有 req
 
 常见嵌套 iframe/OOPIF 与开放 Shadow DOM 使用相同快照和 ref 入口。`frame_coverage` 按文档说明 `captured`、`partial`、`hidden` 或 `unavailable`，`shadow_dom=open_only` 明确闭合根不在快照覆盖范围。整体文字/元素预算作用于整个 Tab；元素可用 `next_offset` 继续读取，文字截断由 `text_truncated` 表示。不要将部分观察当成完整 DOM。
 
+同源 frame 被定位到极远屏外、处于低透明度或零内容尺寸时，仍保留控件 ref、名称和角色，但不返回正文、值或选项；覆盖回执为 `partial / metadata_only`。普通页面滚动使 frame 离开视口时，仅隐藏正文、保留正常字段值，回执为 `partial / text_not_visible`。跨域隐藏 frame 继续遵循原有排除规则，不能把仅保留元数据理解为已验证实际可点击。
+
 仿射 frame 变换使用 CDP content quad 映射真实坐标；透视变换、退化几何、裁剪/遮挡或无法核实命中点时返回明确错误。实际边界与可控复现见 [frame-tool-design.md](frame-tool-design.md)。闭合 Shadow DOM 尚无可靠的通用快照和 ref 操作支持，不宣称完整支持。
 
 `Act` 的 Go error 为 `nil` 时仍须检查 `FailedStep`、`Cancelled` 及每步 `Success`。`Completed` 是已确认成功的步骤数，预检失败可能发生在执行任何步骤之前。`snapshot_error` 与 `screenshot_error` 分开表示动作之后的观察失败，不能据此重放动作。SDK 不自动重试副作用。

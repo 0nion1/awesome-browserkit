@@ -8,6 +8,8 @@ import (
 )
 
 const pageSnapshotScript = `(options) => {
+		const suppressContent = options.suppress_content === true;
+		const suppressText = suppressContent || options.suppress_text === true;
 		const clean = value => (value || '').replace(/[\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim();
 		const xpathFor = (el, useId) => {
 			const segments = [];
@@ -188,7 +190,7 @@ const pageSnapshotScript = `(options) => {
 			const labelledBy = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean).map(id => el.getRootNode().getElementById?.(id)?.textContent || el.ownerDocument.getElementById(id)?.textContent || '').join(' ');
 			const nativeLabel = [...(el.labels || [])].map(label => label.innerText || label.textContent || '').join(' ');
 			const buttonValue = el.tagName === 'INPUT' && ['button', 'submit', 'reset'].includes(type) ? el.value : '';
-			const label = el.getAttribute('aria-label') || labelledBy || nativeLabel || el.getAttribute('placeholder') || el.getAttribute('title') || text(el) || buttonValue || el.getAttribute('name') || el.id || '';
+			const label = el.getAttribute('aria-label') || labelledBy || nativeLabel || el.getAttribute('placeholder') || el.getAttribute('title') || (!suppressContent && (text(el) || buttonValue)) || el.getAttribute('name') || el.id || '';
 			const optionsFor = el => [...el.options].slice(0, 100).map(option => ({value: option.value, label: clean(option.label).slice(0, 160), selected: option.selected}));
 			const checkable = el.tagName === 'INPUT' && (type === 'checkbox' || type === 'radio');
 			const ariaChecked = el.getAttribute('aria-checked');
@@ -206,7 +208,7 @@ const pageSnapshotScript = `(options) => {
 			const valueStyle = getComputedStyle(el);
 			const masked = (valueStyle.getPropertyValue('-webkit-text-security') || 'none') !== 'none' || autocomplete.some(maskedToken);
 			const valueRect = el.getBoundingClientRect();
-			const valueHidden = masked || valueRect.width <= 1 || valueRect.height <= 1 || effectivelyHidden(el);
+			const valueHidden = suppressContent || masked || valueRect.width <= 1 || valueRect.height <= 1 || effectivelyHidden(el);
 			const options = el.tagName === 'SELECT' && !valueHidden ? optionsFor(el) : undefined;
 			let value, valueTruncated;
 			if (valueCapable && !valueHidden) {
@@ -237,7 +239,7 @@ const pageSnapshotScript = `(options) => {
 			active = nested;
 		}
 		const activeRef = active?.getAttribute?.('data-browserkit-ref') || '';
-		const activeValue = active && ('value' in active) ? String(active.value ?? '') : (active?.isContentEditable ? String(active.textContent || '') : '');
+		const activeValue = suppressContent || (active && effectivelyHidden(active)) ? '' : active && ('value' in active) ? String(active.value ?? '') : (active?.isContentEditable ? String(active.textContent || '') : '');
 		const visibleForText = el => {
 			try {
 				return !el.checkVisibility || el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
@@ -296,7 +298,7 @@ const pageSnapshotScript = `(options) => {
 		};
 		const maxChars = Math.max(0, options.max_chars ?? 12000);
 		// 多收一点给 clean 的空白折叠留余量，避免刚好卡在预算边界时误判截断。
-		const collected = visibleText(document.body || document.documentElement, maxChars + 64);
+		const collected = suppressText ? {text: '', stopped: false, crossFrame: false} : visibleText(document.body || document.documentElement, maxChars + 64);
 		const bodyText = clean(collected.text);
 		return {url: location.href, title: document.title, text: bodyText.slice(0, maxChars), elements, total: Math.min(candidates.length, offset + elements.length), refs: [...state.refs], has_more: candidates.length > offset + elements.length, text_truncated: bodyText.length > maxChars || collected.stopped, cross_frame: collected.crossFrame, active_element_ref: activeRef, active_element_value: activeValue};
 	}`
@@ -341,7 +343,7 @@ func (page *rodPage) mergeFrameSnapshots(ctx context.Context, raw *domSnapshot, 
 		if textRoom < 0 {
 			textRoom = 0
 		}
-		args, _ := json.Marshal(map[string]int{"max_chars": textRoom, "max_elements": room, "offset": elementOffset})
+		args, _ := json.Marshal(map[string]any{"max_chars": textRoom, "max_elements": room, "offset": elementOffset, "suppress_content": frame.MetadataOnly, "suppress_text": frame.SuppressText})
 		expression := "(() => { const state = " + pageStateObserverScript + "; state.refPrefix = " + strconvQuote(frame.Prefix) + "; return (" + pageSnapshotScript + ")(" + string(args) + "); })()"
 		data, ok := page.frameEvaluate(ctx, frame, expression)
 		var child domSnapshot
@@ -376,6 +378,12 @@ func (page *rodPage) mergeFrameSnapshots(ctx context.Context, raw *domSnapshot, 
 			elementOffset -= child.Total
 		} else {
 			elementOffset = 0
+		}
+		if frame.SuppressText {
+			entry.Status, entry.Reason = "partial", "text_not_visible"
+		}
+		if frame.MetadataOnly {
+			entry.Status, entry.Reason = "partial", "metadata_only"
 		}
 		if child.HasMore || child.TextTruncated {
 			entry.Status, entry.Reason = "partial", "snapshot_budget"

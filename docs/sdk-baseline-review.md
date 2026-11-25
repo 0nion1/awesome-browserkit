@@ -19,6 +19,26 @@
 
 frame 输入回归包括 `document.querySelector(...)`、引号、换行及追加文本原样保留；`min=1/max=10/value=3` 的 number 输入填写 `99` 时返回 `invalid_value` 并恢复 `3`。主文档、同源、跨域和 OOPIF 开放根复用同一特殊输入实现。
 
+## 同源 frame 元数据回归
+
+`TestRealBrowserSnapshotFormValues` 在基线通过，而合并 frame 采集后的实现会遗漏 `IframeSecret`、`FadedFrameSecret`、`RightFrame`。原因是把“宿主导致字段值不可见”直接当成“整个文档不应枚举”，跳过了原有同源控件元数据。
+
+修复区分内容遮蔽与文档排除：同源低透明度、零尺寸或极远屏外 frame 保留 ref、名称和角色，但隐藏值、选项、正文和活动字段值；是否同源按浏览器实际访问完整父链的权限判断，不根据 URL 猜测。跨域隐藏 frame 的原有排除规则保留。正常同源 frame 因页面滚动而离开视口时，正文和字段值的可见性分别判断。
+
+此修复保留原表单及隐藏宿主测试的断言，并增加嵌套 `srcdoc`、同源/跨域/OOPIF、分页、名称回退及普通滚动的定向用例。原 `docs/frame-tool-design.md` 同时恢复英文，保留最新能力说明。
+
+Docker 对照运行原用例：基线 `ba1ea8e` PASS 1.306s；修复前 PR 提交 `7966ae1` FAIL 1.295s，缺少上述三个字段。修复后使用原测试断言，最终运行：
+
+```sh
+docker exec browserkit-pr-review go test -race -tags=browser_smoke . \
+  -run '^(TestRealBrowserSnapshotFormValues|TestRealBrowserSameOriginHiddenHostExcluded|TestRealBrowserOOPIFHiddenHostExcluded|TestRealBrowserCrossSiteOOPIF|TestRealBrowserFrameMetadataOnly|TestRealBrowserScrolledFrameKeepsValues|TestRealBrowserFrameBaseline|TestRealBrowserSnapshotValueAfterScroll)$' -v
+docker exec browserkit-pr-review go test . -run 'TestFunctionsContract|TestMapFramePoint'
+docker exec browserkit-pr-review go build ./...
+docker exec browserkit-pr-review env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
+```
+
+结果：真实浏览器定向 race 全部 PASS 26.618s；声明与几何单测 PASS 0.003s；两种架构构建通过。`TestRealBrowserFrameMetadataOnly` 包括 12 组宿主呈现/源组合，字段值、选项、正文、名称回退与活动值不会在仅元数据回执中泄漏；`TestRealBrowserScrolledFrameKeepsValues` 确认正常滚动保留字段值，绝对负向定位仍遮蔽。未改动旧测试断言，也未运行无关全量回归。
+
 ## Docker 运行
 
 所有依赖、构建及浏览器测试在 Docker 内执行。测试镜像按当前机器架构安装发行版 Chromium，不固定 `--platform`。

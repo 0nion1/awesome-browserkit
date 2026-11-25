@@ -16,17 +16,19 @@ import (
 // frameBinding 分别记录文档及 CDP session 身份；OOPIF 的文档与 iframe
 // 宿主属于不同 session，嵌套坐标映射必须沿宿主链向上转换。
 type frameBinding struct {
-	FrameID     proto.PageFrameID
-	ParentID    proto.PageFrameID
-	LoaderID    proto.NetworkLoaderID
-	ContextID   proto.RuntimeExecutionContextID
-	Page        *rod.Page
-	Owner       *rod.Page
-	RootFrameID proto.PageFrameID
-	Prefix      string
-	URL         string
-	Hidden      bool
-	Unavailable string
+	FrameID      proto.PageFrameID
+	ParentID     proto.PageFrameID
+	LoaderID     proto.NetworkLoaderID
+	ContextID    proto.RuntimeExecutionContextID
+	Page         *rod.Page
+	Owner        *rod.Page
+	RootFrameID  proto.PageFrameID
+	Prefix       string
+	URL          string
+	Hidden       bool
+	MetadataOnly bool
+	SuppressText bool
+	Unavailable  string
 }
 
 func frameRefPrefixFor(frameID proto.PageFrameID, loaderID proto.NetworkLoaderID) string {
@@ -197,7 +199,8 @@ func (page *rodPage) frameBindings(ctx context.Context) ([]frameBinding, error) 
 			if ownerErr != nil || owner == nil {
 				binding.Unavailable = "frame owner unavailable"
 			} else {
-				binding.Hidden = !page.frameOwnerVisibleIn(ctx, binding.Owner, owner.BackendNodeID)
+				visibility := page.frameOwnerVisibilityIn(ctx, binding.Owner, owner.BackendNodeID)
+				binding.Hidden, binding.MetadataOnly, binding.SuppressText = visibility.Hidden, visibility.MetadataOnly, visibility.SuppressText
 			}
 		}
 		result = append(result, binding)
@@ -210,11 +213,18 @@ func (page *rodPage) frameBindings(ctx context.Context) ([]frameBinding, error) 
 			}
 			// 可见性取已完成宿主检查的条目。
 			for _, candidate := range result {
-				if candidate.FrameID == parentID && candidate.Hidden {
-					result[index].Hidden = true
+				if candidate.FrameID == parentID {
+					result[index].Hidden = result[index].Hidden || candidate.Hidden
+					result[index].MetadataOnly = result[index].MetadataOnly || candidate.MetadataOnly
+					result[index].SuppressText = result[index].SuppressText || candidate.SuppressText
 				}
 			}
 			parentID = parent.ParentID
+		}
+	}
+	for index := range result {
+		if (result[index].MetadataOnly || result[index].SuppressText) && !result[index].Hidden && !page.frameCanReadTop(ctx, result[index]) {
+			result[index].Hidden = true
 		}
 	}
 	// 已移除或导航的 frame 文档不能保留旧引用。
@@ -839,15 +849,21 @@ func (page *rodPage) closeOOPIFs() {
 	}
 }
 
-// frameOwnerVisible 检查 iframe 宿主元素本身是否可见。
-func (page *rodPage) frameOwnerVisibleIn(ctx context.Context, client *rod.Page, backendNodeID proto.DOMBackendNodeID) bool {
+type frameVisibility struct {
+	Hidden       bool `json:"hidden"`
+	MetadataOnly bool `json:"metadata_only"`
+	SuppressText bool `json:"suppress_text"`
+}
+
+// frameOwnerVisibilityIn 区分不可枚举的宿主与只允许返回控件元数据的宿主。
+func (page *rodPage) frameOwnerVisibilityIn(ctx context.Context, client *rod.Page, backendNodeID proto.DOMBackendNodeID) frameVisibility {
 	if backendNodeID == 0 {
-		return true
+		return frameVisibility{}
 	}
 	node, err := proto.DOMResolveNode{BackendNodeID: backendNodeID}.Call(client.Context(ctx))
 	if err != nil || node == nil || node.Object == nil || node.Object.ObjectID == "" {
 		// 嵌套跨进程 frame 的 owner 可能无法从主 world 解析；保守保留内容。
-		return true
+		return frameVisibility{}
 	}
 	result, err := proto.RuntimeCallFunctionOn{
 		ObjectID: node.Object.ObjectID,
@@ -870,13 +886,15 @@ func (page *rodPage) frameOwnerVisibleIn(ctx context.Context, client *rod.Page, 
 			// visibility 可被子元素覆盖，取元素自身的最终值；其余属性
 			// 无法被后代覆盖，必须沿祖先链检查。
 			const self = getComputedStyle(this);
-			if (self.visibility === 'hidden' || self.visibility === 'collapse') return {visible: false};
+			if (self.visibility === 'hidden' || self.visibility === 'collapse') return {hidden: true};
+			let metadataOnly = false;
 			for (let el = this; el;) {
 				const s = getComputedStyle(el);
-				if (s.display === 'none') return {visible: false};
-				if (s.contentVisibility === 'hidden') return {visible: false};
-				if (parseFloat(s.opacity) < 0.05) return {visible: false};
-				if (clipped(s)) return {visible: false};
+				if (s.display === 'none') return {hidden: true};
+				if (s.contentVisibility === 'hidden') return {hidden: true};
+				if (Number(s.opacity) === 0) return {hidden: true};
+				if (Number(s.opacity) < 0.05) metadataOnly = true;
+				if (clipped(s)) return {hidden: true};
 				if (el.parentElement) { el = el.parentElement; continue; }
 				const root = el.getRootNode ? el.getRootNode() : null;
 				if (root && root.host) { el = root.host; continue; }
@@ -884,20 +902,35 @@ func (page *rodPage) frameOwnerVisibleIn(ctx context.Context, client *rod.Page, 
 			}
 			const rect = this.getBoundingClientRect();
 			const vw = window.innerWidth, vh = window.innerHeight;
-			if (rect.width <= 1 || rect.height <= 1) return {visible: false};
-			if (rect.right < -1000 || rect.bottom < -1000 || rect.left > vw + 5000 || rect.top > vh + 5000) return {visible: false};
-			return {visible: true};
+			const farOutside = rect.right < -1000 || rect.bottom < -1000 || rect.left > vw + 5000 || rect.top > vh + 5000;
+			const left = rect.left + window.scrollX, top = rect.top + window.scrollY;
+			// 正常滚动仅隐藏正文；负向文档坐标和远正向位置才屏蔽字段值。
+			if (this.clientWidth <= 1 || this.clientHeight <= 1 || rect.width <= 1 || rect.height <= 1 || left < -1000 || top < -1000 || rect.left > vw + 5000 || rect.top > vh + 5000) metadataOnly = true;
+			return {metadata_only: metadataOnly, suppress_text: metadataOnly || farOutside};
 		}`,
 		ReturnByValue: true,
 	}.Call(client.Context(ctx))
 	if err != nil || result == nil || result.Result == nil || result.ExceptionDetails != nil {
-		return true
+		return frameVisibility{}
 	}
-	var visibility struct {
-		Visible bool `json:"visible"`
-	}
+	var visibility frameVisibility
 	if err := result.Result.Value.Unmarshal(&visibility); err != nil {
-		return true
+		return frameVisibility{}
 	}
-	return visibility.Visible
+	return visibility
+}
+
+// frameCanReadTop 以浏览器实际访问权限核对完整祖先链，不根据 URL 推断源。
+func (page *rodPage) frameCanReadTop(ctx context.Context, binding frameBinding) bool {
+	raw, ok := page.frameEvaluate(ctx, binding, `(() => {
+		try {
+			for (let view = window; view !== view.top;) {
+				view = view.parent;
+				if (!view.document.documentElement) return false;
+			}
+			return true;
+		} catch { return false; }
+	})()`)
+	var readable bool
+	return ok && json.Unmarshal(raw, &readable) == nil && readable
 }

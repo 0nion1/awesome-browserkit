@@ -39,6 +39,25 @@ docker exec browserkit-pr-review env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go bu
 
 结果：真实浏览器定向 race 全部 PASS 26.618s；声明与几何单测 PASS 0.003s；两种架构构建通过。`TestRealBrowserFrameMetadataOnly` 包括 12 组宿主呈现/源组合，字段值、选项、正文、名称回退与活动值不会在仅元数据回执中泄漏；`TestRealBrowserScrolledFrameKeepsValues` 确认正常滚动保留字段值，绝对负向定位仍遮蔽。未改动旧测试断言，也未运行无关全量回归。
 
+## 最终错误分支与关闭复查
+
+宿主可见性或同源访问探测失败时，frame 及其后代改为明确的 `unavailable`，不再当成可见内容。已解析的宿主 CDP 对象使用独立的有界 context 释放。分页保留 `metadata_only` / `text_not_visible`，继续以 `next_offset` 表达尚有元素，避免预算原因掩盖持续存在的内容遮蔽。
+
+Manager 开始关闭 session 时先标记下载关闭，再关闭页面，避免页面关闭产生的取消事件被误报为下载失败。已完成和已失败的下载状态保持不变，完成文件仍然保留。
+
+扩大后的 46 项相关真实浏览器用例通过（94.719s），覆盖输入、表单、快照、frame、下载及 Act。最终修复完成后，全部 Go 包测试通过（主包 4.264s），`go vet ./...`、arm64 构建和 amd64 交叉编译通过；以下针对最终改动的 race 检查通过（11.219s）：
+
+```sh
+docker exec browserkit-final-review go test ./...
+docker exec browserkit-final-review go vet ./...
+docker exec browserkit-final-review go build ./...
+docker exec browserkit-final-review env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
+docker exec browserkit-final-review go test -race -tags=browser_smoke . \
+  -run '^(TestFrameCoverageDoesNotAssumeVisibilityWhenCDPFails|TestFrameOwnerReleaseSurvivesCanceledProbe|TestManagerCloseMarksDownloadsBeforeClosingPage|TestRealBrowserSnapshotFormValues|TestRealBrowserSameOriginHiddenHostExcluded|TestRealBrowserOOPIFHiddenHostExcluded|TestRealBrowserDownloadBudgetCancelAndSessionClose|TestRealBrowserScrolledFrameKeepsValues)$' -v
+```
+
+最终 frame 元数据与滚动分页用例另通过（16.488s），模拟 CDP 错误和取消清理的 race 用例通过（1.009s）。首次获取依赖遇到默认 Go 代理的 EOF，改用可达代理后完成验证，未改仓库依赖。运行环境仍为 Go 1.25.14 / Chromium 156 / linux/arm64；长期压力与 amd64 真实浏览器不在本次验证范围。
+
 ## Docker 运行
 
 所有依赖、构建及浏览器测试在 Docker 内执行。测试镜像按当前机器架构安装发行版 Chromium，不固定 `--platform`。

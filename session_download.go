@@ -283,6 +283,12 @@ func (session *rodSession) CancelDownload(ctx context.Context, id string) (Downl
 	return session.DownloadStatus(ctx, id)
 }
 
+// beginClose records the host shutdown before closing tabs can emit cancellation.
+func (session *rodSession) beginClose() {
+	session.closed.Store(true)
+	session.closeDownloads()
+}
+
 func (session *rodSession) closeDownloads() {
 	session.downloadMu.Lock()
 	defer session.downloadMu.Unlock()

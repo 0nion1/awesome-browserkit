@@ -199,10 +199,13 @@ func (manager *Manager) closeSession(ctx context.Context, current *session) erro
 		return nil
 	}
 	current.closed = true
+	browser := current.browser
+	if closing, ok := browser.(interface{ beginClose() }); ok {
+		closing.beginClose()
+	}
 	if current.cancel != nil {
 		current.cancel()
 	}
-	browser := current.browser
 	var releaser TabReleaseSession
 	if candidate, ok := browser.(TabReleaseSession); ok {
 		releaser = candidate

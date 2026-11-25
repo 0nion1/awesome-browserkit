@@ -118,6 +118,7 @@ func TestRealBrowserFrameMetadataOnly(t *testing.T) {
 								seen[element.Ref] = true
 							}
 							checkMetadataSnapshot(t, part, false)
+							checkMetadataFrameCoverage(t, part)
 							if part.NextOffset == 0 {
 								break
 							}
@@ -166,15 +167,20 @@ func checkMetadataSnapshot(t *testing.T, snapshot SnapshotResponse, requireMetad
 		if len(found) != 3 {
 			t.Fatalf("missing metadata controls: %+v", snapshot.Elements)
 		}
-		metadataFrames := 0
-		for _, coverage := range snapshot.FrameCoverage {
-			if coverage.Status == "partial" && coverage.Reason == "metadata_only" {
-				metadataFrames++
-			}
+		checkMetadataFrameCoverage(t, snapshot)
+	}
+}
+
+func checkMetadataFrameCoverage(t *testing.T, snapshot SnapshotResponse) {
+	t.Helper()
+	metadataFrames := 0
+	for _, coverage := range snapshot.FrameCoverage {
+		if coverage.Status == "partial" && coverage.Reason == "metadata_only" {
+			metadataFrames++
 		}
-		if metadataFrames != 2 {
-			t.Fatalf("nested metadata coverage missing: %+v", snapshot.FrameCoverage)
-		}
+	}
+	if metadataFrames != 2 {
+		t.Fatalf("nested metadata coverage missing: %+v", snapshot.FrameCoverage)
 	}
 }
 
@@ -221,13 +227,19 @@ func TestRealBrowserScrolledFrameKeepsValues(t *testing.T) {
 	if strings.Contains(snapshot.Text, "SCROLLED_TEXT") || strings.Contains(snapshot.Text, "NEGATIVE_TEXT") {
 		t.Fatalf("offscreen text leaked: %s", snapshot.Text)
 	}
-	foundTextOnly := false
-	for _, coverage := range snapshot.FrameCoverage {
-		if coverage.Reason == "text_not_visible" {
-			foundTextOnly = true
-		}
+	paged, err := manager.Snapshot(ctx, SnapshotRequest{SessionID: opened.SessionID, PageID: opened.PageID, MaxElements: 1})
+	if err != nil || paged.NextOffset == 0 {
+		t.Fatalf("frame pagination missing: %+v, %v", paged, err)
 	}
-	if !foundTextOnly {
-		t.Fatalf("text-only omission missing: %+v", snapshot.FrameCoverage)
+	for _, view := range []SnapshotResponse{snapshot, paged} {
+		foundTextOnly := false
+		for _, coverage := range view.FrameCoverage {
+			if coverage.Status == "partial" && coverage.Reason == "text_not_visible" {
+				foundTextOnly = true
+			}
+		}
+		if !foundTextOnly {
+			t.Fatalf("text-only omission missing: %+v", view.FrameCoverage)
+		}
 	}
 }

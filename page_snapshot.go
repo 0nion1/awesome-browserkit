@@ -321,15 +321,8 @@ func (page *rodPage) mergeFrameSnapshots(ctx context.Context, raw *domSnapshot, 
 	mainHasMore := raw.HasMore
 	for _, frame := range frames {
 		entry := FrameCoverage{FrameID: string(frame.FrameID), URL: frame.URL, Status: "captured", ShadowDOM: "open_only"}
-		if frame.Hidden {
+		if frame.Hidden && frame.Unavailable == "" {
 			entry.Status = "hidden"
-			coverage = append(coverage, entry)
-			continue
-		}
-		if frame.Unavailable != "" {
-			entry.Status = "unavailable"
-			entry.Reason = frame.Unavailable
-			raw.TextTruncated = true
 			coverage = append(coverage, entry)
 			continue
 		}
@@ -343,12 +336,17 @@ func (page *rodPage) mergeFrameSnapshots(ctx context.Context, raw *domSnapshot, 
 		if textRoom < 0 {
 			textRoom = 0
 		}
-		args, _ := json.Marshal(map[string]any{"max_chars": textRoom, "max_elements": room, "offset": elementOffset, "suppress_content": frame.MetadataOnly, "suppress_text": frame.SuppressText})
-		expression := "(() => { const state = " + pageStateObserverScript + "; state.refPrefix = " + strconvQuote(frame.Prefix) + "; return (" + pageSnapshotScript + ")(" + string(args) + "); })()"
-		data, ok := page.frameEvaluate(ctx, frame, expression)
 		var child domSnapshot
-		if !ok || json.Unmarshal(data, &child) != nil {
-			entry.Status, entry.Reason = "unavailable", "frame_snapshot_failed"
+		if frame.Unavailable == "" {
+			args, _ := json.Marshal(map[string]any{"max_chars": textRoom, "max_elements": room, "offset": elementOffset, "suppress_content": frame.MetadataOnly, "suppress_text": frame.SuppressText})
+			expression := "(() => { const state = " + pageStateObserverScript + "; state.refPrefix = " + strconvQuote(frame.Prefix) + "; return (" + pageSnapshotScript + ")(" + string(args) + "); })()"
+			data, ok := page.frameEvaluate(ctx, frame, expression)
+			if !ok || json.Unmarshal(data, &child) != nil {
+				frame.Unavailable = "frame_snapshot_failed"
+			}
+		}
+		if frame.Unavailable != "" {
+			entry.Status, entry.Reason = "unavailable", frame.Unavailable
 			raw.TextTruncated = true
 			// 观察失败无法证明以前签发的引用已经消失。
 			page.stateMu.Lock()
@@ -379,13 +377,12 @@ func (page *rodPage) mergeFrameSnapshots(ctx context.Context, raw *domSnapshot, 
 		} else {
 			elementOffset = 0
 		}
-		if frame.SuppressText {
-			entry.Status, entry.Reason = "partial", "text_not_visible"
-		}
-		if frame.MetadataOnly {
+		switch {
+		case frame.MetadataOnly:
 			entry.Status, entry.Reason = "partial", "metadata_only"
-		}
-		if child.HasMore || child.TextTruncated {
+		case frame.SuppressText:
+			entry.Status, entry.Reason = "partial", "text_not_visible"
+		case child.HasMore || child.TextTruncated:
 			entry.Status, entry.Reason = "partial", "snapshot_budget"
 		}
 		coverage = append(coverage, entry)

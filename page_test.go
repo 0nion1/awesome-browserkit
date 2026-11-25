@@ -199,34 +199,21 @@ func TestMouseButtonMaskMatchesCDPButtons(t *testing.T) {
 	}
 }
 
-func TestAxisAlignedQuadRejectsTransforms(t *testing.T) {
-	if !axisAlignedQuad([]float64{10, 20, 110, 20, 110, 60, 10, 60}) {
-		t.Fatal("轴对齐 quad 应被接受")
-	}
-	cases := map[string][]float64{
-		"旋转":   {10, 20, 110, 40, 90, 60, 10, 40},
-		"skew": {10, 20, 110, 45, 110, 60, 10, 35},
-		"镜像":   {110, 20, 10, 20, 10, 60, 110, 60},
-		"180度": {110, 60, 10, 60, 10, 20, 110, 20},
-		"长度不足": {10, 20, 30},
-	}
-	for name, quad := range cases {
-		if axisAlignedQuad(quad) {
-			t.Fatalf("%s quad 应被拒绝: %v", name, quad)
+func TestMapFramePoint(t *testing.T) {
+	for _, quad := range [][]float64{
+		{10, 20, 110, 20, 110, 60, 10, 60},
+		{110, 20, 10, 20, 10, 60, 110, 60},
+		{110, 60, 10, 60, 10, 20, 110, 20},
+		{10, 20, 110, 40, 120, 80, 20, 60},
+	} {
+		x, y, ok := mapFramePoint(quad, 100, 40, 50, 20)
+		if !ok || x != (quad[0]+quad[4])/2 || y != (quad[1]+quad[5])/2 {
+			t.Fatalf("quad=%v mapped=(%v,%v),%v", quad, x, y, ok)
 		}
 	}
-}
-
-func TestPointInQuadBounds(t *testing.T) {
-	quad := []float64{10, 20, 110, 20, 110, 60, 10, 60}
-	for _, point := range [][2]float64{{10, 20}, {110, 60}, {60, 40}} {
-		if !pointInQuad(quad, point[0], point[1]) {
-			t.Fatalf("边界内点 %v 应命中", point)
-		}
-	}
-	for _, point := range [][2]float64{{9, 40}, {111, 40}, {60, 19}, {60, 61}} {
-		if pointInQuad(quad, point[0], point[1]) {
-			t.Fatalf("边界外点 %v 不应命中", point)
+	for _, quad := range [][]float64{{10, 20, 30}, {0, 0, 100, 0, 80, 100, 0, 100}, {0, 0, 0, 0, 0, 0, 0, 0}} {
+		if _, _, ok := mapFramePoint(quad, 100, 100, 50, 50); ok {
+			t.Fatalf("invalid/perspective quad accepted: %v", quad)
 		}
 	}
 }

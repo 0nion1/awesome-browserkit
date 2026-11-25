@@ -39,6 +39,8 @@ type PageOptions struct {
 type PageInfo struct {
 	URL   string `json:"url"`
 	Title string `json:"title"`
+	// IsDownload 仅由 Navigate 返回，表示浏览器开始下载而没有替换当前文档。
+	IsDownload bool `json:"is_download,omitempty"`
 }
 
 // Dialog 是页面当前弹窗或一次显式处理结果。
@@ -177,9 +179,19 @@ type SelectOptionPage interface {
 	SelectOption(context.Context, ElementRef, string, string) (string, error)
 }
 
+// SelectOptionsPage 支持替换原生 select 的选中项，返回控件中的实际值。
+type SelectOptionsPage interface {
+	SelectOptions(ctx context.Context, ref ElementRef, matches []string, byLabel bool) ([]string, error)
+}
+
 // UploadFilePage 支持为原生文件输入控件设置一个本地文件。
 type UploadFilePage interface {
 	UploadFile(context.Context, ElementRef, string) error
+}
+
+// UploadFilesPage 支持为原生文件输入框设置文件，或点击元素触发文件选择器。
+type UploadFilesPage interface {
+	UploadFiles(ctx context.Context, ref ElementRef, paths []string, chooser bool) error
 }
 
 // SnapshotOptions 限制快照大小。
@@ -190,13 +202,24 @@ type SnapshotOptions struct {
 	Offset int
 }
 
+// FrameCoverage 描述快照包含或遗漏的文档。ShadowDOM 为 open_only，
+// 明确快照只遍历开放 Shadow DOM，不覆盖闭合根。
+type FrameCoverage struct {
+	FrameID   string `json:"frame_id"`
+	URL       string `json:"url,omitempty"`
+	Status    string `json:"status"`
+	Reason    string `json:"reason,omitempty"`
+	ShadowDOM string `json:"shadow_dom"`
+}
+
 // Snapshot 是页面文本和可交互元素的结构化摘要。
 type Snapshot struct {
-	Info      PageInfo  `json:"info"`
-	Revision  uint64    `json:"revision"`
-	Text      string    `json:"text"`
-	Elements  []Element `json:"elements"`
-	Truncated bool      `json:"truncated"`
+	FrameCoverage []FrameCoverage `json:"frame_coverage,omitempty"`
+	Info          PageInfo        `json:"info"`
+	Revision      uint64          `json:"revision"`
+	Text          string          `json:"text"`
+	Elements      []Element       `json:"elements"`
+	Truncated     bool            `json:"truncated"`
 	// ActiveElementRef 和 ActiveElementValue 只供手动操作序列录制合并输入，
 	// 不进入 Snapshot 的公开 JSON，避免把页面字段值暴露给普通快照调用方。
 	ActiveElementRef   string `json:"-"`
@@ -348,8 +371,9 @@ type TargetPage interface {
 	TargetID() string
 }
 
-// DownloadPage 是可点击元素并等待文件下载完成的 Page 扩展能力。
-// 未实现该接口的 Page 仍会看到 browserDownload，但调用时返回 download_unsupported。
+// DownloadPage 可尝试一次触发下载的原生点击。点击不能证明下载事件的因果归属，
+// 因此返回 Triggered 和 download_unconfirmed，不返回猜测的下载身份或文件。
+// dir 必须使用 session 配置的 DownloadDir。
 type DownloadPage interface {
 	Page
 	Download(context.Context, ElementRef, string) (DownloadInfo, error)
@@ -399,11 +423,30 @@ type HistoryPage interface {
 	NavigateHistory(context.Context, HistoryEntry) (PageInfo, error)
 }
 
-// DownloadInfo 描述一次已完成下载的文件事实。
+// DownloadSession 提供会话内自动下载的查询、续等和真正取消能力。
+// WaitDownload 受 OperationTimeout 和 ctx 限制；超时保留下载及部分事实。
+type DownloadSession interface {
+	Session
+	Downloads(context.Context) ([]DownloadInfo, error)
+	DownloadStatus(context.Context, string) (DownloadInfo, error)
+	WaitDownload(context.Context, string) (DownloadInfo, error)
+	CancelDownload(context.Context, string) (DownloadInfo, error)
+}
+
+// DownloadInfo 描述下载事实或一次触发回执。只有 completed 带完整文件引用。
 type DownloadInfo struct {
-	Filename string
-	Path     string
-	Bytes    int64
+	// Triggered 仅用于 Download 触发回执：true 表示点击已确认完成；false 不证明未执行。
+	Triggered  bool   `json:"triggered,omitempty"`
+	ID         string `json:"download_id"`
+	State      string `json:"state"`
+	FrameID    string `json:"frame_id"`
+	TargetID   string `json:"target_id,omitempty"`
+	URL        string `json:"url"`
+	Filename   string `json:"file_name,omitempty"`
+	Path       string `json:"path,omitempty"`
+	Bytes      int64  `json:"bytes"`
+	TotalBytes int64  `json:"total_bytes"`
+	Error      string `json:"error,omitempty"`
 }
 
 // WaitOptions 描述浏览器页面的有限等待条件。

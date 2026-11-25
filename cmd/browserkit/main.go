@@ -172,11 +172,30 @@ func invoke(ctx context.Context, functions map[string]browserkit.Function, data 
 	}
 	values := handler.Call([]reflect.Value{reflect.ValueOf(ctx), argument.Elem()})
 	if errValue := values[1]; !errValue.IsNil() {
-		response.Error = values[1].Interface().(error).Error()
+		if !values[0].IsZero() {
+			response.Result = values[0].Interface()
+		}
+		response.Error = errValue.Interface().(error).Error()
 		return response
 	}
-	response.OK = true
 	response.Result = values[0].Interface()
+	if act, ok := response.Result.(browserkit.ActResponse); ok {
+		if act.FailedStep != 0 {
+			response.Error = fmt.Sprintf("browserAct 第 %d 步失败", act.FailedStep)
+			for _, step := range act.Steps {
+				if step.Index+1 == act.FailedStep && step.Error != "" {
+					response.Error = step.Error
+					break
+				}
+			}
+			return response
+		}
+		if act.Cancelled {
+			response.Error = "browserAct 已取消"
+			return response
+		}
+	}
+	response.OK = true
 	return response
 }
 

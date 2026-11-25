@@ -149,6 +149,7 @@ browserkit --url 'https://example.com'
 
 The default `new` mode runs headless with a temporary profile.
 Every locally launched session, including library and HTTP server sessions, gets its own temporary profile. Cookies and local storage are isolated from the everyday browser; closing the session removes the profile. An explicit `SessionConfig.UserDataDir` keeps its existing cleanup setting.
+See the [host-managed Go SDK examples](docs/host-sdk.md) for authenticated proxies, certificate handling, session lifetime, uploads and persistent download tracking.
 The local launcher builds a desktop user agent from the installed Chrome version and keeps it with the session profile, unless `SessionConfig.UserAgent` is explicitly set. If the version cannot be read, Chrome's own identity is used. It removes Rod's automation flag and site isolation overrides and disables Blink's `AutomationControlled` feature. Remote browser sessions retain their existing profile and launch settings.
 Without `--url`, the agent creates a page through a tool call.
 
@@ -279,6 +280,9 @@ Snapshots report form values and state while masking sensitive values and applyi
 on snapshots and `grid` on screenshots add CSS coordinate labels.
 Set `Config.DownloadDir` (or the CLI's `--download-dir`) to enable local downloads;
 remote CDP sessions do not support this download directory.
+`browserDownload.start` reports click completion with `download_unconfirmed`;
+it does not infer which download the click caused. Discover actual downloads with `list`,
+then query or wait using a chosen `download_id`.
 The CLI also accepts `--upload-dir` for uploads.
 Custom `Page` implementations must adopt the extended action interface;
 see the [migration and compatibility notes](docs/keycode-browser-port.md).
@@ -365,14 +369,18 @@ Run `make lab` to serve the [tool lab pages](internal/toollab/README.md) at
 `http://127.0.0.1:8879/`. The pages include forms, hover menus, asynchronous
 data, nested and long page scrolling, DOM replacement, assets, and popup tabs.
 Snapshot results include native form labels, checkbox roles, and select options.
-`browserSelectOption` chooses a native select option by value or label;
+`browserSelectOption` and the `browserAct` select step accept `values` or `labels`
+for native single- and multiple-selects. Pass `[]` to clear or `[""]` to select an empty option.
 `browserScroll` sends a wheel event at the viewport center or supplied CSS coordinates.
-Snapshots also find controls in same-origin iframes and open shadow roots.
-Cross-origin iframe elements appear with role `frame` and `frame_url`. Snapshots also
-include text and actionable controls from up to three visible cross-origin frames,
-including cross-site OOPIFs; frame controls use independent `f`-prefixed references.
-Set `Config.UploadDir` to expose `browserUploadFile` for regular files up to 10 MiB
-inside that directory; the tool returns the file name and size.
+Snapshots cover nested same- and cross-origin iframes/OOPIFs and their open shadow roots.
+Frame controls use document-bound `f`-prefixed references. Text and element budgets
+apply to the entire Tab; `next_offset` continues element pagination and `frame_coverage`
+reports each document's coverage and `shadow_dom=open_only` scope. See the
+[frame notes](docs/frame-tool-design.md) for transforms, clipping, and closed-root boundaries.
+Set `Config.UploadDir` to expose `browserUploadFile`. Pass one absolute `path` or
+a list of `paths` inside that directory, with a 10 MiB limit per regular file.
+Use a file input's `ref`, or set `chooser: true` and use the element that opens a
+native file chooser. The result lists each file's name and size.
 Use `browserkit --allow-private-network --url http://127.0.0.1:8879/` to try
 function calls manually. `make smoke` runs the same lab in a temporary browser
 and verifies every enabled browser function through JSON tool calls.

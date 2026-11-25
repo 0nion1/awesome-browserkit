@@ -173,6 +173,7 @@ type fakePage struct {
 	screenshotData   []byte
 	viewport         Viewport
 	snapshotHook     func()
+	screenshotHook   func() error
 	refExists        *bool
 	hasRefBlock      <-chan struct{}
 	hasRefCalls      int
@@ -365,6 +366,9 @@ func (page *fakePage) Download(_ context.Context, _ ElementRef, dir string) (Dow
 	return page.downloadInfo, page.downloadErr
 }
 func (page *fakePage) Screenshot(context.Context, ScreenshotOptions) (Screenshot, error) {
+	if page.screenshotHook != nil {
+		return Screenshot{}, page.screenshotHook()
+	}
 	data := page.screenshotData
 	if len(data) == 0 {
 		data = []byte("png")
@@ -2101,7 +2105,7 @@ func TestBrowserWaitTimeoutIsStructured(t *testing.T) {
 	}
 }
 
-func TestBrowserDownloadReturnsSavedFile(t *testing.T) {
+func TestBrowserDownloadStartReturnsUnconfirmedWithoutInventedFile(t *testing.T) {
 	dir := t.TempDir()
 	manager, session := fakeManager(t, Config{AllowPrivateNetwork: true, DownloadDir: dir})
 	opened, err := manager.Open(context.Background(), OpenRequest{URL: "https://example.com"})
@@ -2112,26 +2116,23 @@ func TestBrowserDownloadReturnsSavedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session.page.downloadInfo = DownloadInfo{Filename: "report.txt", Path: dir + "/report.txt", Bytes: 12}
-	response, err := manager.Download(context.Background(), DownloadRequest{
-		SessionID: opened.SessionID, PageID: opened.PageID,
-		Ref: snapshot.Elements[0].Ref, Revision: snapshot.Revision,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.FileName != "report.txt" || response.Bytes != 12 || !session.page.downloadCalled || session.page.downloadDir != manager.config.DownloadDir {
-		t.Fatalf("下载响应=%+v page=%+v", response, session.page)
-	}
-
-	session.page.downloadErr = context.DeadlineExceeded
-	_, err = manager.Download(context.Background(), DownloadRequest{
-		SessionID: opened.SessionID, PageID: opened.PageID,
-		Ref: snapshot.Elements[0].Ref, Revision: snapshot.Revision,
-	})
+	// 即使自定义 Page 交付旧式猜测身份，Manager 的 start 也只交付点击事实。
+	session.page.downloadInfo = DownloadInfo{Triggered: true, ID: "unproven", Filename: "report.txt", Path: dir + "/report.txt", Bytes: 12}
+	request := DownloadRequest{SessionID: opened.SessionID, PageID: opened.PageID, Ref: snapshot.Elements[0].Ref, Revision: snapshot.Revision}
+	response, err := manager.Download(context.Background(), request)
 	var browserErr *Error
-	if !errors.As(err, &browserErr) || browserErr.Kind != "download_timeout" {
-		t.Fatalf("下载超时应返回 download_timeout: %v", err)
+	if !errors.As(err, &browserErr) || browserErr.Kind != "download_unconfirmed" || !response.Triggered || response.State != "unconfirmed" || response.DownloadID != "" || response.Path != "" || response.FileName != "" || response.Bytes != 0 || !session.page.downloadCalled {
+		t.Fatalf("response=%+v err=%v", response, err)
+	}
+	session.page.downloadInfo.Triggered = false
+	response, err = manager.Download(context.Background(), request)
+	if !errors.As(err, &browserErr) || browserErr.Kind != "download_unconfirmed" || response.Triggered {
+		t.Fatalf("nil error invented completion: response=%+v err=%v", response, err)
+	}
+	session.page.downloadErr = context.DeadlineExceeded
+	response, err = manager.Download(context.Background(), request)
+	if !errors.As(err, &browserErr) || browserErr.Kind != "download_trigger_timeout" || response.Triggered || response.SessionID != opened.SessionID || response.PageID != opened.PageID || response.Ref != request.Ref || response.DownloadID != "" || response.Path != "" {
+		t.Fatalf("partial response=%+v err=%v", response, err)
 	}
 }
 
@@ -2181,6 +2182,40 @@ func TestBrowserActIncludesScreenshot(t *testing.T) {
 	}
 	if response.Screenshot == nil || len(response.Screenshot.Data) == 0 || response.Screenshot.Bytes == 0 {
 		t.Fatalf("批次截图缺失: %+v", response)
+	}
+}
+
+func TestBrowserActKeepsStepsWhenObservationIsCanceled(t *testing.T) {
+	for _, phase := range []string{"snapshot", "screenshot"} {
+		t.Run(phase, func(t *testing.T) {
+			manager, session := fakeManager(t, Config{AllowPrivateNetwork: true, ScreenshotDir: t.TempDir()})
+			defer manager.Close(context.Background())
+			opened, err := manager.Open(context.Background(), OpenRequest{URL: "http://127.0.0.1/"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if phase == "snapshot" {
+				session.page.snapshotHook = cancel
+				session.page.snapshotErr = context.Canceled
+			} else {
+				session.page.screenshotHook = func() error {
+					cancel()
+					return context.Canceled
+				}
+			}
+			response, err := manager.Act(ctx, ActRequest{
+				SessionID: opened.SessionID, PageID: opened.PageID, IncludeScreenshot: true,
+				Steps: []ActStep{{Op: "wait", Condition: "load_complete"}},
+			})
+			if !errors.Is(err, context.Canceled) || !response.Cancelled || response.Completed != 1 || response.FailedStep != 0 || len(response.Steps) != 1 || !response.Steps[0].Success {
+				t.Fatalf("lost completed step after %s cancellation: %+v, %v", phase, response, err)
+			}
+			if (response.SnapshotError != "") != (phase == "snapshot") || (response.ScreenshotError != "") != (phase == "screenshot") {
+				t.Fatalf("wrong observation error after %s cancellation: %+v", phase, response)
+			}
+		})
 	}
 }
 

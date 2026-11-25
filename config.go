@@ -63,11 +63,15 @@ type Config struct {
 	// UploadDir 限制 browserUploadFile 可读取的本地文件目录；留空时不暴露该函数。
 	UploadDir string
 	// DownloadDir 是 browserDownload 保存文件的本地目录；留空时不暴露该函数。
-	DownloadDir    string
-	MaxScriptBytes int
-	MaxResultBytes int
+	DownloadDir string
+	// DownloadMaxBytes 限制每个下载的字节数；零值不限大小。
+	DownloadMaxBytes int64
+	MaxScriptBytes   int
+	MaxResultBytes   int
 	// IdleTimeout 是浏览器 session 无操作后的自动回收时间；零值为 30 分钟。
 	IdleTimeout time.Duration
+	// DisableIdleReclaim 将 session 寿命交给宿主，直到显式 Close 或连接断开。
+	DisableIdleReclaim bool
 	// DNSResolver 用于浏览器请求发出前解析目标主机。省略时使用系统解析器。
 	// 自定义解析器主要用于使用专用 DNS 的宿主和确定性测试。
 	DNSResolver DNSResolver
@@ -77,6 +81,12 @@ type Config struct {
 
 // Validate 检查 浏览器运行时 配置。
 func (config Config) Validate() error {
+	if _, err := parseBrowserProxy(config.Session.Proxy); err != nil {
+		return err
+	}
+	if config.DownloadMaxBytes < 0 || config.Session.DownloadMaxBytes < 0 {
+		return errors.New("Browser DownloadMaxBytes 不能为负数")
+	}
 	if strings.TrimSpace(config.Session.ExecPath) != "" && strings.TrimSpace(config.Session.RemoteAddress) != "" {
 		return errors.New("Browser ExecPath 和 RemoteAddress 不能同时设置")
 	}
@@ -222,6 +232,12 @@ func (config Config) normalized() (Config, error) {
 		config.DownloadDir = absolute
 	}
 	config.Session.DownloadDir = config.DownloadDir
+	if config.DownloadMaxBytes == 0 {
+		config.DownloadMaxBytes = config.Session.DownloadMaxBytes
+	} else if config.Session.DownloadMaxBytes != 0 && config.Session.DownloadMaxBytes != config.DownloadMaxBytes {
+		return Config{}, errors.New("Browser DownloadMaxBytes 与 Session.DownloadMaxBytes 不一致")
+	}
+	config.Session.DownloadMaxBytes = config.DownloadMaxBytes
 	return config, nil
 }
 

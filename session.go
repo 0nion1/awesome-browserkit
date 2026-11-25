@@ -22,16 +22,22 @@ import (
 type SessionConfig struct {
 	ExecPath string
 	// RemoteAddress 是 Chrome 的 HTTP 调试入口或 browser WebSocket；关闭会话只断开连接。
-	RemoteAddress      string
-	Leakless           bool
-	ForceSandbox       bool
-	Proxy              string
-	UserAgent          string
-	UserDataDir        string
-	CleanupUserDataDir bool
-	InsecureDomains    []string
+	RemoteAddress string
+	Leakless      bool
+	ForceSandbox  bool
+	Proxy         string
+	// ProxyBypassList 使用 Chromium 的代理绕过规则；["<-loopback>"] 让环回请求也经过代理。
+	ProxyBypassList []string
+	// IgnoreCertificateErrors 仅控制本地 Chromium 的证书校验，默认关闭。
+	IgnoreCertificateErrors bool
+	UserAgent               string
+	UserDataDir             string
+	CleanupUserDataDir      bool
+	InsecureDomains         []string
 	// DownloadDir 是本地浏览器允许下载的目录；留空时禁用下载。
 	DownloadDir string
+	// DownloadMaxBytes 限制每个下载的字节数；零值不限大小。
+	DownloadMaxBytes int64
 	// OperationTimeout 限制每次 BrowserKit 操作的最长执行时间；省略时使用 30 秒。
 	OperationTimeout time.Duration
 	requestPolicy    *browserNetworkPolicy
@@ -124,10 +130,10 @@ type rodSession struct {
 	closeOnce         sync.Once
 	stopNetworkPolicy func()
 	downloadMu        sync.Mutex
-	downloadCallMu    sync.Mutex
-	downloadFrames    map[string]*downloadWaiter
-	downloadGuids     map[string]*downloadWaiter
-	downloadActive    map[*downloadWaiter]bool
+	downloadDir       string
+	downloadTempDir   string
+	downloadMaxBytes  int64
+	downloadGuids     map[string]*downloadRecord
 	tabEventsOnce     sync.Once
 	tabChanges        chan struct{}
 	connectionDone    chan struct{}
@@ -161,8 +167,15 @@ func NewSession(ctx context.Context, config SessionConfig) (result Session, err 
 	if config.OperationTimeout < 0 {
 		return nil, errors.New("Browser OperationTimeout 不能为负数")
 	}
+	if config.DownloadMaxBytes < 0 {
+		return nil, errors.New("Browser DownloadMaxBytes 不能为负数")
+	}
 	if config.OperationTimeout == 0 {
 		config.OperationTimeout = defaultOperationTimeout
+	}
+	proxy, err := parseBrowserProxy(config.Proxy)
+	if err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(config.ExecPath) != "" && strings.TrimSpace(config.RemoteAddress) != "" {
 		return nil, errors.New("ExecPath 和 RemoteAddress 不能同时设置")
@@ -227,8 +240,14 @@ func NewSession(ctx context.Context, config SessionConfig) (result Session, err 
 		// Launcher 只负责启动阶段；使用 startupCtx 限制等待 Chrome
 		// remote-debugging URL，启动完成后由 sessionContext 管理会话生命周期。
 		launch = launcher.New().Bin(address).Context(startupCtx).Leakless(config.Leakless).
-			Headless(true).Proxy(config.Proxy)
+			Headless(true).Proxy(proxy.server)
 		profile.configureLauncher(launch)
+		if config.IgnoreCertificateErrors {
+			launch.Set("ignore-certificate-errors")
+		}
+		if len(config.ProxyBypassList) > 0 {
+			launch.Set("proxy-bypass-list", strings.Join(config.ProxyBypassList, ";"))
+		}
 		if config.ForceSandbox {
 			launch.Delete("no-sandbox")
 		} else {
@@ -282,7 +301,10 @@ func NewSession(ctx context.Context, config SessionConfig) (result Session, err 
 		}
 		return nil, fmt.Errorf("连接浏览器: %w", connectErr)
 	}
-	stopNetworkPolicy, policyErr := startBrowserNetworkPolicy(sessionContext, browser, config.requestPolicy)
+	if !ownsLauncher {
+		proxy = browserProxy{}
+	}
+	stopNetworkPolicy, policyErr := startBrowserNetworkPolicy(sessionContext, startupCtx, browser, config.requestPolicy, proxy)
 	if policyErr != nil {
 		browserCancel()
 		cancel()
@@ -296,8 +318,7 @@ func NewSession(ctx context.Context, config SessionConfig) (result Session, err 
 	}
 	// Rod 当前没有下载策略的高层包装，只能使用 CDP Browser 域；调用使用
 	// startupCtx，避免初始化阶段无限等待（此处是初始化期唯一的 Browser
-	// 域 proto 调用）。本地浏览器默认禁用下载；browserDownload 只在单次
-	// 调用期间临时允许并绑定下载事件。
+	// 域 proto 调用）。本地浏览器默认禁用下载。
 	if ownsLauncher {
 		if err := (proto.BrowserSetDownloadBehavior{Behavior: proto.BrowserSetDownloadBehaviorBehaviorDeny}).Call(browser.Context(startupCtx)); err != nil {
 			cancel()
@@ -317,19 +338,27 @@ func NewSession(ctx context.Context, config SessionConfig) (result Session, err 
 		cleanup: profile.cleanup, operationTimeout: config.OperationTimeout,
 		cancel: cancel, transport: transport, pages: make(map[proto.TargetTargetID]*rodPage), stopNetworkPolicy: stopNetworkPolicy,
 		connectionDone: make(chan struct{})}
+	if config.DownloadDir != "" {
+		session.downloadDir = config.DownloadDir
+		session.downloadMaxBytes = config.DownloadMaxBytes
+		session.downloadGuids = make(map[string]*downloadRecord)
+		session.downloadTempDir, err = os.MkdirTemp(config.DownloadDir, ".browserkit-")
+		if err != nil {
+			_ = session.Close()
+			return nil, fmt.Errorf("创建下载临时目录: %w", err)
+		}
+		session.startDownloadWatcher()
+		if err = setDownloadBehavior(startupCtx, browser, proto.BrowserSetDownloadBehaviorBehaviorAllowAndName, session.downloadTempDir); err != nil {
+			_ = session.Close()
+			return nil, fmt.Errorf("启用浏览器下载: %w", err)
+		}
+	}
 	if transport != nil {
-		// CDP WebSocket 断开后 Rod 仍可能保留缓存的 target 映射；先标记会话
-		// 失效并通知 Manager，避免状态接口继续返回已经无法操作的 Tab。
+		// 下载状态初始化完成后才观察断线，避免关闭与初始化并发访问。
 		go func() {
 			<-transport.Done()
 			session.markClosed()
 		}()
-	}
-	if config.DownloadDir != "" {
-		session.downloadFrames = make(map[string]*downloadWaiter)
-		session.downloadGuids = make(map[string]*downloadWaiter)
-		session.downloadActive = make(map[*downloadWaiter]bool)
-		session.startDownloadWatcher()
 	}
 	return session, nil
 }
@@ -820,6 +849,7 @@ func (session *rodSession) markClosed() {
 		return
 	}
 	session.closed.Store(true)
+	session.closeDownloads()
 	session.connectionOnce.Do(func() { close(session.connectionDone) })
 	if session.cancel != nil {
 		session.cancel()
@@ -854,6 +884,9 @@ func (session *rodSession) Close() error {
 			if session.cleanup {
 				session.launcher.Cleanup()
 			}
+		}
+		if session.downloadTempDir != "" {
+			_ = os.RemoveAll(session.downloadTempDir)
 		}
 	})
 	return nil

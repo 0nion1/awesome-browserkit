@@ -62,6 +62,10 @@ func (manager *Manager) CloseActive(ctx context.Context) error {
 
 func (manager *Manager) reclaimIdleSessions() {
 	defer close(manager.reclaimDone)
+	if manager.config.DisableIdleReclaim {
+		<-manager.lifecycleCtx.Done()
+		return
+	}
 	interval := manager.idleCheckInterval
 	if interval <= 0 || interval > manager.config.IdleTimeout {
 		interval = manager.config.IdleTimeout

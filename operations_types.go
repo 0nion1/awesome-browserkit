@@ -30,6 +30,8 @@ const (
 	OpenLoadLoaded OpenLoadStatus = "loaded"
 	// OpenLoadTimeout 表示页面已经打开，但在等待窗口内没有进入空闲。
 	OpenLoadTimeout OpenLoadStatus = "timeout"
+	// OpenLoadDownload 表示导航触发下载，URL 仍是保留的当前文档地址。
+	OpenLoadDownload OpenLoadStatus = "download"
 )
 
 // OpenResponse 是 browserOpen 的输出。
@@ -38,7 +40,7 @@ type OpenResponse struct {
 	PageID     string         `json:"page_id"`
 	URL        string         `json:"url"`
 	Title      string         `json:"title,omitempty"`
-	LoadStatus OpenLoadStatus `json:"load_status"`
+	LoadStatus OpenLoadStatus `json:"load_status" jsonschema:"enum=loaded,enum=timeout,enum=download" jsonschema_description:"loaded 为文档就绪，timeout 为仍在加载，download 为开始下载并保留原文档；下载状态通过 browserDownload 查询。"`
 	// Snapshot 是加载超时时当前可读取的页面快照，可直接使用其中的元素引用。
 	Snapshot *SnapshotResponse `json:"snapshot,omitempty"`
 	// Warning 提醒模型当前内容可能不完整，由模型决定是否继续等待。
@@ -134,8 +136,8 @@ type NavigateRequest struct {
 
 // NavigateResponse 是 browserNavigate 的输出。
 type NavigateResponse struct {
-	// LoadStatus 表示加载与空闲等待（通常最多约 4 秒）后的状态。
-	LoadStatus OpenLoadStatus `json:"load_status"`
+	// LoadStatus 表示文档加载结果，或浏览器确认导航已触发下载。
+	LoadStatus OpenLoadStatus `json:"load_status" jsonschema:"enum=loaded,enum=timeout,enum=download" jsonschema_description:"loaded 为文档就绪，timeout 为仍在加载，download 为开始下载并保留原文档；下载状态通过 browserDownload 查询。"`
 	// Snapshot 是加载超时时当前可读取的页面快照，可直接使用其中的元素引用。
 	Snapshot *SnapshotResponse `json:"snapshot,omitempty"`
 	// Warning 提醒模型当前内容可能不完整，由模型决定是否继续等待。
@@ -165,30 +167,32 @@ type ActRequest struct {
 
 // ActStep 是批量动作中的一步；只填写 op 对应需要的字段。
 type ActStep struct {
-	Op            string   `json:"op" jsonschema:"required,enum=click,enum=hover,enum=type,enum=select,enum=check,enum=press,enum=scroll,enum=wait,enum=drag,enum=evaluate" jsonschema_description:"动作类型；evaluate 需要宿主启用 allow_evaluate。"`
-	Ref           string   `json:"ref,omitempty" jsonschema_description:"click/hover/type/select/check/press 的目标 ref。"`
-	Text          string   `json:"text,omitempty" jsonschema_description:"type 要输入的文本，可以为空；特殊输入类型格式同 browserType。"`
-	Append        bool     `json:"append,omitempty" jsonschema_description:"type 时追加而不是覆盖。"`
-	Value         string   `json:"value,omitempty" jsonschema_description:"select 的选项值；与 label 二选一。"`
-	Label         string   `json:"label,omitempty" jsonschema_description:"select 的选项可见标签；与 value 二选一。"`
-	Checked       *bool    `json:"checked,omitempty" jsonschema_description:"check 的目标勾选状态。"`
-	Key           string   `json:"key,omitempty" jsonschema_description:"press 的按键名称。"`
-	Modifiers     []string `json:"modifiers,omitempty" jsonschema:"enum=Control,enum=Meta,enum=Alt,enum=Shift" jsonschema_description:"press 的修饰键。"`
-	Button        string   `json:"button,omitempty" jsonschema:"enum=left,enum=right,enum=middle" jsonschema_description:"click 的鼠标按键。"`
-	ClickCount    int      `json:"click_count,omitempty" jsonschema:"minimum=1,maximum=2" jsonschema_description:"click 次数：1 或 2。"`
-	WaitAfterMS   int      `json:"wait_after_ms,omitempty" jsonschema_description:"click 后的额外等待毫秒数。"`
-	Submit        bool     `json:"submit,omitempty" jsonschema_description:"type 后是否发送 Enter。"`
-	DeltaX        float64  `json:"delta_x,omitempty" jsonschema_description:"scroll 的水平距离或 drag 的水平位移。"`
-	DeltaY        float64  `json:"delta_y,omitempty" jsonschema_description:"scroll 的垂直距离或 drag 的垂直位移。"`
-	X             *float64 `json:"x,omitempty" jsonschema_description:"scroll、click 或 drag 起点的视口 CSS 横坐标。"`
-	Y             *float64 `json:"y,omitempty" jsonschema_description:"scroll、click 或 drag 起点的视口 CSS 纵坐标。"`
-	Condition     string   `json:"condition,omitempty" jsonschema_description:"wait 条件；与 browserWait 相同。"`
-	RefOrSelector string   `json:"ref_or_selector,omitempty" jsonschema_description:"wait 的 CSS selector、ref 或匹配文本。"`
-	TimeoutMS     int      `json:"timeout_ms,omitempty" jsonschema:"minimum=1,maximum=600000" jsonschema_description:"该步骤的毫秒超时；省略时受浏览器 OperationTimeout 约束。"`
-	SourceRef     string   `json:"source_ref,omitempty" jsonschema_description:"drag 的源元素 ref；与 x/y 二选一。"`
-	TargetRef     string   `json:"target_ref,omitempty" jsonschema_description:"drag 的目标：同一快照的 ref、唯一 CSS selector；与 delta_x/delta_y 二选一。"`
-	Code          string   `json:"code,omitempty" jsonschema_description:"evaluate 要执行的 JavaScript；需要 allow_evaluate。"`
-	AwaitPromise  *bool    `json:"await_promise,omitempty" jsonschema_description:"evaluate 是否等待 Promise；省略时等待。"`
+	Op            string    `json:"op" jsonschema:"required,enum=click,enum=hover,enum=type,enum=select,enum=check,enum=press,enum=scroll,enum=wait,enum=drag,enum=evaluate" jsonschema_description:"动作类型；evaluate 需要宿主启用 allow_evaluate。"`
+	Ref           string    `json:"ref,omitempty" jsonschema_description:"click/hover/type/select/check/press 的目标 ref。"`
+	Text          string    `json:"text,omitempty" jsonschema_description:"type 要输入的文本，可以为空；特殊输入类型格式同 browserType。"`
+	Append        bool      `json:"append,omitempty" jsonschema_description:"type 时追加而不是覆盖。"`
+	Value         string    `json:"value,omitempty" jsonschema_description:"select 的单个非空选项值；与 label、values、labels 互斥。"`
+	Label         string    `json:"label,omitempty" jsonschema_description:"select 的单个非空可见标签；与 value、values、labels 互斥。"`
+	Values        *[]string `json:"values,omitempty" jsonschema_description:"按值选择；[] 清空，空字符串选项用 [\"\"]。与 value、label、labels 互斥。"`
+	Labels        *[]string `json:"labels,omitempty" jsonschema_description:"按标签选择；[] 清空，空标签用 [\"\"]。与 value、label、values 互斥。"`
+	Checked       *bool     `json:"checked,omitempty" jsonschema_description:"check 的目标勾选状态。"`
+	Key           string    `json:"key,omitempty" jsonschema_description:"press 的按键名称。"`
+	Modifiers     []string  `json:"modifiers,omitempty" jsonschema:"enum=Control,enum=Meta,enum=Alt,enum=Shift" jsonschema_description:"press 的修饰键。"`
+	Button        string    `json:"button,omitempty" jsonschema:"enum=left,enum=right,enum=middle" jsonschema_description:"click 的鼠标按键。"`
+	ClickCount    int       `json:"click_count,omitempty" jsonschema:"minimum=1,maximum=2" jsonschema_description:"click 次数：1 或 2。"`
+	WaitAfterMS   int       `json:"wait_after_ms,omitempty" jsonschema_description:"click 后的额外等待毫秒数。"`
+	Submit        bool      `json:"submit,omitempty" jsonschema_description:"type 后是否发送 Enter。"`
+	DeltaX        float64   `json:"delta_x,omitempty" jsonschema_description:"scroll 的水平距离或 drag 的水平位移。"`
+	DeltaY        float64   `json:"delta_y,omitempty" jsonschema_description:"scroll 的垂直距离或 drag 的垂直位移。"`
+	X             *float64  `json:"x,omitempty" jsonschema_description:"scroll、click 或 drag 起点的视口 CSS 横坐标。"`
+	Y             *float64  `json:"y,omitempty" jsonschema_description:"scroll、click 或 drag 起点的视口 CSS 纵坐标。"`
+	Condition     string    `json:"condition,omitempty" jsonschema_description:"wait 条件；与 browserWait 相同。"`
+	RefOrSelector string    `json:"ref_or_selector,omitempty" jsonschema_description:"wait 的 CSS selector、ref 或匹配文本。"`
+	TimeoutMS     int       `json:"timeout_ms,omitempty" jsonschema:"minimum=1,maximum=600000" jsonschema_description:"该步骤的毫秒超时；省略时受浏览器 OperationTimeout 约束。"`
+	SourceRef     string    `json:"source_ref,omitempty" jsonschema_description:"drag 的源元素 ref；与 x/y 二选一。"`
+	TargetRef     string    `json:"target_ref,omitempty" jsonschema_description:"drag 的目标：同一快照的 ref、唯一 CSS selector；与 delta_x/delta_y 二选一。"`
+	Code          string    `json:"code,omitempty" jsonschema_description:"evaluate 要执行的 JavaScript；需要 allow_evaluate。"`
+	AwaitPromise  *bool     `json:"await_promise,omitempty" jsonschema_description:"evaluate 是否等待 Promise；省略时等待。"`
 }
 
 // ActStepResult 是批量动作中一步的执行结果。
@@ -199,6 +203,7 @@ type ActStepResult struct {
 	Success             bool            `json:"success"`
 	Changed             bool            `json:"changed,omitempty"`
 	Value               string          `json:"value,omitempty"`
+	Values              *[]string       `json:"values,omitempty"`
 	Result              json.RawMessage `json:"result,omitempty"`
 	Type                string          `json:"type,omitempty"`
 	Kind                string          `json:"kind,omitempty"`
@@ -270,7 +275,8 @@ type SnapshotResponse struct {
 	// Screenshot 是 include_screenshot 请求的视口截图。
 	Screenshot *ScreenshotResponse `json:"screenshot,omitempty"`
 	// ScreenshotError 表示截图失败；快照本身仍然有效。
-	ScreenshotError string `json:"screenshot_error,omitempty"`
+	ScreenshotError string          `json:"screenshot_error,omitempty"`
+	FrameCoverage   []FrameCoverage `json:"frame_coverage,omitempty"`
 }
 
 // HandleDialogRequest 是 browserHandleDialog 的输入。
@@ -384,25 +390,28 @@ type TypeResponse struct {
 	SnapshotError string `json:"snapshot_error,omitempty"`
 }
 
-// SelectOptionRequest 是 browserSelectOption 的输入。value 和 label 二选一。
+// SelectOptionRequest 是 browserSelectOption 的输入。四种选择条件中填写一种。
 type SelectOptionRequest struct {
-	SessionID string `json:"session_id" jsonschema:"required,minLength=1" jsonschema_description:"browserOpen 返回的 session_id。"`
-	PageID    string `json:"page_id" jsonschema:"required,minLength=1" jsonschema_description:"目标 Tab 的 page_id。"`
-	Ref       string `json:"ref" jsonschema:"required,minLength=1" jsonschema_description:"同一快照的 ref，不能跨 Tab 使用。"`
-	Revision  uint64 `json:"revision" jsonschema:"required,minimum=1" jsonschema_description:"browserSnapshot 的 revision（JSON 整数，不要加引号）；失效后重新快照。"`
-	Value     string `json:"value,omitempty" jsonschema_description:"要选择的原生单选下拉框选项值，使用快照 options 中的 value；与 label 二选一，不能为空。"`
-	Label     string `json:"label,omitempty" jsonschema_description:"要选择的原生单选下拉框可见标签，使用快照 options 中的 label；与 value 二选一，不能为空。"`
+	SessionID string    `json:"session_id" jsonschema:"required,minLength=1" jsonschema_description:"browserOpen 返回的 session_id。"`
+	PageID    string    `json:"page_id" jsonschema:"required,minLength=1" jsonschema_description:"目标 Tab 的 page_id。"`
+	Ref       string    `json:"ref" jsonschema:"required,minLength=1" jsonschema_description:"同一快照的 ref，不能跨 Tab 使用。"`
+	Revision  uint64    `json:"revision" jsonschema:"required,minimum=1" jsonschema_description:"browserSnapshot 的 revision（JSON 整数，不要加引号）；失效后重新快照。"`
+	Value     string    `json:"value,omitempty" jsonschema_description:"要选择的单个非空选项值；与 label、values、labels 互斥。"`
+	Label     string    `json:"label,omitempty" jsonschema_description:"要选择的单个非空选项标签；与 value、values、labels 互斥。"`
+	Values    *[]string `json:"values,omitempty" jsonschema_description:"按值选择；[] 清空，空字符串选项用 [\"\"]。与 value、label、labels 互斥。"`
+	Labels    *[]string `json:"labels,omitempty" jsonschema_description:"按标签选择；[] 清空，空标签用 [\"\"]。与 value、label、values 互斥。"`
 }
 
 // SelectOptionResponse 是 browserSelectOption 的输出。
 type SelectOptionResponse struct {
-	SessionID    string `json:"session_id"`
-	PageID       string `json:"page_id"`
-	Ref          string `json:"ref"`
-	Value        string `json:"value"`
-	ActivePageID string `json:"active_page_id,omitempty"`
-	TabsRevision uint64 `json:"tabs_revision"`
-	TabsChanged  bool   `json:"tabs_changed"`
+	SessionID    string   `json:"session_id"`
+	PageID       string   `json:"page_id"`
+	Ref          string   `json:"ref"`
+	Value        string   `json:"value"`
+	Values       []string `json:"values"`
+	ActivePageID string   `json:"active_page_id,omitempty"`
+	TabsRevision uint64   `json:"tabs_revision"`
+	TabsChanged  bool     `json:"tabs_changed"`
 	// Snapshot 是操作完成后被操作页面的最新快照。
 	Snapshot *SnapshotResponse `json:"snapshot,omitempty"`
 	// SnapshotError 表示附加快照失败；操作已完成，只需重新读取页面，不应重放操作。
@@ -411,11 +420,19 @@ type SelectOptionResponse struct {
 
 // UploadFileRequest 是 browserUploadFile 的输入。
 type UploadFileRequest struct {
-	SessionID string `json:"session_id" jsonschema:"required,minLength=1" jsonschema_description:"browserOpen 返回的 session_id。"`
-	PageID    string `json:"page_id" jsonschema:"required,minLength=1" jsonschema_description:"目标 Tab 的 page_id。"`
-	Ref       string `json:"ref" jsonschema:"required,minLength=1" jsonschema_description:"目标原生 file input 的快照 ref；必须来自同一 page_id 的 browserSnapshot。"`
-	Revision  uint64 `json:"revision" jsonschema:"required,minimum=1" jsonschema_description:"browserSnapshot 的 revision（JSON 整数，不要加引号）；失效后重新快照。"`
-	Path      string `json:"path" jsonschema:"required,minLength=1" jsonschema_description:"浏览器宿主机器上的绝对文件路径；解析符号链接后必须位于宿主授权的 UploadDir 内，文件必须是大小不超过 10 MiB 的普通文件。"`
+	SessionID string   `json:"session_id" jsonschema:"required,minLength=1" jsonschema_description:"browserOpen 返回的 session_id。"`
+	PageID    string   `json:"page_id" jsonschema:"required,minLength=1" jsonschema_description:"目标 Tab 的 page_id。"`
+	Ref       string   `json:"ref" jsonschema:"required,minLength=1" jsonschema_description:"原生文件输入框的快照 ref；chooser=true 时使用打开文件选择器的元素 ref。"`
+	Revision  uint64   `json:"revision" jsonschema:"required,minimum=1" jsonschema_description:"browserSnapshot 的 revision（JSON 整数，不要加引号）；失效后重新快照。"`
+	Path      string   `json:"path,omitempty" jsonschema:"minLength=1" jsonschema_description:"UploadDir 内的单个绝对文件路径；与 paths 互斥。"`
+	Paths     []string `json:"paths,omitempty" jsonschema:"minItems=1" jsonschema_description:"UploadDir 内的绝对文件路径，每个须为不超过 10 MiB 的普通文件；与 path 互斥。"`
+	Chooser   bool     `json:"chooser,omitempty" jsonschema_description:"点击 ref 打开原生文件选择器，并将文件设置到该选择器的输入框。"`
+}
+
+// UploadedFile 是已交给文件输入框的单个文件。
+type UploadedFile struct {
+	FileName string `json:"file_name"`
+	Bytes    int64  `json:"bytes"`
 }
 
 // UploadFileResponse 只返回文件名，不回显宿主路径或内容。
@@ -423,8 +440,11 @@ type UploadFileResponse struct {
 	SessionID string `json:"session_id"`
 	PageID    string `json:"page_id"`
 	Ref       string `json:"ref"`
-	FileName  string `json:"file_name"`
-	Bytes     int64  `json:"bytes"`
+	// Uploaded 表示浏览器已确认设置文件。
+	Uploaded bool           `json:"uploaded"`
+	FileName string         `json:"file_name,omitempty"`
+	Bytes    int64          `json:"bytes"`
+	Files    []UploadedFile `json:"files,omitempty"`
 	// Snapshot 是操作完成后被操作页面的最新快照。
 	Snapshot *SnapshotResponse `json:"snapshot,omitempty"`
 	// SnapshotError 表示附加快照失败；操作已完成，只需重新读取页面，不应重放操作。
@@ -433,23 +453,34 @@ type UploadFileResponse struct {
 
 // DownloadRequest 是 browserDownload 的输入。
 type DownloadRequest struct {
-	SessionID string `json:"session_id" jsonschema:"required,minLength=1" jsonschema_description:"browserOpen 返回的 session_id。"`
-	PageID    string `json:"page_id" jsonschema:"required,minLength=1" jsonschema_description:"目标 Tab 的 page_id。"`
-	Ref       string `json:"ref" jsonschema:"required,minLength=1" jsonschema_description:"触发下载的链接或按钮的快照 ref；必须来自同一 page_id 的 browserSnapshot。"`
-	Revision  uint64 `json:"revision" jsonschema:"required,minimum=1" jsonschema_description:"browserSnapshot 的 revision（JSON 整数，不要加引号）；失效后重新快照。"`
-	TimeoutMS int    `json:"timeout_ms,omitempty" jsonschema:"minimum=1,maximum=600000" jsonschema_description:"等待下载完成的毫秒数；省略时使用浏览器 OperationTimeout（默认 30 秒）。"`
+	SessionID  string `json:"session_id" jsonschema:"required,minLength=1" jsonschema_description:"browserOpen 返回的 session_id。"`
+	PageID     string `json:"page_id,omitempty" jsonschema_description:"start 必填；其他操作可省略以查询整个 session。"`
+	Action     string `json:"action,omitempty" jsonschema:"enum=start,enum=list,enum=query,enum=wait,enum=cancel" jsonschema_description:"省略时：提供 ref 为 start，提供 download_id 为 query，否则 list。start 返回点击完成事实 triggered 和 download_unconfirmed，不推断下载因果；wait 超时不取消下载。"`
+	DownloadID string `json:"download_id,omitempty" jsonschema_description:"query、wait、cancel 使用已有下载身份，不重新点击。"`
+	Ref        string `json:"ref,omitempty" jsonschema_description:"start 点击一次此快照 ref；不自动关联下载 ID。必须同时提供 revision 和 page_id。"`
+	Revision   uint64 `json:"revision,omitempty" jsonschema:"minimum=1" jsonschema_description:"start 使用的快照 revision。"`
+	TimeoutMS  int    `json:"timeout_ms,omitempty" jsonschema:"minimum=1,maximum=600000" jsonschema_description:"start 的点击或 wait 的等待时限；超时不会取消下载。"`
 }
 
-// DownloadResponse 描述本次下载落到 DownloadDir 的文件。
+// DownloadResponse 返回单个下载或 session 下载列表的执行事实。
 type DownloadResponse struct {
-	SessionID string `json:"session_id"`
-	PageID    string `json:"page_id"`
-	Ref       string `json:"ref"`
-	// FileName 是浏览器实际保存的文件名。
-	FileName string `json:"file_name"`
-	// Path 是浏览器主机 DownloadDir 内的绝对路径。
-	Path  string `json:"path"`
-	Bytes int64  `json:"bytes"`
+	// Triggered=true 仅表示 start 的点击已确认完成；false 不证明未发生副作用。
+	Triggered  bool           `json:"triggered"`
+	SessionID  string         `json:"session_id"`
+	PageID     string         `json:"page_id,omitempty"`
+	Ref        string         `json:"ref,omitempty"`
+	DownloadID string         `json:"download_id,omitempty"`
+	State      string         `json:"state,omitempty"`
+	FrameID    string         `json:"frame_id,omitempty"`
+	TargetID   string         `json:"target_id,omitempty"`
+	URL        string         `json:"url,omitempty"`
+	FileName   string         `json:"file_name,omitempty"`
+	Path       string         `json:"path,omitempty"`
+	Bytes      int64          `json:"bytes"`
+	TotalBytes int64          `json:"total_bytes"`
+	Error      string         `json:"error,omitempty"`
+	WaitError  string         `json:"wait_error,omitempty"`
+	Downloads  []DownloadInfo `json:"downloads,omitempty"`
 }
 
 // PressRequest 是 browserPress 的输入。

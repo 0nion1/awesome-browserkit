@@ -664,7 +664,8 @@ func (manager *Manager) Navigate(ctx context.Context, request NavigateRequest) (
 			return NavigateResponse{}, err
 		}
 	}
-	loadStatus, err := manager.pageLoadStatus(ctx, currentPage.page)
+	isDownload := info.IsDownload
+	loadStatus, err := manager.navigationLoadStatus(ctx, currentPage.page, info)
 	if err != nil {
 		return NavigateResponse{}, err
 	}
@@ -680,12 +681,17 @@ func (manager *Manager) Navigate(ctx context.Context, request NavigateRequest) (
 		info = PageInfo{URL: historyURL}
 	}
 	current.mu.Lock()
-	clearPageRefs(currentPage)
-	currentPage.generation++
+	if !isDownload {
+		clearPageRefs(currentPage)
+		currentPage.generation++
+	}
 	currentPage.info = info
 	currentPage.status = "ready"
 	current.mu.Unlock()
-	candidateID := recordSequenceStep(current, currentPage, SequenceStep{Type: "navigate", URL: info.URL}, "succeeded")
+	candidateID := ""
+	if !isDownload {
+		candidateID = recordSequenceStep(current, currentPage, SequenceStep{Type: "navigate", URL: info.URL}, "succeeded")
+	}
 	manager.emit(ctx, Event{Kind: "navigation_finished", SessionID: current.id, PageID: currentPage.id, URL: info.URL})
 	var activePageID string
 	var tabsRevision uint64

@@ -135,22 +135,25 @@ func publicNetworkAddress(address netip.Addr) bool {
 
 type networkPolicyJob struct {
 	event     *proto.FetchRequestPaused
+	auth      *proto.FetchAuthRequired
 	sessionID proto.TargetSessionID
 }
 
 const networkPolicyWorkers = 32
 const networkPolicyQueueSize = 256
 
-func startBrowserNetworkPolicy(ctx context.Context, browser *rod.Browser, policy *browserNetworkPolicy) (func(), error) {
-	if policy == nil || browser == nil {
+func startBrowserNetworkPolicy(ctx, startupCtx context.Context, browser *rod.Browser, policy *browserNetworkPolicy, proxy browserProxy) (func(), error) {
+	if policy == nil && !proxy.authenticated || browser == nil {
 		return func() {}, nil
 	}
 	policyCtx, cancel := context.WithCancel(ctx)
-	if err := (proto.FetchEnable{Patterns: policy.requestPatterns()}).Call(browser.Context(policyCtx)); err != nil {
+	if err := (proto.FetchEnable{Patterns: policy.requestPatterns(), HandleAuthRequests: proxy.authenticated}).Call(browser.Context(startupCtx)); err != nil {
 		cancel()
 		return nil, err
 	}
 	jobs := make(chan networkPolicyJob, networkPolicyQueueSize)
+	var authMu sync.Mutex
+	attempted := make(map[string]time.Time)
 	for index := 0; index < networkPolicyWorkers; index++ {
 		go func() {
 			for {
@@ -158,7 +161,25 @@ func startBrowserNetworkPolicy(ctx context.Context, browser *rod.Browser, policy
 				case <-policyCtx.Done():
 					return
 				case job := <-jobs:
-					enforceBrowserNetworkPolicy(policyCtx, browser, policy, job.event, job.sessionID)
+					if job.auth == nil {
+						enforceBrowserNetworkPolicy(policyCtx, browser, policy, job.event, job.sessionID)
+						continue
+					}
+					key := string(job.sessionID) + "/" + string(job.auth.RequestID)
+					authMu.Lock()
+					_, retried := attempted[key]
+					now := time.Now()
+					for id, at := range attempted {
+						if now.Sub(at) > 5*time.Minute {
+							delete(attempted, id)
+						}
+					}
+					attempted[key] = now
+					authMu.Unlock()
+					authCtx, authCancel := context.WithTimeout(policyCtx, 3*time.Second)
+					client := cdpSessionClient{client: browser, ctx: authCtx, sessionID: job.sessionID}
+					_ = (proto.FetchContinueWithAuth{RequestID: job.auth.RequestID, AuthChallengeResponse: proxy.challengeResponse(job.auth.AuthChallenge, retried)}).Call(client)
+					authCancel()
 				}
 			}
 		}()
@@ -171,6 +192,14 @@ func startBrowserNetworkPolicy(ctx context.Context, browser *rod.Browser, policy
 		// 队列满时对事件读取施加背压，而不是创建无上限 goroutine。
 		select {
 		case jobs <- networkPolicyJob{event: event, sessionID: sessionID}:
+		case <-policyCtx.Done():
+		}
+	}, func(event *proto.FetchAuthRequired, sessionID proto.TargetSessionID) {
+		if event == nil {
+			return
+		}
+		select {
+		case jobs <- networkPolicyJob{auth: event, sessionID: sessionID}:
 		case <-policyCtx.Done():
 		}
 	})
